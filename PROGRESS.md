@@ -4,6 +4,7 @@
 
 - **Current phase:** Phase 0 (bootstrap and plan): **complete**, at the gate awaiting review.
 - **Next:** Phase 1 (core queue: single worker, happy path, idempotency). Starts on Mohammed's go-ahead.
+- **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
 - **AWS:** nothing created. Spend to date: $0.
 
 ## Phase log
@@ -73,7 +74,9 @@ pytest exit (redis up)=0
 **Open issues**
 - None blocking Phase 1. Not needed until Phase 7: AWS CLI v2, Terraform, a named AWS profile,
   and the account's sign-up date (the Free plan closes the account 6 months after sign-up).
-  Not needed until Phase 5: a GitHub repo.
+  The GitHub repo (needed for Phase 5 CI) now exists: https://github.com/TechBroMoho/fault-tolerant-task-queue.
+- Post-gate review decisions: skip the HTTP enqueue endpoint (ADR-015); author name confirmed as
+  Mohammed Jasim.
 
 ## Spend log
 
