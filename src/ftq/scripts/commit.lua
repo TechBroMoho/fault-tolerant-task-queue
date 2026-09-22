@@ -9,6 +9,7 @@
 -- KEYS[2]  done key for this job_id (hash: state, result, finished_at_ms, worker_id)
 -- KEYS[3]  results log (append-only stream)
 -- KEYS[4]  stats hash
+-- KEYS[5]  dead-letter stream (for a late success, ADR-009)
 -- ARGV[1]  consumer group
 -- ARGV[2]  stream entry id being completed
 -- ARGV[3]  job_id
@@ -17,7 +18,8 @@
 -- ARGV[6]  worker id
 -- ARGV[7]  enqueued_at_ms (copied into the results log for latency math)
 --
--- Returns 1 = COMMITTED (first success for this job_id), 0 = DUPLICATE (suppressed).
+-- Returns 1 = COMMITTED (first success for this job_id), 0 = DUPLICATE (suppressed),
+--         2 = LATE_SUCCESS (committed, replacing an earlier DEAD; ADR-009).
 --
 -- First-wins and idempotent: ANY holder of the job may commit, with no ownership check.
 -- Whoever arrives first records the result; every later commit for the same job_id
@@ -25,13 +27,30 @@
 -- re-sent after a lost reply) only acks its entry and bumps a counter.
 
 -- 1. Already succeeded? Then this delivery's work is a duplicate: drop it.
---    (Checks state == SUCCEEDED rather than key existence so that, from Phase 2, a
---    late success can still replace DEAD per ADR-009.)
-if redis.call('HGET', KEYS[2], 'state') == 'SUCCEEDED' then
+--    (Checks state == SUCCEEDED rather than key existence, so a late success can still
+--    replace DEAD in step 1b.)
+local state = redis.call('HGET', KEYS[2], 'state')
+if state == 'SUCCEEDED' then
   redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])                    -- leave the PEL
   redis.call('XDEL', KEYS[1], ARGV[2])                             -- leave the stream (ADR-016)
   redis.call('HINCRBY', KEYS[4], 'duplicates_suppressed', 1)
   return 0
+end
+
+-- 1b. Late success: the job was moved to the DLQ (say its lease expired and the
+--     reclaimer hit max_deliveries) while this slower holder was still running it, and
+--     now it has finished. The work was done, so SUCCEEDED replaces DEAD (SPEC §4). Its
+--     DLQ entry is deleted in the same step, so the DLQ holds exactly the DEAD jobs and
+--     `dlq requeue --all` can't run a finished job again (ADR-009).
+local outcome = 1
+if state == 'DEAD' then
+  local dead_id = redis.call('HGET', KEYS[2], 'dead_entry_id')
+  if dead_id then
+    redis.call('XDEL', KEYS[5], dead_id)                           -- out of the DLQ
+  end
+  redis.call('DEL', KEYS[2])                                       -- drop DEAD's fields
+  redis.call('HINCRBY', KEYS[4], 'late_successes', 1)
+  outcome = 2
 end
 
 -- 2. First success. Timestamp from Redis's clock (ADR-020).
@@ -64,4 +83,4 @@ redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
 redis.call('XDEL', KEYS[1], ARGV[2])
 
 redis.call('HINCRBY', KEYS[4], 'processed', 1)
-return 1
+return outcome

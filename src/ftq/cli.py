@@ -1,24 +1,31 @@
-"""Command-line interface: `ftq worker`, `ftq enqueue`.
+"""Command-line interface: `ftq worker`, `ftq enqueue`, `ftq dlq list|requeue`.
 
 Configuration comes from `FTQ_*` env vars (config.py); flags override a few of them.
-`stats`, `dlq`, and `bench` arrive in later phases.
+`stats` and `bench` arrive in later phases.
 """
 
 import asyncio
+import dataclasses
 import importlib
 import json
 import logging
 import signal
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 
+import redis.asyncio as aioredis
 import typer
 
+from ftq import dlq
 from ftq.client import Client
 from ftq.config import Settings, make_redis
+from ftq.keys import Keys
 from ftq.registry import Registry
 from ftq.worker import Worker
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
+dlq_app = typer.Typer(no_args_is_help=True, help="Inspect and requeue dead-lettered jobs.")
+app.add_typer(dlq_app, name="dlq")
 
 
 def _settings(**overrides: Any) -> Settings:
@@ -98,3 +105,52 @@ def enqueue(
             await redis.aclose()
 
     typer.echo(asyncio.run(_enqueue()))
+
+
+def _with_redis[T](settings: Settings, fn: Callable[[aioredis.Redis], Awaitable[T]]) -> T:
+    async def _run() -> T:
+        redis = make_redis(settings)
+        try:
+            return await fn(redis)
+        finally:
+            await redis.aclose()
+
+    return asyncio.run(_run())
+
+
+@dlq_app.command("list")
+def dlq_list(
+    limit: Annotated[int, typer.Option(help="Show at most this many (oldest first).")] = 100,
+    queue: Annotated[str | None, typer.Option(help="Overrides FTQ_QUEUE.")] = None,
+) -> None:
+    """Print DLQ entries as JSON lines: job_id, type, reason, error, attempts, deliveries."""
+    settings = _settings(queue=queue)
+    dead = _with_redis(settings, lambda r: dlq.list_dead(r, Keys(settings.queue), limit))
+    for job in dead:
+        typer.echo(json.dumps(dataclasses.asdict(job)))
+
+
+@dlq_app.command("requeue")
+def dlq_requeue(
+    job_ids: Annotated[list[str] | None, typer.Argument(help="job_id(s) to requeue.")] = None,
+    all_: Annotated[bool, typer.Option("--all", help="Requeue every DLQ entry.")] = False,
+    queue: Annotated[str | None, typer.Option(help="Overrides FTQ_QUEUE.")] = None,
+) -> None:
+    """Put DEAD jobs back on the queue with a fresh set of attempts (same job_id)."""
+    if all_ == bool(job_ids):
+        raise typer.BadParameter("give job_id(s) or --all, not both or neither")
+    settings = _settings(queue=queue)
+    keys = Keys(settings.queue)
+
+    async def _requeue(r: aioredis.Redis) -> int:
+        if all_:
+            return await dlq.requeue_all(r, keys)
+        count = 0
+        for job_id in job_ids or []:
+            if await dlq.requeue(r, keys, job_id):
+                count += 1
+            else:
+                typer.echo(f"{job_id}: not DEAD, skipped", err=True)
+        return count
+
+    typer.echo(f"requeued {_with_redis(settings, _requeue)}")

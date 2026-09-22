@@ -18,6 +18,9 @@ from redis.backoff import ExponentialWithJitterBackoff
 # and the charset is kept boring enough to be safe in keys, logs, and shell commands.
 _QUEUE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
+# done_ttl_seconds must be at least this many times Settings.job_lifetime_bound (ADR-010).
+_TTL_MARGIN = 10
+
 
 class Settings(BaseSettings):
     """Configuration for producers and workers. Field docs double as the README table."""
@@ -75,6 +78,78 @@ class Settings(BaseSettings):
         description="On SIGTERM, seconds to let in-flight jobs finish before abandoning them.",
     )
 
+    process_pool_size: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Processes for CPU-bound handlers registered with pool='process' (ADR-028). "
+            "Thread-pool handlers get `concurrency` threads."
+        ),
+    )
+
+    # ------------------------------------------------------------ leases (ADR-023, ADR-025)
+    visibility_timeout: float = Field(
+        default=30.0,
+        gt=0,
+        description=(
+            "Lease length (s): an entry idle this long in the PEL is reclaimed by XAUTOCLAIM."
+        ),
+    )
+    heartbeat_interval: float = Field(
+        default=10.0,
+        gt=0,
+        description="Seconds between lease extensions of a running job; at most half the lease.",
+    )
+    reap_interval: float = Field(
+        default=5.0,
+        gt=0,
+        description="Seconds between reaper passes (XAUTOCLAIM of expired leases).",
+    )
+
+    # ------------------------------------------------------------ retries and DLQ (ADR-026/027)
+    max_attempts: int = Field(
+        default=5,
+        ge=1,
+        description="Handler runs (first try + retries) before a failing job goes to the DLQ.",
+    )
+    max_deliveries: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "Deliveries of one stream entry (XPENDING count) before it goes to the DLQ "
+            "unrun: the job keeps crashing its worker."
+        ),
+    )
+    job_backoff_base: float = Field(
+        default=1.0,
+        gt=0,
+        description="Retry delay base (s): delay = random(0, min(cap, base * 2^attempt)).",
+    )
+    job_backoff_cap: float = Field(
+        default=300.0, gt=0, description="Cap (s) on a single retry delay."
+    )
+    scheduler_interval: float = Field(
+        default=0.5,
+        gt=0,
+        description="Seconds between moves of due retries from the delayed set to the stream.",
+    )
+    scheduler_batch: int = Field(
+        default=500, ge=1, description="Max due retries moved per scheduler pass."
+    )
+
+    # ------------------------------------------------------------ consumer cleanup (ADR-029)
+    consumer_prune_idle: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            "Delete a group consumer idle this long (s), but ONLY if it owns zero pending "
+            "entries (deleting one that does would drop its jobs from the PEL)."
+        ),
+    )
+    consumer_prune_interval: float = Field(
+        default=60.0, gt=0, description="Seconds between consumer-cleanup passes."
+    )
+
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(
         default="INFO",
         description="INFO logs lifecycle events only; per-job lines are DEBUG.",
@@ -108,9 +183,37 @@ class Settings(BaseSettings):
             )
         if self.retry_backoff_base > self.retry_backoff_cap:
             raise ValueError("retry_backoff_base must not exceed retry_backoff_cap")
-        # The full ADR-010 relation (attempts x backoff + deliveries x lease + margin)
-        # needs the Phase 2 lease/retry knobs; it is validated once those exist.
+        if self.job_backoff_base > self.job_backoff_cap:
+            raise ValueError("job_backoff_base must not exceed job_backoff_cap")
+        # At least two heartbeats per lease, so one slow or lost heartbeat doesn't
+        # expire the lease of a healthy job (ADR-025).
+        if 2 * self.heartbeat_interval > self.visibility_timeout:
+            raise ValueError(
+                f"heartbeat_interval ({self.heartbeat_interval}s) must be at most half of "
+                f"visibility_timeout ({self.visibility_timeout}s)"
+            )
+        # A live worker touches its consumer at least every block_ms (each XREADGROUP),
+        # so a prune threshold below that would churn live consumers. Safety never depends
+        # on this: pruning only ever deletes consumers that own no entries (ADR-029).
+        if self.consumer_prune_idle * 1000 <= self.block_ms:
+            raise ValueError("consumer_prune_idle must exceed block_ms")
+        if self.done_ttl_seconds and self.done_ttl_seconds < _TTL_MARGIN * self.job_lifetime_bound:
+            raise ValueError(
+                f"done_ttl_seconds ({self.done_ttl_seconds}) must be 0 or at least "
+                f"{_TTL_MARGIN}x the redelivery bound of {self.job_lifetime_bound:.0f}s (ADR-010)"
+            )
         return self
+
+    @property
+    def job_lifetime_bound(self) -> float:
+        """Upper bound (s) on how long copies of a job can keep being redelivered without
+        anyone heartbeating: every attempt can be delivered `max_deliveries` times, each
+        after a full lease, and waits up to `job_backoff_cap` before the next attempt.
+        The done/ledger TTL must outlast this, or a late copy would commit twice (ADR-010).
+        Time spent waiting undelivered in a backlog is NOT covered: size TTLs for that.
+        """
+        per_attempt = self.max_deliveries * self.visibility_timeout + self.job_backoff_cap
+        return self.max_attempts * per_attempt
 
 
 def make_redis(settings: Settings) -> aioredis.Redis:

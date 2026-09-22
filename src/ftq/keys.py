@@ -23,6 +23,16 @@ class Keys:
         return f"{self.prefix}:stream"
 
     @property
+    def delayed(self) -> str:
+        """Sorted set of jobs waiting to be retried, scored by due time (ms, Redis clock)."""
+        return f"{self.prefix}:delayed"
+
+    @property
+    def dead(self) -> str:
+        """Dead-letter stream: jobs that ended DEAD, with why (dlq_* fields)."""
+        return f"{self.prefix}:dead"
+
+    @property
     def results(self) -> str:
         """Append-only log: one entry per *first* commit. The chaos verifier counts it."""
         return f"{self.prefix}:results"

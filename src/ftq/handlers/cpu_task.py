@@ -3,17 +3,19 @@
 import hashlib
 from typing import Any
 
-from ftq.registry import JobContext
+from ftq.models import Job
 
 
-async def cpu_task(ctx: JobContext) -> dict[str, Any]:
+def cpu_task(job: Job) -> dict[str, Any]:
     """Payload: optional `rounds` (int, default 1000).
 
-    Deliberately runs on the event loop: it models real CPU-bound work, which holds the
-    GIL whether or not it's on a thread. It has no side effects, so it needs no ledger.
+    A plain function, registered to run in the worker's process pool (ADR-028). Hashing
+    32 bytes at a time holds the GIL, so on the event loop (or on a thread) a long run
+    would starve the heartbeats, and the reaper would take the job away mid-run. A test
+    proves the pool version keeps its lease. It has no side effects, so it needs no ledger.
     """
-    rounds = int(ctx.job.payload.get("rounds", 1000))
-    digest = ctx.job.job_id.encode()
+    rounds = int(job.payload.get("rounds", 1000))
+    digest = job.job_id.encode()
     for _ in range(rounds):
         digest = hashlib.sha256(digest).digest()
     return {"rounds": rounds, "digest": digest.hex()}
