@@ -1,0 +1,30 @@
+# Local topology. Phase 0: Redis only. Toxiproxy and workers arrive in Phases 3–4
+# (the per-worker proxy topology is designed in Phase 4; see DECISIONS.md ADR-011).
+name: ftq
+
+services:
+  redis:
+    # Pinned; classic stream commands only so we stay portable to Redis/Valkey 7.x (ADR-004).
+    image: redis:8.8.3
+    command:
+      - redis-server
+      # AOF with fsync once per second: a Redis crash can lose up to ~1 s of writes.
+      # Redis data loss is outside the zero-loss claim (SPEC §4, ADR-013).
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      # Hard memory cap with noeviction: when full, writes fail loudly instead of
+      # silently evicting idempotency keys (ADR-013).
+      - --maxmemory
+      - 2gb
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      # Loopback only: never expose an unauthenticated Redis beyond this machine.
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15

@@ -1,0 +1,66 @@
+[project]
+name = "ftq"
+version = "0.1.0"
+description = "A fault-tolerant distributed task queue on Redis Streams: at-least-once delivery, effectively-once effects, chaos-tested."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Mohammed Jasim", email = "mohammedjasim@berkeley.edu" }]
+# Pinned to 3.12 per SPEC §5 (see DECISIONS.md ADR-005).
+requires-python = ">=3.12,<3.13"
+# Runtime deps are added in the phase that first needs them (no premature deps).
+# Exact versions are pinned in uv.lock; these ranges only bound upgrades.
+dependencies = [
+    "redis>=8.1,<9",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3,<3",
+    "pytest>=9.1,<10",
+    "pytest-asyncio>=1.4,<2",
+    "pytest-timeout>=2.4,<3",
+    "ruff>=0.16,<0.17",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.16,<0.12.0"]
+build-backend = "uv_build"
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "B",        # bugbear
+    "UP",       # pyupgrade
+    "SIM",      # simplify
+    "ASYNC",    # common asyncio mistakes (blocking calls in async code)
+    "RUF",      # ruff-specific
+]
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+# Explicit @pytest.mark.asyncio on async tests: makes async-ness visible at the call site.
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
+# A hung test (e.g. a black-holed Redis connection) must fail, not stall CI forever.
+timeout = 60
+markers = [
+    "integration: needs a real Redis (run `make up` first)",
+    "slow: takes more than a few seconds",
+]

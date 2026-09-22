@@ -1,0 +1,45 @@
+# ---- secrets: never commit (SPEC §3.3)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.aws/
+
+# ---- Terraform: state and vars can contain account IDs and secrets
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+.terraform.tfstate.lock.info
+
+# ---- Python / tooling
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# ---- logs and scratch output (raw results under results/ ARE committed)
+*.log
+logs/
+tmp/
+
+# ---- OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
