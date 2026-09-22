@@ -10,8 +10,15 @@ requires-python = ">=3.12,<3.13"
 # Runtime deps are added in the phase that first needs them (no premature deps).
 # Exact versions are pinned in uv.lock; these ranges only bound upgrades.
 dependencies = [
+    "pydantic>=2.13,<3",
+    "pydantic-settings>=2.15,<3",
     "redis>=8.1,<9",
+    "typer>=0.27,<0.28",
+    "uuid-utils>=1.0,<2",   # UUIDv7 job ids (stdlib uuid7 needs 3.14; ADR-005)
 ]
+
+[project.scripts]
+ftq = "ftq.cli:app"
 
 [dependency-groups]
 dev = [
