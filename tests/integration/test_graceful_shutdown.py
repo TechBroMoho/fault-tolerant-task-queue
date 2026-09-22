@@ -6,9 +6,7 @@ The worker's log lines on stderr are the synchronization points (no bare sleeps)
 """
 
 import asyncio
-import os
 import signal
-import sys
 
 import pytest
 import redis.asyncio as aioredis
@@ -18,46 +16,14 @@ from ftq.config import Settings
 from ftq.keys import Keys
 from ftq.metrics import read_counters
 
-from .helpers import hash_of, pel_size, wait_for
+from .helpers import hash_of, pel_size, read_until, start_worker_process, wait_for
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio, pytest.mark.slow]
 
 
 async def _start_worker(settings: Settings, grace: float) -> asyncio.subprocess.Process:
-    env = {
-        **os.environ,
-        "FTQ_REDIS_URL": settings.redis_url,
-        "FTQ_QUEUE": settings.queue,
-        "FTQ_BLOCK_MS": "100",
-        "FTQ_SHUTDOWN_GRACE": str(grace),
-        "FTQ_DONE_TTL_SECONDS": "0",
-        "FTQ_LOG_LEVEL": "INFO",
-    }
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "ftq", "worker", env=env, stderr=asyncio.subprocess.PIPE
-    )
-    await _read_until(proc, ": started (")
+    proc, _worker_id = await start_worker_process(settings, FTQ_SHUTDOWN_GRACE=str(grace))
     return proc
-
-
-async def _read_until(proc: asyncio.subprocess.Process, marker: str, within: float = 10) -> str:
-    """Consume the worker's stderr until a line contains `marker`."""
-    assert proc.stderr is not None
-    seen: list[str] = []
-
-    async def scan() -> str:
-        assert proc.stderr is not None
-        while line := (await proc.stderr.readline()).decode():
-            seen.append(line)
-            if marker in line:
-                return line
-        raise AssertionError(f"worker exited before logging {marker!r}:\n{''.join(seen)}")
-
-    try:
-        return await asyncio.wait_for(scan(), within)
-    except TimeoutError:
-        proc.kill()
-        raise AssertionError(f"no {marker!r} within {within}s:\n{''.join(seen)}") from None
 
 
 async def test_sigterm_lets_in_flight_job_finish_and_stops_fetching(
@@ -72,7 +38,7 @@ async def test_sigterm_lets_in_flight_job_finish_and_stops_fetching(
 
     await wait_for(in_flight)
     proc.send_signal(signal.SIGTERM)
-    await _read_until(proc, "stopped fetching; 1 job(s) in flight")
+    await read_until(proc, "stopped fetching; 1 job(s) in flight")
 
     # The fetch loop has exited: a job enqueued now must NOT be picked up.
     late = await client.enqueue("send_email")
@@ -116,3 +82,29 @@ async def test_sigterm_past_grace_abandons_job_to_pel(
     assert await r.xlen(keys.effects) == 0
     assert await r.xlen(keys.stream) == 1
     assert await pel_size(r, keys.stream, settings.group) == 1
+
+
+async def test_sigterm_past_grace_terminates_process_pool_job(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    """A CPU-bound job in the process pool can't be cancelled like a coroutine, and the
+    interpreter waits for pool children at exit. Past the grace period the worker must
+    kill them, or shutdown wouldn't be bounded by the grace period at all (ADR-028)."""
+    proc = await _start_worker(settings, grace=0.5)
+    job_id = await Client(r, settings).enqueue("cpu_task", {"rounds": 500_000_000})  # ~minutes
+
+    async def in_flight() -> bool:
+        return await pel_size(r, keys.stream, settings.group) == 1
+
+    await wait_for(in_flight)
+    loop = asyncio.get_running_loop()
+    signalled_at = loop.time()
+    proc.send_signal(signal.SIGTERM)
+    _stdout, stderr_tail = await asyncio.wait_for(proc.communicate(), timeout=10)
+    elapsed = loop.time() - signalled_at
+
+    assert proc.returncode == 0, stderr_tail.decode()
+    assert "abandoning 1 in-flight job(s)" in stderr_tail.decode()
+    assert elapsed < 5  # the grace period, not the job, bounded the shutdown
+    assert not await r.exists(keys.done(job_id))
+    assert await pel_size(r, keys.stream, settings.group) == 1  # left for a reaper

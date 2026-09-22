@@ -42,7 +42,7 @@ async def _commit(
     ttl: int = 0,
 ) -> int:
     outcome = await script(
-        keys=[keys.stream, keys.done(job.job_id), keys.results, keys.stats],
+        keys=[keys.stream, keys.done(job.job_id), keys.results, keys.stats, keys.dead],
         args=[settings.group, entry_id, job.job_id, '{"n":1}', ttl, worker_id, job.enqueued_at_ms],
     )
     return int(outcome)
