@@ -325,3 +325,30 @@ iCloud's conflict handling can corrupt a git repository.
 **Consequences.** No machine-specific workaround in the repo. After the move, the recreated
 `.venv` has no hidden flag and `import ftq` works. If the project is ever cloned back into
 `~/Desktop` or `~/Documents` on a Mac with iCloud Desktop sync, this failure comes back.
+
+---
+
+## ADR-015: No HTTP enqueue endpoint; backpressure lives in the library
+
+*Status: accepted (Phase 0 review; affects Phase 3).*
+
+**Context.** SPEC §4 and Phase 3 list an *optional* FastAPI enqueue endpoint that turns
+`QueueFull` into `429 Too Many Requests` with a `Retry-After` header.
+
+**Options.** (a) build the endpoint (FastAPI + uvicorn, a container, and tests);
+(b) keep backpressure in the library only: `enqueue()` raises `QueueFull` in `reject` mode and
+waits in `block` mode.
+
+**Decision.** (b), per Mohammed.
+- The mechanism is the high/low watermarks, the cached depth check, and hysteresis. It sits in
+  `client.py` either way. An HTTP layer would only translate an exception into a status code,
+  and adds nothing to the correctness or throughput story.
+- The "throttling intake during traffic spikes" claim (SPEC §9) is backed by the backpressure
+  benchmark: offered vs. accepted rate, bounded queue depth, and rejected/blocked counts. The
+  benchmark calls the library directly.
+- It avoids two dependencies, a service to deploy on AWS, and an extra network hop that would
+  make enqueue-latency numbers harder to interpret.
+
+**Consequences.** Web apps would call `enqueue()` in-process, like Celery/RQ clients do. An HTTP
+front end would be a thin addition later (catch `QueueFull`, return 429 + `Retry-After`) and is
+listed as future work. The README must not imply an HTTP API exists.
