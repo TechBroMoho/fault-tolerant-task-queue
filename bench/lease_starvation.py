@@ -11,6 +11,7 @@ import secrets
 import signal
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root: reuse the test helpers
 from tests.integration.helpers import hash_of, start_worker_process, wait_for, watching_lease
@@ -26,11 +27,11 @@ ENV = {
 }
 
 
-async def once(handlers: str, job_type: str, payload: dict) -> tuple[int, int, int]:
+async def once(handlers: str, job_type: str, payload: dict[str, Any]) -> tuple[int, int, int]:
     s = Settings(queue=f"measure-{secrets.token_hex(4)}", block_ms=100, done_ttl_seconds=0)
     keys = Keys(s.queue)
     r = make_redis(s)
-    proc, _ = await start_worker_process(s, handlers=handlers, **ENV)
+    proc, _ = await start_worker_process(s, handlers=handlers, env=ENV)
     try:
         job_id = await Client(r, s).enqueue(job_type, payload)
         async with watching_lease(r, keys.stream, s.group) as w:
@@ -39,7 +40,8 @@ async def once(handlers: str, job_type: str, payload: dict) -> tuple[int, int, i
                 return (await hash_of(r, keys.done(job_id))).get("state") == "SUCCEEDED"
 
             await wait_for(done, within=60)
-        [(_i, e)] = await r.xrange(keys.results)
+        results: Any = await r.xrange(keys.results)
+        [(_i, e)] = results
         return w.max_idle_ms, w.samples, int(e["finished_at_ms"]) - int(e["enqueued_at_ms"])
     finally:
         proc.send_signal(signal.SIGTERM)
@@ -51,7 +53,7 @@ async def once(handlers: str, job_type: str, payload: dict) -> tuple[int, int, i
 
 
 async def main() -> None:
-    for label, h, t, p in [
+    runs: list[tuple[str, str, str, dict[str, Any]]] = [
         ("cpu_task, process pool", "ftq.handlers:registry", "cpu_task", {"rounds": 12_000_000}),
         (
             "hog_on_loop (control) ",
@@ -59,7 +61,8 @@ async def main() -> None:
             "hog_on_loop",
             {"seconds": 2.5},
         ),
-    ]:
+    ]
+    for label, h, t, p in runs:
         for i in range(3):
             idle, n, run = await once(h, t, p)
             print(
