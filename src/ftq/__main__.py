@@ -2,7 +2,8 @@
 
 from ftq.cli import app
 
-# The guard matters: process-pool children are started with "spawn", which re-imports
-# the parent's main module in each child. Without it, every child would start the CLI.
+# Conventional hygiene, not a fix: multiprocessing's "spawn" does NOT re-run a package's
+# __main__ module in pool children (CPython's spawn._fixup_main_from_name skips any
+# `*.__main__`), so the process pool is safe either way (ADR-028).
 if __name__ == "__main__":
     app()

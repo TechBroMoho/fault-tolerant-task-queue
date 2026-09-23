@@ -315,7 +315,12 @@ class Worker:
             failure = exc
         finally:
             if heartbeat is not None:
+                # Wait for it to actually stop, so no beat still in flight on the client
+                # side lands after the transition below. (One that does is harmless: the
+                # ownership check turns it into LEASE_LOST. But it would log a false
+                # "lost the lease" and inflate the lease_lost counter.)
                 heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
 
         if failure is not None:
             await self._fail(entry_id, job, failure)
@@ -331,6 +336,14 @@ class Worker:
             # reruns, and the ledger suppresses its effects).
             log.warning(
                 "worker %s: commit of job %s failed (%s); left for redelivery",
+                self.worker_id,
+                job.job_id,
+                exc,
+            )
+            return
+        except RedisError as exc:  # a server-side error: a bug or unexpected key state
+            log.error(
+                "worker %s: commit of job %s errored (%r); left in the PEL",
                 self.worker_id,
                 job.job_id,
                 exc,
@@ -402,9 +415,9 @@ class Worker:
         )
         try:
             outcome = await self._transitions.retry(entry_id, job, delay)
-        except (*_REDIS_DOWN, ResponseError) as err:
+        except RedisError as err:
             log.warning(
-                "worker %s: could not schedule retry of job %s (%s); left in the PEL",
+                "worker %s: could not schedule retry of job %s (%r); left in the PEL",
                 self.worker_id,
                 job.job_id,
                 err,
@@ -432,9 +445,9 @@ class Worker:
     ) -> None:
         try:
             outcome = await self._transitions.dead(entry_id, job_id, reason, error, attempts)
-        except _REDIS_DOWN as exc:
+        except RedisError as exc:
             log.warning(
-                "worker %s: could not move job %s to the DLQ (%s); left in the PEL",
+                "worker %s: could not move job %s to the DLQ (%r); left in the PEL",
                 self.worker_id,
                 job_id,
                 exc,

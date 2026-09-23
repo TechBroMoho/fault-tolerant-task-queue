@@ -8,13 +8,15 @@ import sys
 import pytest
 import redis.asyncio as aioredis
 
+from ftq import dlq
 from ftq.client import Client
 from ftq.config import Settings
+from ftq.handlers import registry as builtin_registry
 from ftq.keys import Keys
 from ftq.metrics import read_counters
 from ftq.registry import JobContext, Registry
 
-from .helpers import REPO_ROOT, entries, fast, hash_of, running_worker, wait_for
+from .helpers import REPO_ROOT, add_entry, entries, fast, hash_of, running_worker, wait_for
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -100,3 +102,30 @@ async def test_dlq_requeue_cli_argument_handling(
     assert "not DEAD" in err
     code, out, _err = await _ftq(settings, "dlq", "requeue", "--all")
     assert (code, out.strip()) == (0, "requeued 0")
+
+
+async def test_requeue_all_is_bounded_while_workers_keep_killing_jobs(
+    r: aioredis.Redis, settings: Settings, keys: Keys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`dlq requeue --all` against a live system: every requeued poison job dies again
+    within milliseconds and lands at the END of the DLQ. The sweep must requeue what was
+    in the DLQ when it started, once each, and stop. It must not chase the new entries.
+    Also: an orphan entry (no DEAD record) is skipped without stalling the sweep."""
+    s = fast(settings, max_attempts=1)  # a poison job dies on its first failure
+    n = 20
+    client = Client(r, s)
+    job_ids = [await client.enqueue("poison") for _ in range(n)]
+    await add_entry(r, keys.dead, {"dlq_job_id": "orphan", "type": "poison"})  # no DEAD record
+    monkeypatch.setattr(dlq, "_PAGE", 1)  # one entry per page: maximum interleaving
+
+    async with running_worker(r, s, builtin_registry):
+
+        async def all_dead() -> bool:
+            states = [(await hash_of(r, keys.done(j))).get("state") for j in job_ids]
+            return states == ["DEAD"] * n
+
+        await wait_for(all_dead)
+        requeued = await asyncio.wait_for(dlq.requeue_all(r, keys), timeout=10)
+
+    assert requeued == n
+    assert (await read_counters(r, keys))["requeued"] == n

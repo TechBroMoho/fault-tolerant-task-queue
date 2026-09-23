@@ -98,7 +98,7 @@ class Settings(BaseSettings):
     heartbeat_interval: float = Field(
         default=10.0,
         gt=0,
-        description="Seconds between lease extensions of a running job; at most half the lease.",
+        description="Seconds between lease extensions of a running job; at most lease / 3.",
     )
     reap_interval: float = Field(
         default=5.0,
@@ -185,11 +185,13 @@ class Settings(BaseSettings):
             raise ValueError("retry_backoff_base must not exceed retry_backoff_cap")
         if self.job_backoff_base > self.job_backoff_cap:
             raise ValueError("job_backoff_base must not exceed job_backoff_cap")
-        # At least two heartbeats per lease, so one slow or lost heartbeat doesn't
-        # expire the lease of a healthy job (ADR-025).
-        if 2 * self.heartbeat_interval > self.visibility_timeout:
+        # Beats land every interval + one round trip. If one is lost, idle reaches
+        # 2 x (interval + RTT) before the next lands, so at interval = lease/2 a single
+        # lost beat would already let the reaper take a healthy job. A third of the lease
+        # leaves a full interval of margin for one lost or slow beat (ADR-025).
+        if 3 * self.heartbeat_interval > self.visibility_timeout:
             raise ValueError(
-                f"heartbeat_interval ({self.heartbeat_interval}s) must be at most half of "
+                f"heartbeat_interval ({self.heartbeat_interval}s) must be at most a third of "
                 f"visibility_timeout ({self.visibility_timeout}s)"
             )
         # A live worker touches its consumer at least every block_ms (each XREADGROUP),

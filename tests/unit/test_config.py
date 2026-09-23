@@ -39,11 +39,14 @@ def test_negative_values_rejected() -> None:
             Settings.model_validate({field: -1})
 
 
-def test_heartbeat_at_most_half_the_lease() -> None:
-    # At least two heartbeats per lease, so one lost beat doesn't expire a healthy job.
+def test_heartbeat_at_most_a_third_of_the_lease() -> None:
+    # One lost beat lets idle reach 2 x (interval + RTT). At interval = lease/2 that is
+    # already past the lease, so half is rejected; a third leaves a full interval spare.
     with pytest.raises(ValidationError, match="heartbeat_interval"):
-        Settings(visibility_timeout=10.0, heartbeat_interval=5.1)
-    Settings(visibility_timeout=10.0, heartbeat_interval=5.0)
+        Settings(visibility_timeout=10.0, heartbeat_interval=5.0)
+    with pytest.raises(ValidationError, match="heartbeat_interval"):
+        Settings(visibility_timeout=9.0, heartbeat_interval=3.01)
+    Settings(visibility_timeout=9.0, heartbeat_interval=3.0)
 
 
 def test_job_backoff_base_cannot_exceed_cap() -> None:
@@ -79,4 +82,4 @@ def test_done_ttl_must_outlast_redelivery_bound() -> None:
 def test_defaults_are_consistent() -> None:
     s = Settings()
     assert s.done_ttl_seconds >= 10 * s.job_lifetime_bound
-    assert 2 * s.heartbeat_interval <= s.visibility_timeout
+    assert 3 * s.heartbeat_interval <= s.visibility_timeout

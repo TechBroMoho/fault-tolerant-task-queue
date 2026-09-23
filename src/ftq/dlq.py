@@ -62,13 +62,22 @@ async def requeue(redis: aioredis.Redis, keys: Keys, job_id: str) -> bool:
 
 
 async def requeue_all(redis: aioredis.Redis, keys: Keys) -> int:
-    """Requeue every DLQ entry that is DEAD; return how many were requeued."""
+    """Requeue every job that was in the DLQ when this call started; return how many.
+
+    The sweep is bounded by the DLQ's last entry id at the start. With workers running, a
+    requeued job that fails again lands at the END of the DLQ within milliseconds; an
+    unbounded sweep would chase those new entries and never finish (a test reproduces
+    exactly that). Pages use an exclusive start after the previous page, so an entry
+    that can't be requeued (it's still there) isn't read again either.
+    """
+    last: Any = await redis.xrevrange(keys.dead, count=1)
+    if not last:
+        return 0
+    end = last[0][0]
     total = 0
     start = "-"
     while True:
-        # Exclusive start after the last page, so an entry that couldn't be requeued
-        # (and so is still there) isn't read again forever.
-        page: Any = await redis.xrange(keys.dead, min=start, count=_PAGE)
+        page: Any = await redis.xrange(keys.dead, min=start, max=end, count=_PAGE)
         if not page:
             return total
         for _eid, fields in page:

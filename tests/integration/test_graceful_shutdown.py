@@ -22,7 +22,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio, pytest.mark.slow]
 
 
 async def _start_worker(settings: Settings, grace: float) -> asyncio.subprocess.Process:
-    proc, _worker_id = await start_worker_process(settings, FTQ_SHUTDOWN_GRACE=str(grace))
+    proc, _worker_id = await start_worker_process(settings, env={"FTQ_SHUTDOWN_GRACE": str(grace)})
     return proc
 
 

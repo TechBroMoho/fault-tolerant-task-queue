@@ -170,12 +170,17 @@ async def watching_lease(
 
 
 async def start_worker_process(
-    settings: Settings, handlers: str = "ftq.handlers:registry", **env: str
+    settings: Settings,
+    handlers: str = "ftq.handlers:registry",
+    new_session: bool = False,
+    env: dict[str, str] | None = None,
 ) -> tuple[asyncio.subprocess.Process, str]:
     """Start `python -m ftq worker` and wait for its "started" log line.
 
-    `env` adds FTQ_* variables (e.g. FTQ_VISIBILITY_TIMEOUT="0.5"). Returns the process
-    and its worker id (its consumer name), parsed from the log line.
+    `env` adds FTQ_* variables (e.g. FTQ_VISIBILITY_TIMEOUT="0.5"). `new_session` gives
+    the worker its own process group, so a test can signal the worker AND its pool
+    children at once, like Ctrl-C in a terminal. Returns the process and its worker id
+    (its consumer name), parsed from the log line.
     """
     full_env = {
         **os.environ,
@@ -184,7 +189,7 @@ async def start_worker_process(
         "FTQ_BLOCK_MS": "100",
         "FTQ_DONE_TTL_SECONDS": "0",
         "FTQ_LOG_LEVEL": "INFO",
-        **env,
+        **(env or {}),
     }
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -196,6 +201,7 @@ async def start_worker_process(
         env=full_env,
         cwd=REPO_ROOT,  # so test-only handler modules (tests.integration.*) import
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=new_session,
     )
     line = await read_until(proc, ": started (")
     worker_id = line.split("worker ", 1)[1].split(": started", 1)[0]

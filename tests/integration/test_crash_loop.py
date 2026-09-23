@@ -39,14 +39,14 @@ async def test_crash_looping_job_hits_max_deliveries_and_goes_to_dlq(
     # Deliveries 1 and 2: each worker takes the job (the first by XREADGROUP, the second
     # by reclaiming it once the dead worker's lease expires) and dies running it.
     for delivery in (1, 2):
-        proc, _worker_id = await start_worker_process(settings, **ENV)
+        proc, _worker_id = await start_worker_process(settings, env=ENV)
         code = await asyncio.wait_for(proc.wait(), timeout=15)
         assert code == CRASH_EXIT_CODE, f"delivery {delivery}: worker exited {code}"
         assert not await r.exists(keys.done(job_id))
 
     # Delivery 3 > max_deliveries (2): this worker reclaims the entry and, seeing the
     # count, sends it to the DLQ without running it. So this worker survives.
-    proc, survivor = await start_worker_process(settings, **ENV)
+    proc, survivor = await start_worker_process(settings, env=ENV)
     try:
 
         async def dead() -> bool:

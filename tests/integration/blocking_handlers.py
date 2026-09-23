@@ -7,6 +7,7 @@ in test_blocking_handlers.py really can detect starved heartbeats.
 """
 
 import hashlib
+import os
 import time
 from typing import Any
 
@@ -32,3 +33,29 @@ def blocking_io(job: Job) -> dict[str, Any]:
 
 
 registry.register_sync("blocking_io", pool="thread")(blocking_io)
+
+
+def crash_child_on_first_attempt(job: Job) -> dict[str, Any]:
+    """Kills the pool child process (not the worker) on attempt 0, then succeeds."""
+    if job.attempt == 0:
+        os._exit(3)
+    return {"attempt": job.attempt}
+
+
+registry.register_sync("crash_child_on_first_attempt", pool="process")(crash_child_on_first_attempt)
+
+
+def spin_after_marking(job: Job) -> dict[str, Any]:
+    """Writes the file at payload["marker"] from INSIDE the pool child, then burns CPU for
+    payload["seconds"]. The marker tells a test the child exists and is mid-job, so a
+    signal sent after it really does hit a running child."""
+    with open(job.payload["marker"], "w") as f:
+        f.write(str(os.getpid()))
+    deadline = time.monotonic() + float(job.payload["seconds"])
+    digest = b"x"
+    while time.monotonic() < deadline:
+        digest = hashlib.sha256(digest).digest()
+    return {"digest": digest.hex()}
+
+
+registry.register_sync("spin_after_marking", pool="process")(spin_after_marking)

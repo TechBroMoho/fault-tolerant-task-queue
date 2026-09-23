@@ -6,6 +6,7 @@ a worker that really dies, so it lives in test_crash_loop.py with real subproces
 
 import asyncio
 import json
+from typing import Any
 
 import pytest
 import redis.asyncio as aioredis
@@ -15,6 +16,7 @@ from ftq.config import Settings
 from ftq.handlers import registry as builtin_registry
 from ftq.keys import Keys
 from ftq.metrics import read_counters
+from ftq.models import Job
 from ftq.registry import JobContext, Registry
 
 from .helpers import (
@@ -130,8 +132,14 @@ async def test_malformed_and_unknown_jobs_go_straight_to_dlq(
         await _wait_state(r, keys, unknown, "DEAD")
         await _wait_state(r, keys, "broken", "DEAD")
 
-    reasons = {f["dlq_job_id"]: f["dlq_reason"] for _id, f in await entries(r, keys.dead)}
-    assert reasons == {unknown: "unknown_type", "broken": "malformed"}
+    dead = {f["dlq_job_id"]: f for _id, f in await entries(r, keys.dead)}
+    assert {j: f["dlq_reason"] for j, f in dead.items()} == {
+        unknown: "unknown_type",
+        "broken": "malformed",
+    }
+    # "Straight to": first delivery, no handler run, no retry.
+    for fields in dead.values():
+        assert (fields["dlq_attempts"], fields["dlq_deliveries"]) == ("0", "1")
     assert (await read_counters(r, keys))["retried"] == 0
     await _assert_drained(r, keys, s.group)
 
@@ -284,3 +292,61 @@ async def test_heartbeats_stop_after_the_lease_is_lost(
         assert counters["lease_lost"] == 1  # after one refusal
         release.set()
         await _wait_state(r, keys, job_id, "SUCCEEDED")  # commit is first-wins: fine
+
+
+async def test_worker_schedules_retry_within_the_backoff_bound(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    """The unit tests bound the backoff formula; this checks the worker actually applies
+    it. After attempt 0 fails, the retry's due time must be at most base x 2^0 = 2 s past
+    the failure, and the job must not run again before it's due."""
+    s = fast(settings, job_backoff_base=2.0, job_backoff_cap=2.0)
+    before_ms = int((await r.time())[0]) * 1000
+    job_id = await Client(r, s).enqueue("flaky", {"fail_times": 1})
+    async with running_worker(r, s, builtin_registry):
+
+        async def retry_parked() -> bool:
+            return bool(await r.zcard(keys.delayed))
+
+        await wait_for(retry_parked)
+        secs, micros = await r.time()
+        after_ms = int(secs) * 1000 + int(micros) // 1000
+        delayed: Any = await r.zrange(keys.delayed, 0, -1, withscores=True)
+        [(_member, due_ms)] = delayed
+        assert before_ms <= due_ms <= after_ms + 2000
+        if due_ms > after_ms + 100:  # comfortably in the future: must not have run yet
+            assert (await read_counters(r, keys))["scheduled"] == 0
+        await _wait_state(r, keys, job_id, "SUCCEEDED")
+    assert (await read_counters(r, keys))["scheduled"] == 1
+
+
+async def test_scheduler_drains_a_backlog_without_waiting_between_full_batches(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    """ADR-026: a full batch means more may be due, so the mover goes again at once. With a
+    30 s scheduler interval and a batch of 5, 23 due retries are moved in well under a
+    second. If it slept after every batch, only the first 5 would move."""
+    s = fast(settings, scheduler_interval=30.0, scheduler_batch=5)
+    now_ms = int((await r.time())[0]) * 1000
+    members = {}
+    for i in range(23):
+        fields = {
+            **Job(job_id=f"backlog-{i}", type="send_email").to_fields(),
+            "enqueued_at_ms": str(now_ms),
+        }
+        flat = [x for name_value in fields.items() for x in name_value]  # retry.lua's format
+        members[json.dumps(flat)] = now_ms - 1000  # due a second ago
+    await r.zadd(keys.delayed, members)
+
+    async with running_worker(r, s, builtin_registry):
+
+        async def all_moved() -> bool:
+            return (await read_counters(r, keys))["scheduled"] == 23
+
+        await wait_for(all_moved, within=2)
+
+        async def all_done() -> bool:
+            return (await read_counters(r, keys))["processed"] == 23
+
+        await wait_for(all_done)
+    await _assert_drained(r, keys, s.group)

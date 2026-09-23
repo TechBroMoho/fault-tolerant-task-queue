@@ -23,7 +23,17 @@ from ftq.reaper import Reaper
 from ftq.scheduler import Scheduler
 from ftq.transitions import Commit, DeadReason, Outcome, Transitions
 
-from .helpers import add_entry, deliver, entries, fast, hash_of, pel_size, pending, wait_for
+from .helpers import (
+    add_entry,
+    deliver,
+    entries,
+    fast,
+    hash_of,
+    pel_size,
+    pending,
+    wait_for,
+    with_,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -298,7 +308,9 @@ async def test_concurrent_schedulers_never_move_a_job_twice(
             moved += n
         return moved
 
-    totals = await asyncio.gather(*(drain() for _ in range(10)))
+    # Bounded: if a move weren't atomic (or didn't remove its member), the schedulers
+    # would keep re-moving jobs forever; fail clearly instead of hanging until timeout.
+    totals = await asyncio.wait_for(asyncio.gather(*(drain() for _ in range(10))), timeout=10)
     assert sum(totals) == 200
     moved_ids = sorted(fields["job_id"] for _id, fields in await entries(r, keys.stream))
     assert moved_ids == sorted(str(i) for i in range(200))
@@ -391,3 +403,116 @@ async def test_requeue_all_and_list(r: aioredis.Redis, settings: Settings, keys:
     assert await dlq.list_dead(r, keys) == []
     stream_ids: Any = [f["job_id"] for _id, f in await entries(r, keys.stream)]
     assert stream_ids == job_ids
+
+
+async def test_reaper_cursor_continues_through_a_long_pel(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    """XAUTOCLAIM examines at most COUNT x 10 PEL entries per call. A stale entry behind
+    25 healthy ones is only reached if the reaper keeps its cursor between passes, and
+    `more` says when a pass stopped early (the worker then reaps again right away)."""
+    s = with_(settings, visibility_timeout=30.0)
+    client = Client(r, s)
+    await r.xgroup_create(keys.stream, s.group, id="0", mkstream=True)
+    for _ in range(26):
+        await client.enqueue("t")
+        await deliver(r, keys.stream, s.group, "alive")
+    stale = (await pending(r, keys.stream, s.group))[-1].entry_id
+    # Make only the LAST entry look expired: XCLAIM's IDLE option sets its idle time.
+    await r.xclaim(keys.stream, s.group, "crashed", 0, [stale], idle=60_000)
+
+    reaper = Reaper(r, s, "reaper")
+    passes: list[tuple[list[str], bool]] = []
+    for _ in range(3):
+        claimed, more = await reaper.reclaim(count=1)
+        passes.append(([c.entry_id for c in claimed], more))
+    # Passes 1-2 scan 10 healthy entries each and stop early; pass 3 reaches the stale one
+    # and finishes the scan.
+    assert passes == [([], True), ([], True), ([stale], False)]
+
+
+async def test_reclaim_reports_pending_entries_whose_data_was_deleted(
+    r: aioredis.Redis, settings: Settings, keys: Keys, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Something outside ftq deleted a pending entry's data (our exits always ack first).
+    XAUTOCLAIM drops the id from the PEL, since there's nothing left to run, and the
+    reaper logs it at ERROR: each one is a job no worker can ever run."""
+    s = fast(settings)
+    await Client(r, s).enqueue("t")
+    await r.xgroup_create(keys.stream, s.group, id="0", mkstream=True)
+    entry = await deliver(r, keys.stream, s.group, "crashed")
+    await r.xdel(keys.stream, entry)  # data gone, still pending
+    assert await pel_size(r, keys.stream, s.group) == 1
+
+    # Let the lease expire naturally. (Faking the idle time with XCLAIM ... IDLE would not
+    # work: on Redis 7+, XCLAIM itself drops a pending id whose data is gone.)
+    async def expired() -> bool:
+        return (await pending(r, keys.stream, s.group))[0].idle_ms >= 500
+
+    await wait_for(expired)
+
+    claimed, _more = await Reaper(r, s, "reaper").reclaim(count=10)
+
+    assert claimed == []
+    assert await pel_size(r, keys.stream, s.group) == 0
+    errors = [rec for rec in caplog.records if rec.levelname == "ERROR"]
+    assert len(errors) == 1 and entry in errors[0].getMessage()
+
+
+# ---------------------------------------------------------------- cross-path races
+
+
+async def test_stale_commit_after_the_reclaimer_scheduled_a_retry(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    """a stalls; b reclaims, its run fails, and b schedules a retry. Then a finishes and
+    commits. The work was done, so a's commit is the (first-wins) success. The pending
+    retry must not produce a second result, and if it keeps failing it must not
+    overwrite SUCCEEDED."""
+    job = await _setup(r, settings, keys)
+    entry = await deliver(r, keys.stream, settings.group, "a")
+    await _steal(r, settings, keys, entry, to="b")
+    assert await _as(r, settings, "b").retry(entry, job, delay_s=0) is Outcome.OK
+
+    assert await _as(r, settings, "a").commit(entry, job, "{}") is Commit.COMMITTED
+
+    # The retry comes due and is delivered: a success is suppressed...
+    assert await Scheduler(r, settings).move_due() == 1
+    retry_entry = await deliver(r, keys.stream, settings.group, "c")
+    retry_job = job.model_copy(update={"attempt": 1})
+    await add_entry(r, keys.stream, (await entries(r, keys.stream))[0][1])  # a 2nd copy
+    copy_entry = await deliver(r, keys.stream, settings.group, "d")
+    assert await _as(r, settings, "c").commit(retry_entry, retry_job, "{}") is Commit.DUPLICATE
+    # ...and a failure is dropped, not retried again or dead-lettered.
+    assert await _as(r, settings, "d").retry(copy_entry, retry_job, 0) is Outcome.TERMINAL
+
+    assert (await hash_of(r, keys.done(job.job_id)))["state"] == "SUCCEEDED"
+    assert await r.xlen(keys.results) == 1
+    assert await r.zcard(keys.delayed) == 0
+    assert await r.xlen(keys.dead) == 0
+    assert await r.xlen(keys.stream) == 0
+    assert await pel_size(r, keys.stream, settings.group) == 0
+
+
+async def test_stale_commit_after_the_job_was_dead_lettered_and_requeued(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    """a stalls; b reclaims and dead-letters the job; an operator requeues it. Then a
+    finishes. Requeue cleared DEAD, so a's commit is a plain first success (not a late
+    success), and the requeued copy becomes a suppressed duplicate. One result."""
+    job = await _setup(r, settings, keys)
+    entry = await deliver(r, keys.stream, settings.group, "a")
+    await _steal(r, settings, keys, entry, to="b")
+    b = _as(r, settings, "b")
+    assert await b.dead(entry, job.job_id, DeadReason.MAX_DELIVERIES, "x", 1) is Outcome.OK
+    assert await dlq.requeue(r, keys, job.job_id)
+
+    assert await _as(r, settings, "a").commit(entry, job, "{}") is Commit.COMMITTED
+
+    requeued_entry = await deliver(r, keys.stream, settings.group, "c")
+    requeued = job.model_copy(update={"attempt": 0})
+    assert await _as(r, settings, "c").commit(requeued_entry, requeued, "{}") is Commit.DUPLICATE
+    assert (await hash_of(r, keys.done(job.job_id)))["state"] == "SUCCEEDED"
+    assert await r.xlen(keys.results) == 1
+    assert await r.xlen(keys.dead) == 0
+    assert await pel_size(r, keys.stream, settings.group) == 0

@@ -135,3 +135,37 @@ async def test_running_worker_prunes_only_empty_idle_consumers(
 
     assert await consumers(r, keys.stream, s.group) == {"crashed": 1, "live": 0}
     assert not await r.exists(keys.done(job_id))  # not run yet: its lease hasn't expired
+
+
+async def test_live_idle_workers_never_prune_each_other(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    """The earlier tests only show a worker doesn't prune ITSELF (it's excluded by name).
+    This one checks the threshold against Redis's actual `idle` semantics: two live
+    workers with nothing to do, each pruning every 0.05 s with a 0.3 s threshold, never
+    delete each other. On Redis 7.2+, `idle` counts from the last *attempted* read, and an
+    idle worker attempts one every block_ms (0.1 s). By contrast, `inactive` counts from
+    the last read that returned entries, and it is -1 for a consumer that never had one.
+    So each consumer first gets one successful read, and the test checks that `inactive`
+    grew past the threshold. Pruning on the wrong field would then have deleted both."""
+    s = _prune_settings(settings)
+    client = Client(r, s)
+    await r.xgroup_create(keys.stream, s.group, id="0", mkstream=True)
+    for name in ("A", "B"):  # one successful read each, fully acked: nothing left pending
+        await client.enqueue("send_email")
+        entry = await deliver(r, keys.stream, s.group, name)
+        await r.xack(keys.stream, s.group, entry)
+        await r.xdel(keys.stream, entry)
+
+    async with (
+        running_worker(r, s, builtin_registry, worker_id="A"),
+        running_worker(r, s, builtin_registry, worker_id="B"),
+    ):
+        # ~10x the prune threshold of pure idling, with a prune pass every 0.05 s.
+        for _ in range(30):
+            await asyncio.sleep(0.1)  # observing that nothing happens over time
+            assert set(await consumers(r, keys.stream, s.group)) == {"A", "B"}
+        info = await r.xinfo_consumers(keys.stream, s.group)
+    assert all(c["idle"] < PRUNE_IDLE * 1000 for c in info), info
+    assert all(c["inactive"] > PRUNE_IDLE * 1000 for c in info), info  # the trap was armed
+    assert (await read_counters(r, keys))["consumers_pruned"] == 0

@@ -12,7 +12,10 @@ own event loop (and so its sampling) can't be blocked by the handler.
 """
 
 import asyncio
+import json
+import os
 import signal
+from pathlib import Path
 
 import pytest
 import redis.asyncio as aioredis
@@ -68,7 +71,7 @@ async def test_long_cpu_task_in_process_pool_keeps_its_lease(
     """A cpu_task running for over two leases, with a second worker's reaper armed the
     whole time. The job must never be reclaimed: its heartbeats keep running because the
     hashing happens in a pool process, not on the event loop."""
-    proc, worker_a = await start_worker_process(settings, **LEASE_ENV)
+    proc, worker_a = await start_worker_process(settings, env=LEASE_ENV)
     try:
         job_id = await Client(r, settings).enqueue("cpu_task", {"rounds": CPU_ROUNDS})
         await _owned_by(r, keys, settings.group, worker_a)
@@ -112,7 +115,7 @@ async def test_control_cpu_work_on_the_event_loop_does_lose_its_lease(
     awaits. Its heartbeats can't run, so the lease lapses. This shows the measurement
     above can see starvation: if the pool version were starving too, it would fail."""
     proc, worker_a = await start_worker_process(
-        settings, handlers="tests.integration.blocking_handlers:registry", **LEASE_ENV
+        settings, handlers="tests.integration.blocking_handlers:registry", env=LEASE_ENV
     )
     try:
         job_id = await Client(r, settings).enqueue("hog_on_loop", {"seconds": 2.5 * LEASE})
@@ -157,3 +160,59 @@ async def test_blocking_io_in_thread_pool_keeps_its_lease(
     # loop was never blocked; a blocked loop would also have frozen the sampler.
     assert watch.samples >= 30, watch
     assert (await read_counters(r, keys))["reclaimed"] == 0
+
+
+async def test_ctrl_c_drains_a_process_pool_job_instead_of_failing_it(
+    r: aioredis.Redis, settings: Settings, keys: Keys, tmp_path: Path
+) -> None:
+    """Ctrl-C sends SIGINT to the whole foreground process group: the worker AND its pool
+    children. The worker treats it as "drain". A child must ignore it (the pool's
+    initializer), or it would die of KeyboardInterrupt mid-job and a graceful stop would
+    turn into a failed attempt. The signal is sent only once the job has written its
+    marker from inside the child, so it provably hits a child that is mid-job."""
+    proc, _worker_a = await start_worker_process(
+        settings,
+        handlers="tests.integration.blocking_handlers:registry",
+        new_session=True,
+        env={"FTQ_SHUTDOWN_GRACE": "30"},
+    )
+    marker = tmp_path / "child-running"
+    job_id = await Client(r, settings).enqueue(
+        "spin_after_marking", {"marker": str(marker), "seconds": 1.0}
+    )
+
+    async def child_mid_job() -> bool:
+        return marker.exists()
+
+    await wait_for(child_mid_job, within=15)
+    assert int(marker.read_text()) != proc.pid  # it really is a separate process
+    os.killpg(proc.pid, signal.SIGINT)  # the whole group, like a terminal's Ctrl-C
+    _out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+
+    assert proc.returncode == 0, err.decode()
+    assert (await hash_of(r, keys.done(job_id))).get("state") == "SUCCEEDED", err.decode()
+    counters = await read_counters(r, keys)
+    assert (counters["retried"], counters["processed"]) == (0, 1)
+
+
+async def test_a_dead_pool_child_fails_one_attempt_and_the_pool_is_replaced(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    """A pool child dies mid-job (os._exit in the child: the worker process survives).
+    That attempt fails with BrokenProcessPool, the worker replaces the broken pool, and
+    the retry succeeds in a fresh child. Without the replacement, every later
+    process-pool job would fail instantly on the dead pool."""
+    s = fast(settings, max_attempts=3)
+    job_id = await Client(r, s).enqueue("crash_child_on_first_attempt")
+    async with running_worker(r, s, blocking_handlers.registry):
+
+        async def done() -> bool:
+            return (await hash_of(r, keys.done(job_id))).get("state") == "SUCCEEDED"
+
+        await wait_for(done, within=20)
+
+    # Attempt 1 ran (and returned) in a process pool, which is only possible if the broken
+    # pool was replaced: a broken ProcessPoolExecutor rejects every later submission.
+    assert json.loads((await hash_of(r, keys.done(job_id)))["result"]) == {"attempt": 1}
+    counters = await read_counters(r, keys)
+    assert (counters["retried"], counters["dead"]) == (1, 0)

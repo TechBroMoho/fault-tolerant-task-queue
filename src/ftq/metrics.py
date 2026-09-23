@@ -18,7 +18,9 @@ succeeded late counts once in `dead` and once in `late_successes`.
 - reclaimed: entries a reaper took over after their lease expired (reclaim.lua)
 - heartbeats: successful lease extensions (heartbeat.lua)
 - lease_lost: heartbeat/retry/DLQ calls refused because the caller no longer owned the
-  entry (heartbeat.lua, retry.lua, dead.lua)
+  entry (heartbeat.lua, retry.lua, dead.lua). An upper bound on real lease losses: a
+  retry or DLQ move re-sent after a lost reply is also refused (its first run already
+  acked the entry) and counts here too.
 - consumers_pruned: idle consumer records with no pending entries deleted
   (prune_consumers.lua)
 """
