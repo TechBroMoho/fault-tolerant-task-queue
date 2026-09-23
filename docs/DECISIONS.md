@@ -2195,3 +2195,36 @@ number.
 - A clean L2 with 6 worker hosts (12 workers at 2 per host) needs 18 vCPUs, about
   **$0.849/h**. The quota (64) allows it, but it's over the approved 16, so it needs
   Mohammed's yes.
+
+**Measured in the Phase 7 session (2026-09-23; raw reports in `results/aws/phase7/`).**
+Both runs had 4 producers on the m7i-flex **shared with Redis**, and 2 workers on one
+c7i-flex.
+- **Saturation (`--rate 0 --max-depth 20000`): worker-bound.** Completed 4,367/s, the
+  same as offered.
+  - Producer CPU: 4 × 0.112 = 0.45 vCPU, about 103 µs per job. That's inflated by
+    22,143 depth waits: the producers mostly idled at the cap.
+  - Redis main thread 0.292 busy, about **67 µs per job** for the whole lifecycle.
+  - It couldn't isolate the loadgen, so a second measurement followed.
+- **Open loop at 16,000/s for 60 s:** 16,001/s offered and accepted, max lag 0.098 s.
+  - Producer CPU: 4 × 0.335 = 1.34 vCPU, about **84 µs per job**, while Redis's main
+    thread (0.512 busy) ran on the same 2 vCPUs.
+  - 1,199,818 jobs, exactly-once.
+  - From the two runs, assuming per-job costs don't change between them: enqueue
+    ≈ 18 µs, completion ≈ 49 µs of Redis main thread.
+- **What that means (projection, not measured):**
+  - A dedicated c7i-flex loadgen at ≤ 84 µs per job, with ~1.6 usable vCPUs, tops out
+    near **19K jobs/s**.
+  - Redis's lifecycle cost of 67 µs, measured while sharing a host, puts its main-thread
+    ceiling near **15K jobs/s**. On its own host it may be higher, and that's the point
+    of Phase 8.
+  - So one loadgen host is at best about 1.3× Redis's ceiling, and possibly below it.
+    It clearly drives 16K/s, but it's **marginal**, not clearly enough by the ≥ 1.3×
+    rule above.
+
+**Recommendation (Mohammed's call; he pre-authorized up to 20 vCPUs for a fix):**
+- **L2' at 18 vCPUs:** Redis + **2** loadgen hosts + 6 worker hosts at 2 each = **12
+  workers**. `max_vcpus=18`, 24 resources, **$0.8487/h** (planned, not applied).
+- It needs the $0 loadgen change first: a producer-only mode for the second host, with
+  the accepted count summed across hosts for the exactly-once check.
+- The alternative, L1 at 16 vCPUs ($0.7556/h), keeps one loadgen host and relies on
+  `depth_min` and producer `cpu_busy` to flag any loadgen-bound point.

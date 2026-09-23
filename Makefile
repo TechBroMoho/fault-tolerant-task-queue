@@ -111,8 +111,14 @@ aws-bench: ## BILLABLE: run the benchmark suite in AWS (Phase 8)
 aws-down: ## Destroy the stack, delete ECR images, then verify-clean (safe to run any time)
 	$(AWS_ENV) terraform -chdir=$(TF_STACK) init -input=false >/dev/null
 	$(AWS_ENV) terraform -chdir=$(TF_STACK) destroy -input=false -auto-approve -var image_tag=$(IMAGE_TAG) $(TF_VARS)
-	$(AWS_ENV) sh -c 'ids=$$(aws ecr list-images --repository-name ftq --query imageIds --output json 2>/dev/null); \
-	  if [ -n "$$ids" ] && [ "$$ids" != "[]" ]; then aws ecr batch-delete-image --repository-name ftq --image-ids "$$ids" >/dev/null; fi'
+	@# Several passes: buildx pushes a manifest list plus child manifests, and a child
+	@# can't be deleted in the same call as the list that references it (Phase 7). A
+	@# batch-delete's failures come back in its JSON with exit 0, so count what's left.
+	$(AWS_ENV) sh -c 'for pass in 1 2 3; do \
+	  ids=$$(aws ecr list-images --repository-name ftq --query imageIds --output json 2>/dev/null) || exit 0; \
+	  [ "$$ids" = "[]" ] && exit 0; \
+	  aws ecr batch-delete-image --repository-name ftq --image-ids "$$ids" --query "length(failures)" --output text; \
+	 done; echo "ECR images left after 3 passes" >&2; exit 1'
 	$(MAKE) aws-verify-clean
 
 aws-verify-clean: ## Fail unless nothing billable is left in us-west-2, $0

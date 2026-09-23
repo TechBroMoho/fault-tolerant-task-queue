@@ -10,15 +10,78 @@
 - **Follow-up done:** CI #7's chaos failure (I4 `kills = 2 < 3`, a harness scheduling
   gap, fixed in ADR-043), and the 1M record: 7 of 7 passing 1M runs on the current
   queue code.
-- **Current phase:** Phase 7 (AWS). The infrastructure is written and planned. **Waiting
-  on Mohammed's approval** of the small-footprint apply ($0.1971/h).
-  - vCPU quota: asked for 16, **AWS granted 64**. The stack's own cap is 16.
-  - Budget alarm created (credits excluded).
-  - Nothing billable exists yet.
+- **Current phase:** Phase 7 (AWS): **session done, torn down, verified clean**
+  (2026-09-23, 14:36–14:57 UTC, ≈ $0.06).
+  - The smoke test passed on ECS.
+  - Loadgen measured: one 2-vCPU host is marginal (ADR-046).
+  - **Waiting on Mohammed:** choose the Phase 8 layout (16 vCPUs, or 18 with 2 loadgen
+    hosts), which needs a $0 loadgen change first if 18.
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
-- **AWS:** budget `ftq-monthly-cost` only ($0; no actions). Spend to date: $0.
+- **AWS:** only the budget and an empty ECR repo remain (both $0 idle). Spend to date ≈ $0.06 (estimate; Cost Explorer lags ~24 h, re-check).
 
 ## Phase log
+
+### Phase 7 session: deploy, smoke, loadgen measurement, teardown (2026-09-23)
+
+Approved by Mohammed (small footprint, ≤ $0.40, 2 h hard stop). The session started
+14:36:36 UTC, and `verify-clean` passed at 14:56:50: **~20 minutes**. Image `ftq:f3f1571`
+(55 MB, linux/amd64).
+- **Apply**, first attempt: the worker ASG's launch failed with `Authentication Failure`.
+  - This was the account's first ASG. AWS created the Auto Scaling service-linked role
+    at 14:38:03, and the launch at 14:38:07 came before the role propagated.
+  - Terraform tainted the ASG. The re-plan was only "replace the ASG" at the same
+    $0.1971/h; the re-apply (14:40:01) succeeded.
+  - It happens once per account, so no code change.
+- **Smoke** (`make aws-smoke` = `ftq bench --jobs 20000` as an ECS task): exit 0.
+  - 20,000 completed, 0 missing, 0 duplicate results, 0 retries, DLQ 0, 2 consumers.
+  - `results/aws/phase7/smoke.txt`
+- **Loadgen measurement** (ADR-046). Both runs had 4 producer processes on the m7i-flex,
+  shared with Redis, and 2 workers.
+
+  ```
+  run                                  offered/s  completed/s  producer CPU     loadgen us/job  redis main  exactly-once
+  saturation, max-depth 20K (60 s)     4,367      4,367        4 x 0.112-0.113  ~103 (inflated) 0.292       349,000 ok
+  open loop 16K (60 s)                 16,001     4,485        4 x 0.334-0.335  ~84             0.512       1,199,818 ok
+  ```
+
+  - `results/aws/phase7/loadgen_probe.json`, `loadgen_open_loop_16k.json` (raw
+    reports).
+  - The first try waited 120 s for workers and exited 1: the loadgen defaults to queue
+    `bench`, and the workers were on `default`.
+    - The second try used `--queue default`.
+    - The stack now sets `FTQ_QUEUE=bench` for every task.
+  - The open-loop run was a second 60 s measurement, added because the saturation run
+    was worker-bound and couldn't isolate the loadgen's cost. It cost a few cents more,
+    within the approved session.
+- **Teardown:** `make aws-down` destroyed 23 resources.
+  - **`verify-clean` then FAILED: `ECR images: 2`.** The image-delete step had passed a
+    manifest list and its child manifests in one `batch-delete-image` call. A child
+    can't be deleted while the list references it. The call reports that in its JSON
+    and still exits 0, and the Makefile discarded the JSON.
+  - A second pass deleted both.
+  - Fix: `aws-down` now deletes in up to 3 passes and fails if images remain.
+  - A re-run of `make aws-down` on the empty account: 0 destroyed, exit 0, CLEAN.
+  - This was the first real proof that `verify-clean` catches a leftover.
+
+```
+$ make aws-verify-clean          (14:56:50 UTC)
+  [ok] EC2 instances (not terminated): 0
+  [ok] EBS volumes: 0
+  [ok] network interfaces: 0
+  [ok] Elastic IPs: 0
+  [ok] NAT gateways: 0
+  [ok] load balancers: 0
+  [ok] auto scaling groups: 0
+  [ok] active ECS clusters: 0
+  [ok] ECR images: 0
+  [ok] CloudWatch log groups /ftq*: 0
+  [ok] resources in the stack's Terraform state: 0
+CLEAN: nothing billable left in us-west-2
+```
+
+- **18-vCPU layout planned for Phase 8, not applied:** Redis + 2 loadgen hosts + 6
+  worker hosts (12 workers), `max_vcpus=18`. 24 resources, **$0.8487/h** from
+  `deploy/aws.py estimate`.
 
 ### Phase 7: infrastructure written and planned; awaiting apply approval (2026-09-23)
 
@@ -1403,9 +1466,23 @@ pytest exit (redis up)=0
 
 | Date | Resources created / destroyed | Duration | Est. cost |
 |---|---|---|---|
-| (none yet) | | | $0 |
+| 2026-09-23 | Budget (no actions, $0) and ECR repo (kept, empty) | kept | $0 |
+| 2026-09-23 | Phase 7 stack: 1 m7i-flex.large (~19 min), 1 c7i-flex.large (~17 min), 2 × 30 GB gp3, 2 public IPv4, 23 resources; ECR image 55 MB (~20 min). All destroyed, verify-clean 14:56:50 UTC | ~20 min | ≈ $0.06 (list prices; re-check Cost Explorer after ~24 h) |
 
 ## Things that went wrong
+
+- **2026-09-23 (Phase 7): the first teardown left 2 ECR images, and verify-clean caught
+  it.**
+  - `aws-down` sent a buildx manifest list and its children to `batch-delete-image` in
+    one call. The children failed ("referenced by a manifest list"), which the call
+    reports in its JSON while exiting 0, and the Makefile sent that JSON to /dev/null.
+  - Fixed with a multi-pass delete that fails loudly.
+  - Lesson: an AWS "batch" call's exit code says nothing about its items.
+- **2026-09-23 (Phase 7): the account's first ASG failed to launch** (`Authentication
+  Failure`). The Auto Scaling service-linked role was created 4 s before the launch and
+  hadn't propagated yet. A re-apply fixed it.
+- **2026-09-23 (Phase 7): the first loadgen probe waited on the wrong queue.** Locally
+  the driver sets `FTQ_QUEUE=bench` for the workers; the ECS stack didn't. It does now.
 
 - **2026-09-23 (Phase 6 follow-up): I4 failed in CI again, and again the fault plan
   left it to chance.** CI #7 executed 2 of 4 planned kills; the other two hit a worker

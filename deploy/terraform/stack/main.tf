@@ -361,6 +361,9 @@ resource "aws_ecs_service" "redis" {
 locals {
   ftq_env = [
     { name = "FTQ_REDIS_URL", value = local.redis_url },
+    # bench.loadgen's default queue, as in the local driver (bench/run.py). Phase 7's
+    # first probe waited on an empty queue because the workers were on `default`.
+    { name = "FTQ_QUEUE", value = "bench" },
     { name = "FTQ_LOG_LEVEL", value = var.log_level },
     { name = "FTQ_LOG_FORMAT", value = "json" },
   ]
