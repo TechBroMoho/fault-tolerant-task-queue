@@ -11,7 +11,7 @@ BENCH_ARGS ?=
 .DEFAULT_GOAL := help
 
 .PHONY: help setup fmt fmt-check lint typecheck test test-all check check-all up down chaos bench \
-        aws-base aws-image aws-plan aws-up aws-smoke aws-bench aws-bench-plan aws-bench-local aws-down aws-verify-clean
+        aws-base aws-image aws-plan aws-up aws-smoke aws-bench aws-bench-plan aws-bench-local aws-down aws-verify-clean chaos-record
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -60,6 +60,14 @@ down: ## Stop the local stack (workers too) and delete its data volume (dev data
 
 chaos: ## Chaos run + verifier: make chaos N=100000 [CHAOS_WORKERS=8] [SEED=s] -> results/local/chaos_report.json
 	$(UV) run python -m chaos.run --jobs $(N) --workers $(CHAOS_WORKERS) $(if $(SEED),--seed $(SEED),)
+
+chaos-record: ## Record a chaos run as a terminal cast: make chaos-record [N=100000] -> results/local/chaos_demo.{cast,txt,json}
+	docker build -q -f docker/Dockerfile -t ftq-worker:local . >/dev/null
+	uvx --from asciinema==2.4.0 asciinema rec --overwrite --cols 170 --rows 42 --idle-time-limit 2 \
+	  --title "ftq chaos test: $(N) jobs, $(CHAOS_WORKERS) workers" \
+	  -c "$(UV) run python -m chaos.run --jobs $(N) --workers $(CHAOS_WORKERS) --skip-build --out results/local/chaos_demo.json" \
+	  results/local/chaos_demo.cast
+	$(UV) run python -m chaos.cast_text results/local/chaos_demo.cast > results/local/chaos_demo.txt
 
 bench: ## Local benchmark: scaling, latency, backpressure + charts -> results/local/bench/ (~25 min; run in background)
 	$(UV) run python -m bench.run scaling $(BENCH_ARGS)

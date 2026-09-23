@@ -47,6 +47,8 @@ uv run ftq dlq requeue JOB_ID... | --all   # back on the stream, attempt 0, same
 uv run python bench/pipelining.py # enqueue batching + worker drain measurement -> results/local/
 make chaos N=100000 [CHAOS_WORKERS=8] [SEED=s]  # chaos run + verifier -> results/local/chaos_report.json (~2 min; run in background)
 uv run python -m chaos.run --help                # same, all knobs (--rate, --out, --keep, --skip-build ...)
+make chaos-record [N=100000]  # the same run recorded (asciinema via uvx) -> results/local/chaos_demo.{cast,txt,json}
+uv run python -m chaos.summary results/ci/chaos_report_*_N1M_*.json   # Markdown table of chaos reports (RESULTS.md)
 gh workflow run chaos-scale.yml -f jobs=N [-f workers=W]   # chaos on a GitHub runner (1M nightly; ~35 min)
 make bench [BENCH_ARGS=...]   # scaling + latency + backpressure + charts -> results/local/bench/ (~25 min; background)
 uv run python -m bench.run {concurrency|scaling|latency|backpressure|iothreads|point} --help   # one suite (local Docker)
@@ -54,7 +56,7 @@ uv run python -m bench.loadgen --help   # the load generator alone: needs only F
 uv run python -m bench.loadgen --hosts 2 --run-id R ...   # coordinator of a 2-host run (ADR-047); on the other host:
 uv run python -m bench.loadgen --producer-only --run-id R   # takes the coordinator's spec, offers its share
 uv run python -m bench.plot             # charts + summary.md from the saved reports
-uv run python -m bench.plot --aws       # AWS scaling.png + summary.md from results/aws/
+uv run python -m bench.plot --aws       # AWS scaling.png + backpressure.png + summary.md from results/aws/
 TF_VAR_alert_email=... make aws-base   # budget alarm + ECR repo (idle $0; applied once)
 make aws-image                    # build linux/amd64, push to ECR as the git short SHA
 make aws-plan [TF_VARS="-var worker_hosts=6 -var workers=12 -var loadgen_hosts=1"]  # plan + itemized estimate, $0
