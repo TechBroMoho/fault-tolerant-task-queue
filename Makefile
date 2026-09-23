@@ -11,7 +11,7 @@ BENCH_ARGS ?=
 .DEFAULT_GOAL := help
 
 .PHONY: help setup fmt fmt-check lint typecheck test test-all check check-all up down chaos bench \
-        aws-base aws-image aws-plan aws-up aws-smoke aws-bench aws-down aws-verify-clean
+        aws-base aws-image aws-plan aws-up aws-smoke aws-bench aws-bench-plan aws-bench-local aws-down aws-verify-clean
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -105,8 +105,17 @@ aws-up: ## BILLABLE: apply the saved plan after a typed confirmation
 aws-smoke: ## BILLABLE (stack must be up): ftq bench as an ECS task, exactly-once checked
 	$(AWS_ENV) $(UV) run python -m deploy.aws smoke $(SMOKE_ARGS)
 
-aws-bench: ## BILLABLE: run the benchmark suite in AWS (Phase 8)
-	@echo "make aws-bench: not implemented yet (Phase 8)" >&2; exit 1
+aws-bench: ## BILLABLE (stack up): the Phase 8 session -> results/aws/ (run in background; BENCH_ARGS=...)
+	$(AWS_ENV) $(UV) run python -m deploy.bench run $(BENCH_ARGS)
+
+aws-bench-plan: ## The Phase 8 session's points, time and cost, $0
+	$(UV) run python -m deploy.bench plan --per-hour 0.8487 $(BENCH_ARGS)
+
+aws-bench-local: ## The same driver on local Docker (tiny points) -> bench/runs/awsbench-local/
+	docker build -q -f docker/Dockerfile -t ftq-worker:local . >/dev/null
+	$(UV) run python -m deploy.bench run --backend local --out bench/runs/awsbench-local --redo \
+	  --worker-counts 1 2 --scaling-measure 5 --headline-repeats 2 --headline-measure 5 \
+	  --backpressure-measure 5 --headline-workers 2 --warmup 2 --cooldown 1 --processes 2 $(BENCH_ARGS)
 
 aws-down: ## Destroy the stack, delete ECR images, then verify-clean (safe to run any time)
 	$(AWS_ENV) terraform -chdir=$(TF_STACK) init -input=false >/dev/null

@@ -1,0 +1,317 @@
+"""The Phase 8 driver (deploy/bench.py), without AWS: the session plan, the commands it
+sends, the report's trip through the task log, the order of steps per point, and the
+ECS calls against a fake `aws` (pure logic: the real ECS run is the billable session)."""
+
+import contextlib
+import io
+import json
+import shlex
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from deploy import bench
+from deploy.bench import (
+    AwsBackend,
+    BenchPoint,
+    PairResult,
+    SessionSpec,
+    backpressure_rate,
+    coordinator_command,
+    decode_report,
+    producer_command,
+    run_session,
+    session_points,
+    session_seconds,
+)
+
+# ---------------------------------------------------------------- plan
+
+
+def test_the_default_session_is_the_spec_phase_8_plan() -> None:
+    points = session_points(SessionSpec())
+    labels = [f"{p.suite}/{p.label}" for p in points]
+    assert labels == [
+        "scaling/w01", "scaling/w02", "scaling/w04", "scaling/w08", "scaling/w12",
+        "headline/w12_r1", "headline/w12_r2", "headline/w12_r3",
+        "backpressure/w12_reject", "backpressure/w12_block",
+    ]  # fmt: skip
+    assert all(p.measure >= 180 for p in points if p.suite == "scaling")  # ~3 min each
+    assert all(p.measure >= 300 for p in points if p.suite == "headline")  # >= 5 min
+    assert all(p.overload == 1.5 for p in points if p.suite == "backpressure")
+    # 10 points of warmup + measure + cooldown + overhead, plus the session overhead.
+    assert session_seconds(points) == sum(p.seconds for p in points) + bench.SESSION_OVERHEAD_S
+
+
+def test_backpressure_offers_a_multiple_of_the_median_headline() -> None:
+    assert backpressure_rate([14_000, 15_000, 20_000], 1.5) == 22_500
+    with pytest.raises(ValueError, match="headline"):
+        backpressure_rate([], 1.5)
+
+
+# ---------------------------------------------------------------- commands
+
+
+def _point(**kw: Any) -> BenchPoint:
+    base: dict[str, Any] = {
+        "suite": "scaling", "label": "w04", "workers": 4, "warmup": 20, "measure": 180,
+        "cooldown": 5, "args": ("--processes", "4", "--rate", "0"),
+    }  # fmt: skip
+    return BenchPoint(**{**base, **kw})
+
+
+def test_the_coordinator_command_survives_the_shell() -> None:
+    meta = {"label": "w12_reject", "tricky": 'it\'s "quoted" $HOME; rm -rf /'}
+    point = _point(args=("--processes", "4", "--backpressure", "reject"))
+    sh, flag, script = coordinator_command(point, "run-1", meta, rate=22500.4)
+    assert (sh, flag) == ("sh", "-c")
+    loadgen, rest = script.split("; rc=$?; ", 1)
+    args = shlex.split(loadgen)
+    assert args[:3] == ["python", "-m", "bench.loadgen"]
+    assert args[args.index("--hosts") + 1] == "2"
+    assert args[args.index("--run-id") + 1] == "run-1"
+    assert args[args.index("--expect-workers") + 1] == "4"
+    assert args[args.index("--rate") + 1] == "22500"
+    assert args[-4:] == ["--meta", json.dumps(meta, separators=(",", ":")), "--out",
+                         "/tmp/report.json"]  # fmt: skip
+    assert rest.endswith("exit $rc")  # the loadgen's exit code is what the task returns
+    # A saturation point sends only its own --rate 0.
+    _, _, sat = coordinator_command(_point(), "run-2", {})
+    sat_args = shlex.split(sat.split("; rc=$?")[0])
+    assert sat_args.count("--rate") == 1 and sat_args[sat_args.index("--rate") + 1] == "0"
+
+
+def test_the_producer_takes_everything_but_the_run_id_from_the_coordinator() -> None:
+    cmd = producer_command("run-1")
+    assert cmd[cmd.index("--run-id") + 1] == "run-1"
+    assert "--producer-only" in cmd
+    for flag in ("--rate", "--processes", "--measure", "--hosts"):
+        assert flag not in cmd
+
+
+# ---------------------------------------------------------------- the report's trip
+
+
+def _dumped(report: dict[str, Any], tmp_path: Path) -> list[str]:
+    """Run the real dump code on a saved report and return what it prints."""
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(report))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        exec(bench._DUMP.replace("/tmp/report.json", str(path)), {})
+    return out.getvalue().splitlines()
+
+
+def test_the_report_survives_the_dump_and_the_log(tmp_path: Path) -> None:
+    report = {"throughput": {"completed_per_s": 12345.6}, "big": "x" * 300_000}
+    lines = _dumped(report, tmp_path)
+    assert all(len(line) < 256 * 1024 for line in lines)  # CloudWatch's event limit
+    # Log lines interleaved with the loadgen's own output, as a task log has them.
+    assert decode_report(["loadgen producing", *lines, "trailing"]) == report
+
+
+def test_a_cut_off_report_is_no_report(tmp_path: Path) -> None:
+    lines = _dumped({"a": 1}, tmp_path)
+    assert decode_report(lines[:-1]) is None  # no REPORT-END: the log isn't complete
+    assert decode_report([]) is None
+
+
+# ---------------------------------------------------------------- the session loop
+
+
+class FakeBackend:
+    name = "fake"
+
+    def __init__(self, report: dict[str, Any] | None) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self.report = report
+        self.workers = 0
+
+    def set_workers(self, n: int) -> None:
+        self.calls.append(("set_workers", n))
+        self.workers = n
+
+    def flush(self) -> None:
+        assert self.workers == 0, "flushed while workers were running"
+        self.calls.append(("flush",))
+
+    def snapshot(self) -> dict[str, Any]:
+        self.calls.append(("snapshot", self.workers))
+        return {"worker_tasks": [{"task": f"t{i}"} for i in range(self.workers)],
+                "account": "123456789012"}  # fmt: skip
+
+    def run_pair(self, coordinator: list[str], producer: list[str], within: float) -> PairResult:
+        self.calls.append(("run_pair", coordinator[2].split("--run-id ")[1].split()[0]))
+        dump: list[str] = []
+        if self.report is not None:
+            import base64
+            import gzip
+
+            data = base64.b64encode(gzip.compress(json.dumps(self.report).encode())).decode()
+            dump = ["REPORT-BEGIN", "R:" + data, "REPORT-END"]
+        return PairResult(0, 0, ["coordinator line", *dump], ["producer line 123456789012"],
+                          {"producer_only": "i-a", "coordinator": "i-b"})  # fmt: skip
+
+    def scrub(self, text: str) -> str:
+        return text.replace("123456789012", "<acct>")
+
+
+def _report() -> dict[str, Any]:
+    return {
+        "meta": {}, "throughput": {"completed_per_s": 15000.0},
+        "exactly_once": {"ok": True}, "producers": {"hosts": {"reported": 2}},
+        "depth_in_window": {"min": 1234},
+    }  # fmt: skip
+
+
+def test_each_point_resets_redis_with_no_workers_then_scales_and_saves(tmp_path: Path) -> None:
+    fake = FakeBackend(_report())
+    points = session_points(SessionSpec(worker_counts=(1, 4), suites=("scaling",)))
+    outcomes = run_session(fake, points, tmp_path, deadline_s=1e9)
+    steps = [c[0] if c[0] != "set_workers" else f"set_workers({c[1]})" for c in fake.calls]
+    assert steps == [
+        "set_workers(0)", "flush", "set_workers(1)", "snapshot", "run_pair",
+        "set_workers(0)", "flush", "set_workers(4)", "snapshot", "run_pair",
+    ]  # fmt: skip
+    assert ("snapshot", 4) in fake.calls  # the evidence is taken with the fleet running
+    run_ids = [c[1] for c in fake.calls if c[0] == "run_pair"]
+    assert len(set(run_ids)) == 2  # a fresh run id every point (SET NX would refuse reuse)
+    saved = json.loads((tmp_path / "scaling" / "w04.json").read_text())
+    assert saved["meta"]["placement"] == {"producer_only": "i-a", "coordinator": "i-b"}
+    services = (tmp_path / "scaling" / "w04.services.json").read_text()
+    assert "123456789012" not in services and "<acct>" in services
+    assert "<acct>" in (tmp_path / "scaling" / "w04.producer.txt").read_text()
+    assert "R:" not in (tmp_path / "scaling" / "w04.coordinator.txt").read_text()
+    assert outcomes["scaling/w04"].startswith("15000/s, exactly-once True, hosts 2/2")
+
+
+def test_saved_points_are_skipped_and_the_deadline_stops_new_ones(tmp_path: Path) -> None:
+    (tmp_path / "scaling").mkdir()
+    (tmp_path / "scaling" / "w01.json").write_text("{}")
+    fake = FakeBackend(_report())
+    points = session_points(SessionSpec(worker_counts=(1, 2, 4), suites=("scaling",)))
+    ticks = iter([0.0, 0.0, 10_000.0])  # start, w02 fits, then w04 is past the deadline
+    outcomes = run_session(fake, points, tmp_path, deadline_s=1_000, clock=lambda: next(ticks))
+    assert outcomes == {
+        "scaling/w01": "skipped (saved)",
+        "scaling/w02": outcomes["scaling/w02"],
+        "scaling/w04": "not run (deadline)",
+    }
+    assert [c for c in fake.calls if c[0] == "set_workers"] == [("set_workers", 0),
+                                                                 ("set_workers", 2)]  # fmt: skip
+
+
+def test_a_missing_report_is_a_failure_and_saves_no_result(tmp_path: Path) -> None:
+    fake = FakeBackend(report=None)
+    points = session_points(SessionSpec(worker_counts=(2,), suites=("scaling",)))
+    outcomes = run_session(fake, points, tmp_path, deadline_s=1e9)
+    assert outcomes["scaling/w02"].startswith("FAILED: no report")
+    assert not (tmp_path / "scaling" / "w02.json").exists()
+    assert (tmp_path / "scaling" / "w02.coordinator.txt").exists()  # the evidence stays
+
+
+def test_backpressure_points_offer_1_5x_the_saved_headline_median(tmp_path: Path) -> None:
+    (tmp_path / "headline").mkdir()
+    for i, rate in enumerate([14_000, 16_000, 15_000]):
+        (tmp_path / "headline" / f"w12_r{i + 1}.json").write_text(
+            json.dumps({"throughput": {"completed_per_s": rate}})
+        )
+    (tmp_path / "headline" / "w12_r1.services.json").write_text("{}")  # not a result
+    fake = FakeBackend(_report())
+    sent: list[list[str]] = []
+    original = fake.run_pair
+
+    def capture(c: list[str], p: list[str], within: float) -> PairResult:
+        sent.append(c)
+        return original(c, p, within)
+
+    fake.run_pair = capture  # type: ignore[method-assign,assignment]
+    points = session_points(SessionSpec(suites=("backpressure",)))
+    run_session(fake, points, tmp_path, deadline_s=1e9)
+    for c in sent:
+        args = shlex.split(c[2].split("; rc=$?")[0])
+        assert args[args.index("--rate") + 1] == "22500"  # 1.5 x 15,000
+
+
+# ---------------------------------------------------------------- ECS calls (fake aws)
+
+
+class FakeAws:
+    """Answers the AWS CLI calls AwsBackend makes; records them."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.desired = 0
+        self.started: list[tuple[str, list[str]]] = []
+
+    def __call__(self, cmd: list[str]) -> str:
+        self.calls.append(cmd)
+        args = cmd[1:]
+        op = args[1] if args[0] == "ecs" else args[0]
+
+        def arg(flag: str) -> str:
+            return args[args.index(flag) + 1]
+
+        if args[:2] == ["sts", "get-caller-identity"]:
+            return json.dumps({"Account": "123456789012"})
+        if op == "update-service":
+            self.desired = int(arg("--desired-count"))
+            return "{}"
+        if op == "describe-services":
+            n = self.desired
+            svc = {"serviceName": "worker", "desiredCount": n, "runningCount": n,
+                   "pendingCount": 0, "deployments": [{}]}  # fmt: skip
+            return json.dumps({"services": [svc]})
+        if op == "list-container-instances":
+            return json.dumps({"containerInstanceArns": ["arn:ci/B", "arn:ci/A", "arn:ci/C"]})
+        if op == "start-task":
+            command = json.loads(arg("--overrides"))["containerOverrides"][0]["command"]
+            self.started.append((arg("--container-instances"), command))
+            return json.dumps({"tasks": [{"taskArn": f"arn:task/{len(self.started)}"}],
+                               "failures": []})  # fmt: skip
+        if op == "describe-tasks":
+            return json.dumps(
+                {"tasks": [{"lastStatus": "STOPPED", "containers": [{"exitCode": 0}]}]}
+            )
+        if args[:2] == ["logs", "get-log-events"]:
+            return json.dumps({"events": [], "nextForwardToken": "t"})
+        raise AssertionError(f"unexpected call {cmd}")
+
+
+def test_the_pair_runs_on_two_different_loadgen_hosts() -> None:
+    fake = FakeAws()
+    backend = AwsBackend({"cluster": "ftq", "loadgen_task_definition": "td"}, fake, poll_s=0)
+    backend.run_pair(["coord"], ["prod"], within=5)
+    (host_a, cmd_a), (host_b, cmd_b) = fake.started
+    assert host_a != host_b
+    assert {host_a, host_b} <= {"arn:ci/A", "arn:ci/B", "arn:ci/C"}
+    assert (cmd_a, cmd_b) == (["prod"], ["coord"])  # the producer first: it waits for the spec
+    # start-task on a named instance, never run-task (which can't guarantee distinct hosts).
+    assert not any("run-task" in c for c in fake.calls)
+
+
+def test_setting_workers_waits_for_the_service_to_settle() -> None:
+    fake = FakeAws()
+    backend = AwsBackend({"cluster": "ftq", "loadgen_task_definition": "td"}, fake, poll_s=0)
+    backend.set_workers(12)
+    update = next(c for c in fake.calls if "update-service" in c)
+    assert update[update.index("--desired-count") + 1] == "12"
+    assert "describe-services" in fake.calls[-1]
+
+
+def test_a_failed_flush_stops_the_session() -> None:
+    fake = FakeAws()
+    backend = AwsBackend({"cluster": "ftq", "loadgen_task_definition": "td"}, fake, poll_s=0)
+    original = fake.__call__
+
+    def failing(cmd: list[str]) -> str:
+        if "describe-tasks" in cmd:
+            return json.dumps(
+                {"tasks": [{"lastStatus": "STOPPED", "containers": [{"exitCode": 1}]}]}
+            )
+        return original(cmd)
+
+    backend._run = failing
+    with pytest.raises(RuntimeError, match="flush exited 1"):
+        backend.flush()

@@ -60,6 +60,9 @@ make aws-plan [TF_VARS="-var worker_hosts=6 -var workers=12 -var loadgen_hosts=1
 make aws-up                       # BILLABLE: apply the saved plan after typing "apply"
 make aws-smoke                    # BILLABLE (stack up): ftq bench as an ECS task, exactly-once checked
 uv run python -m deploy.aws task -- CMD ...   # BILLABLE (stack up): any one-off task, e.g. the loadgen
+make aws-bench-plan               # $0: the Phase 8 session's points, minutes and cost
+make aws-bench-local              # $0: the Phase 8 driver end to end on local Docker (port 6392)
+make aws-bench [BENCH_ARGS=...]   # BILLABLE (stack up): the Phase 8 session -> results/aws/ (background + poll)
 make aws-down                     # destroy stack + delete ECR images + verify-clean (safe any time)
 make aws-verify-clean             # $0: fail unless nothing billable is left in us-west-2
 ```

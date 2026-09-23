@@ -2301,3 +2301,86 @@ second, independent loadgen on the same queue would break its exactly-once check
   That's still to be built (`make aws-bench`).
 - The coordinator also runs the 1 s sampler and the analysis. Its host carries slightly
   more than half the work; `cpu_busy` per producer shows whether it matters.
+
+---
+
+## ADR-048: The Phase 8 driver: reset, scale, snapshot, run the pair, save
+
+*Status: accepted (Phase 8 prep: `deploy/bench.py`, `make aws-bench`,
+`aws-bench-plan`, `aws-bench-local`). Not yet run on AWS.*
+
+**Per point:**
+1. Scale the worker service to 0, then FLUSHALL (a one-off task on a loadgen host).
+   - Every point starts from an empty Redis.
+   - The results log, memory, and the consumer group never carry over.
+   - With no workers running, nobody is holding the group that FLUSHALL deletes.
+2. Scale to N and wait until the service is settled: running = N, pending = 0, one
+   deployment.
+3. Snapshot the worker tasks with their EC2 instance ids and types, into
+   `<label>.services.json`. That's SPEC §9's "12 running workers" evidence, taken while
+   they run.
+4. Start the producer-only task first, since it waits for the spec, then the
+   coordinator.
+   - Each goes to a **named** loadgen container instance (`start-task
+     --container-instances`), so they're always on different hosts. `run-task` with a
+     placement constraint can't guarantee that across two calls.
+5. Wait for both tasks, then read the coordinator's log until the report is complete.
+   awslogs is non-blocking, so the last lines can arrive late.
+   - The raw report travels gzip + base64 in chunks under 60 KB (CloudWatch's event
+     limit is 256 KB).
+   - It's saved with both hosts' logs.
+   - The loadgen's exit code is kept: 1 means "ran, but not exactly-once", and that
+     report is kept too.
+
+**Also:**
+- **Account ids** are scrubbed from everything saved.
+- **Resuming:** points with saved results are skipped, so an interrupted session can
+  resume.
+- **Deadline:** no point starts unless it would finish before the session deadline
+  (default 120 min).
+- **Hard stop:** each loadgen task stops itself (`timeout 1800`).
+- **Backpressure** offers 1.5 × the median of the saved headline runs, computed when it
+  runs.
+- **Queue and database:** every task uses queue `bench`. The local backend runs its own
+  Compose project on port 6392, never the dev Redis (PROGRESS: the leftover-keys lesson).
+
+**Evidence (all $0).**
+- 13 unit tests, with a fake backend and a fake `aws`, covering:
+  - the session plan and its arithmetic;
+  - the commands surviving the shell, including hostile `--meta`;
+  - the report's round trip through the real dump code and a log;
+  - a cut-off report counting as no report;
+  - the step order per point;
+  - skip, deadline, and a missing report;
+  - the backpressure rate taken from saved headline results;
+  - the pair on 2 distinct instances through `start-task`;
+  - worker scaling waiting for the service to settle;
+  - a failed flush stopping the session.
+
+  Mutants caught: flush with workers up (4 tests fail), both tasks on one host (1),
+  services not scrubbed (1).
+- **`make aws-bench-local`** runs the same driver on real Docker: 6 points, worker
+  counts 1 → 2 → 2.
+  - Every point: exactly-once True, hosts 2/2.
+  - The loadgen's consumer count equals the requested workers (1, then 2): the flush
+    and scale reset the group.
+  - The backpressure offer = 1.5 × the headline median.
+  - With 20K/15K watermarks: reject refused 26,348 and block waited 14,641 times, with
+    depth bounded (max 18,214).
+  - Its outputs stay in `bench/runs/` (gitignored). They test the driver, not a
+    benchmark.
+- **Not testable without AWS:** the real ECS responses. The fake `aws` is written from
+  the CLI's documented shapes, and Phase 7 exercised `describe-services`,
+  `describe-tasks`, and the logs calls. `start-task` and `list-container-instances
+  --filter` are new, and they're the first things the session will exercise.
+
+**Consequences.**
+- Session estimate: 10 points = 53 min, + 15 min of session overhead = **68 min**.
+- **Redis memory:** about 0.87 KB per completed job (Phase 7 probe: 1.05 GB peak at
+  1.2M jobs). A 325 s headline run at 20K/s is ~6.5M jobs, ~5.7 GB, over the 5 GB
+  default.
+  - Phase 8 runs with `redis_maxmemory=6500mb`. That's safe on the 8 GiB host with no
+    persistence (no fork) and covers up to ~23K/s.
+  - Faster than that, Redis refuses writes (`noeviction`) and the run fails loudly.
+- **The coordinator** reads the whole results log into memory: up to ~2 GB at 6.5M jobs
+  on a 4 GiB host. It's a risk to watch in the first headline run.

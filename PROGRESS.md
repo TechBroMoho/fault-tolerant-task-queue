@@ -10,19 +10,39 @@
 - **Follow-up done:** CI #7's chaos failure (I4 `kills = 2 < 3`, a harness scheduling
   gap, fixed in ADR-043), and the 1M record: 7 of 7 passing 1M runs on the current
   queue code.
-- **Current phase:** Phase 8 prep. Phase 7 is done (session torn down and verified
-  clean, ≈ $0.06).
-  - Mohammed chose the 18-vCPU layout. The multi-host loadgen is built and tested
-    (ADR-047).
-  - **Waiting on Mohammed:** a yes to the Phase 8 session. The `make aws-bench` driver
-    (2 loadgen tasks on distinct hosts, scaling the worker service between points) is
-    still to be built, at $0.
-  - **TODO 2026-09-24:** re-check Cost Explorer for the actual Phase 7 cost (Mohammed
-    asked; about 1–2 API calls, $0.01 each).
+- **Current phase:** Phase 8 prep is done. **Waiting on Mohammed's yes** to the Phase 8
+  session: 18 vCPUs, ~68 min, ≈ $0.96, hard stop 2 h / $1.70.
+  - The driver is built and tested locally (ADR-048).
+  - **TODO next session start:** re-check Cost Explorer for the actual Phase 7 cost.
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
 - **AWS:** only the budget and an empty ECR repo remain (both $0 idle). Spend to date ≈ $0.06 (estimate; Cost Explorer lags ~24 h, re-check).
 
 ## Phase log
+
+### Phase 8 prep: the benchmark driver (2026-09-23, $0)
+
+- `deploy/bench.py` (ADR-048); `make aws-bench`, `aws-bench-plan`, `aws-bench-local`.
+- **Per point:** scale to 0 → FLUSHALL → scale to N → snapshot the running workers →
+  run the loadgen pair on 2 named hosts → save the report and both logs.
+- **13 unit tests** with a fake backend and a fake `aws`. 3 mutants caught.
+- **`make aws-bench-local`** runs the same driver on real Docker: 6 points, and every
+  point has:
+  - exactly-once True;
+  - hosts 2/2;
+  - consumers = the requested workers.
+  - Backpressure through the driver with 20K watermarks: reject refused 26,348; block
+    waited 14,641 times; depth max 18,214. These are driver tests, not results
+    (`bench/runs/`, gitignored).
+- Found while planning: a 5-min headline run can pass 5 GB of Redis memory. Phase 8 sets
+  `redis_maxmemory=6500mb`.
+- **The check-all slowdown, checked properly this time** (Mohammed's point 3): leftover
+  keys, as recorded above. Tests now use db 15.
+
+```
+$ make check-all > log 2>&1; echo "make check-all exit=$?"
+make check-all exit=0
+======================= 232 passed in 133.77s (0:02:13) ========================
+```
 
 ### Phase 8 prep: several loadgen hosts (2026-09-23, $0)
 
