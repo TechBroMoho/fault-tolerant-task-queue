@@ -7,6 +7,9 @@
   - Redis's single main thread is the bottleneck from 4 workers up.
   - Throughput per worker count varied up to ~1.7× between two sessions on the same
     code (ADR-042).
+- **Follow-up done:** CI #7's chaos failure (I4 `kills = 2 < 3`, a harness scheduling
+  gap, fixed in ADR-043), and the 1M record: 7 of 7 passing 1M runs on the current
+  queue code.
 - **Next:** Phase 7 (AWS deployment, BILLABLE). Starts with $0 read-only pre-flight on
   Mohammed's go-ahead. Nothing billable is created without an itemized estimate and an
   explicit "yes".
@@ -14,6 +17,92 @@
 - **AWS:** nothing created. Spend to date: $0.
 
 ## Phase log
+
+### Phase 6 follow-up: CI #7's chaos failure and the 1M record (2026-09-23)
+
+**CI #7 ([run 35854442425](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35854442425), 662300e, docs-only) failed in `chaos`,
+not `check`.** It is not the known flaky test: `check` (200 tests) and `docker`
+passed.
+- Seed 845664227, 100K jobs, 4 workers. The queue was right: I1, I2, I2b, I3, I5, and
+  W1 all passed, with 99,974 SUCCEEDED and exactly the 26 expected DEAD.
+- **I4 failed: `kills = 2 < 3`.** The plan had 4 kills. Two were skipped with `docker
+  kill … is not running`: a crashy job had just killed that worker (36 crash restarts
+  in a 77 s fault phase on 4 workers), and the supervisor hadn't restarted it yet. The
+  injector gave up at once.
+- The same class of bug as Phase 4's seed 1661764791: the plan left I4 to chance.
+- **Fix (ADR-043), test first.** A kill or pause aimed at a worker that is down waits
+  for the supervisor to restart it, retrying every 0.5 s for up to 10 s. The kill's
+  hold is released between attempts, so the supervisor can restart the worker. I4's
+  minimums are unchanged.
+  - 3 new unit tests with a fake `docker` (kill and pause wait and happen; a worker that
+    stays down is skipped with its hold released). All 3 failed on the old injector.
+  - Mutation checks: no retry → CAUGHT (3 failed); the hold kept between attempts →
+    CAUGHT (1 failed).
+- Local 100K runs with 4 workers on the fix both PASSED with 0 skips:
+  - a random seed, 1427530277 (`results/local/chaos_report_phase6_injector_retry_w4.json`);
+  - the failing seed, 845664227 (`results/local/chaos_report_phase6_seed845664227_w4.json`).
+
+  Neither needed a retry: local timing didn't recreate the crash-then-kill collision.
+  So the retry path is proven by the unit tests, not yet by a live run.
+- The failed report is in `results/ci/chaos_failures/run35854442425_seed845664227_I4.json`.
+  It wasn't rerun until green. The next CI run is on the fix.
+- Both workflows now log the runner's CPU model (`lscpu`), for the reason below.
+
+**Every 1M chaos run** (chaos-scale, 4 workers = one per vCPU, `ubuntu-24.04`).
+- **The queue code is the same in all of them:** `git diff c20d0fd HEAD -- src` is
+  empty. c0f5657 was a docs-only commit on top of c20d0fd.
+- **Every run:** N = 1,000,000 accepted, all of I1–I5 and W1 passed, 999,740 SUCCEEDED
+  and 260 DEAD (200 poison, 30 hang_forever, 30 crashy), 0 timeouts of runs that can't
+  hang, and Redis peak 514–515 MiB.
+- Reports: `results/ci/chaos_report_run<id>_N1M_w4.json`.
+
+```
+#   run                                   code     seed        job time  harness  kills pauses net  skipped  reclaimed  dup suppr.  max delivery  result
+3   https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35838910547  c20d0fd  1644982976  34m57s    2,070 s   33    33    96   3        9,183      2,792       8             PASS
+5   https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35846621221  c0f5657   618731388  34m25s    2,033 s   29    43    88   0        9,092      2,851       7             PASS
+6   https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35846624796  c0f5657   400193833  34m49s    2,055 s   34    30   102   3        9,145      2,755       7             PASS
+7   https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35846628370  c0f5657  1816374322  24m19s    1,429 s   28    42    97   0        9,151      2,565       7             PASS
+8   https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35846631919  c0f5657   884433612  24m22s    1,424 s   33    37    95   0        9,083      2,579       7             PASS
+9   https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35846635450  c0f5657   261336795  35m44s    2,111 s   35    35    97   2        9,275      2,774       7             PASS
+10  https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35846639056  c0f5657  1393279984  34m36s    2,043 s   29    29   105   4        8,958      2,757       6             PASS
+```
+
+- All seven seeds are distinct. Crash restarts were 360 in each run except #10 (358).
+  That's within I3's bound: a crashy job can be dead-lettered by a reaper before its
+  last run.
+- "Max delivery" is the highest delivery count of any non-crashy job; the limit is 12.
+- **Why #7 and #8 took ~24 min against ~35:**
+  - The fault phase lasts as long as the enqueue, and the producer is throttled by
+    backpressure to what the workers finish. It was 1,219 and 1,239 s against
+    1,731–1,824 s.
+  - The workers finished faster because the runner's cores were faster. Same code, same
+    job mix, and the same work in the counters (reclaims, timeouts, and pool resets
+    within 2 % of the others).
+  - The CPU-bound measurements roughly halved or dropped:
+    - process-pool start-up (spawning an interpreter, importing modules), single-thread
+      CPU: mean 0.97 and 0.99 s against 2.20–2.32 s;
+    - Redis CPU 19.3 % and 18.5 % against 24.8–26.2 %;
+    - Toxiproxy 19.1 % and 19.5 % against 27.1–29.6 %.
+  - GitHub-hosted runners aren't uniform hardware (these ran in six different Azure
+    regions). The workflow didn't log the CPU model, so the chip can't be named. It
+    does now.
+- **chaos-scale #4 ([run 35838915586](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35838915586), 4 min 31 s) was not a 1M run.**
+  It was the Phase 5 check of the oversubscribed setup: `workflow_dispatch` with
+  N = 100,000 and 8 workers on the 4-vCPU runner. It passed (0 timeouts of runs that
+  can't hang, 185 pool resets). It's already recorded in the Phase 5 section and
+  `results/ci/chaos_report_run35838915586_N100K_w8.json`.
+- #1 and #2 were the two failing 1M runs on pre-fix code (Phase 5, ADR-039).
+
+**Answer for the resume bullet: 7 passing 1M-job chaos runs on the current queue code**
+(1 on c20d0fd, 6 on c0f5657; `src/` identical to HEAD), 7 of 7 on that code, all on
+GitHub Actions. Each: 0 lost jobs, 0 duplicate results, 0 duplicate effects.
+- **Not "on every push":** they were `workflow_dispatch` runs.
+- **The nightly schedule hasn't produced a run.** Today's 09:23 UTC slot came about
+  3 h after the workflow was added (06:32 UTC), and `gh run list --event schedule` is
+  empty (checked 12:36 UTC). GitHub doesn't guarantee that scheduled runs fire.
+  Tomorrow's slot will show whether it works; until then "nightly" is configured, not
+  observed.
+- Per-push CI runs 100K.
 
 ### Phase 6: Local benchmark harness (2026-09-23)
 
@@ -1224,6 +1313,15 @@ pytest exit (redis up)=0
 | (none yet) | | | $0 |
 
 ## Things that went wrong
+
+- **2026-09-23 (Phase 6 follow-up): I4 failed in CI again, and again the fault plan
+  left it to chance.** CI #7 executed 2 of 4 planned kills; the other two hit a worker
+  that a crashy job had just killed. Phase 4 guaranteed that every kind is *planned*
+  ≥ 4 times and assumed at most one would be skipped. On 4 workers, with 36 crash
+  restarts packed into a 77 s fault phase, two were. The fix makes a planned kill or
+  pause wait for its worker instead of giving up (ADR-043). Lesson: "planned with a
+  spare" isn't "executed". The guarantee has to hold at the point where the fault
+  happens.
 
 - **2026-09-23 (Phase 6): my first capacity number didn't survive a second session.**
   - The first scaling set (3 repeats, 10:09–10:24 UTC) put 8 workers at 14.1–14.8K

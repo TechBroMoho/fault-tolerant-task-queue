@@ -1942,3 +1942,48 @@ knobs matter.
     But a commit or heartbeat that hits it under load could cost an attempt or a lease.
   - Flagged as its own task (reproduce with a test, then size the pool or use a
     blocking pool) for Mohammed to schedule.
+
+---
+
+## ADR-043: A planned kill or pause waits for its worker instead of being skipped
+
+*Status: accepted (Phase 6 follow-up: `chaos/faults.py`, `Injector._one`). Amends
+ADR-036.*
+
+**Context.**
+- CI #7 (run 35854442425, seed 845664227, 100K, 4 workers) failed I4 with
+  `kills = 2 < 3`. Every correctness invariant passed.
+- The plan (ADR-036) guarantees each fault kind 4 times, one more than I4's minimum of
+  3, on the assumption that at most one is ever skipped.
+- A kill or pause is skipped when `docker kill` / `docker pause` fails, and that happens
+  when a crashy job has just killed the target worker (exit 70) and the supervisor
+  hasn't restarted it yet. Here that happened to two of the four kills: 4 workers, 36
+  crash restarts in a 77 s fault phase.
+
+**Options.**
+1. Lower I4's minimum. Rejected: never relax I4 (SPEC §7).
+2. Plan more kills. It makes a failure less likely without ruling it out, and adds
+   faults the run doesn't need.
+3. Retarget a skipped fault to another worker. That could put two faults on one worker,
+   or fault more than half the fleet at once, both of which the plan avoids.
+4. **Wait for the target to come back, then apply the fault.** The supervisor restarts
+   an exited worker within about a second.
+
+**Decision: option 4.**
+- A kill or pause whose `docker` call fails is retried every 0.5 s for up to 10 s, then
+  skipped as before.
+- A kill's hold (`held_down`, which tells the supervisor to leave the worker down) is
+  released after each failed attempt. Otherwise the supervisor would never restart the
+  worker the injector is waiting for.
+- `executed` and `skipped` entries record `attempts`.
+- Network faults don't depend on the worker's state and aren't retried.
+
+**Consequences.**
+- A delayed kill or pause can land closer to that worker's next planned fault than the
+  plan's 2 s settle time, or briefly exceed the half-the-fleet cap. The next fault then
+  waits the same way if its target is down.
+- Unit tests fake `docker` for the injector: 3 tests; the no-retry and kept-hold mutants
+  are both caught.
+- Two local 100K runs on the fix (including CI's failing seed) passed with 0 skips,
+  without needing a retry. So a live retry hasn't been observed yet; the next CI runs
+  will show `attempts` > 1 if it happens.

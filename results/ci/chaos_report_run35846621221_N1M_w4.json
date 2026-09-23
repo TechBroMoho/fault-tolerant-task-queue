@@ -1,0 +1,1703 @@
+{
+  "passed": true,
+  "run": {
+    "date_utc": "2026-09-23T10:38:22+00:00",
+    "git": "c0f5657",
+    "reproduce": "uv run python -m chaos.run --jobs 1000000 --workers 4 --concurrency 16 --seed 618731388 --rate 2000 --fault-tail 20",
+    "seed": 618731388,
+    "jobs": 1000000,
+    "accepted": 1000000,
+    "workers": 4,
+    "mix": {
+      "normal": 944240,
+      "flaky": 30000,
+      "slow": 3000,
+      "cpu": 20000,
+      "hang": 1000,
+      "hang_thread": 500,
+      "hang_process": 1000,
+      "hang_forever": 30,
+      "poison": 200,
+      "crashy": 30
+    },
+    "worker_env": {
+      "FTQ_QUEUE": "chaos",
+      "FTQ_BLOCK_MS": "500",
+      "FTQ_SOCKET_TIMEOUT": "2",
+      "FTQ_SOCKET_CONNECT_TIMEOUT": "1",
+      "FTQ_VISIBILITY_TIMEOUT": "2.0",
+      "FTQ_HEARTBEAT_INTERVAL": "0.5",
+      "FTQ_REAP_INTERVAL": "0.5",
+      "FTQ_MAX_ATTEMPTS": "8",
+      "FTQ_MAX_DELIVERIES": "12",
+      "FTQ_JOB_BACKOFF_BASE": "0.1",
+      "FTQ_JOB_BACKOFF_CAP": "2",
+      "FTQ_JOB_TIMEOUT": "10",
+      "FTQ_SHUTDOWN_GRACE": "10",
+      "FTQ_DONE_TTL_SECONDS": "0",
+      "FTQ_CONSUMER_PRUNE_IDLE": "10",
+      "FTQ_CONSUMER_PRUNE_INTERVAL": "5",
+      "FTQ_LOG_LEVEL": "INFO",
+      "FTQ_LOG_FORMAT": "json",
+      "FTQ_CONCURRENCY": "16",
+      "FTQ_REDIS_URL": "redis://toxiproxy:2000<i>/0"
+    },
+    "docker": {
+      "cpus": "4",
+      "mem_bytes": "16766414848"
+    },
+    "seconds": {
+      "fault_phase": 1741.0,
+      "drain": 213.9,
+      "total": 2032.7
+    },
+    "drained_before_timeout": true,
+    "redis_memory_bytes": {
+      "used_memory": 537117040,
+      "used_memory_peak": 539231896,
+      "maxmemory": 3221225472
+    }
+  },
+  "verifier": {
+    "passed": true,
+    "invariants": {
+      "I1_no_loss": {
+        "ok": true,
+        "jobs": 1000000,
+        "states": {
+          "SUCCEEDED": 999740,
+          "DEAD": 260
+        },
+        "violations": []
+      },
+      "I2_no_duplicate_effects": {
+        "ok": true,
+        "effects_logged": 978240,
+        "distinct_keys": 978240,
+        "duplicated_keys": 0,
+        "violations": []
+      },
+      "I2b_no_duplicate_results": {
+        "ok": true,
+        "results_logged": 999740,
+        "duplicated_job_ids": 0,
+        "violations": []
+      },
+      "I3_dlq_correct": {
+        "ok": true,
+        "dlq_entries": 260,
+        "reasons": {
+          "max_deliveries": 30,
+          "max_attempts": 230
+        },
+        "crashy_dlq_deliveries": [
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13,
+          13
+        ],
+        "violations": []
+      },
+      "I4_faults_happened": {
+        "ok": true,
+        "observed": {
+          "kills": 29,
+          "pauses": 43,
+          "network_windows": 88,
+          "skipped": 0,
+          "pool_resets": 1904,
+          "crash_restarts": 360,
+          "unexpected_exits": 0,
+          "error_log_lines": 0,
+          "reclaimed": 9092,
+          "duplicates_suppressed": 2851,
+          "timeouts": 3792
+        },
+        "minimums": {
+          "kills": 3,
+          "pauses": 3,
+          "network_windows": 6,
+          "reclaimed": 1,
+          "duplicates_suppressed": 1,
+          "timeouts": 1,
+          "pool_resets": 1,
+          "crash_restarts": 1
+        },
+        "violations": []
+      },
+      "W1_workers_healthy": {
+        "ok": true,
+        "unexpected_exits": 0,
+        "error_log_lines": 0,
+        "violations": []
+      },
+      "I5_drained": {
+        "ok": true,
+        "stream": 0,
+        "pel": 0,
+        "delayed": 0,
+        "violations": []
+      }
+    },
+    "counters": {
+      "processed": 999740,
+      "duplicates_suppressed": 2851,
+      "effects_applied": 978240,
+      "effects_suppressed": 2899,
+      "retried": 65314,
+      "scheduled": 65314,
+      "dead": 260,
+      "late_successes": 0,
+      "requeued": 0,
+      "reclaimed": 9092,
+      "heartbeats": 118568,
+      "lease_lost": 808,
+      "consumers_pruned": 387,
+      "timeouts": 3792,
+      "rejected": 0,
+      "blocked": 1673
+    },
+    "reclaims_by_delivery": {
+      "2": 7682,
+      "3": 964,
+      "4": 141,
+      "5": 53,
+      "6": 37,
+      "7": 35,
+      "8": 30,
+      "9": 30,
+      "10": 30,
+      "11": 30,
+      "12": 30,
+      "13": 30
+    },
+    "reclaims_by_delivery_excluding_crashy": {
+      "2": 7652,
+      "3": 934,
+      "4": 111,
+      "5": 23,
+      "6": 7,
+      "7": 5
+    },
+    "max_delivery_excluding_crashy": 7
+  },
+  "faults": {
+    "planned": 160,
+    "executed": {
+      "kills": 29,
+      "pauses": 43,
+      "network_windows": 88,
+      "by_kind.kill": 29,
+      "by_kind.pause": 43,
+      "by_kind.reset_peer": 26,
+      "by_kind.timeout": 23,
+      "by_kind.latency": 16,
+      "by_kind.partition": 23,
+      "skipped": 0
+    },
+    "crash_restarts_by_exit_code": {
+      "70": 360
+    },
+    "timeline": [
+      {
+        "at": 2.0,
+        "kind": "reset_peer",
+        "worker": 2,
+        "duration": 3.292,
+        "latency_ms": 0,
+        "started": 2.002,
+        "healed": 5.307
+      },
+      {
+        "at": 4.365,
+        "kind": "latency",
+        "worker": 1,
+        "duration": 2.363,
+        "latency_ms": 189,
+        "started": 4.365,
+        "healed": 6.738
+      },
+      {
+        "at": 7.71,
+        "kind": "timeout",
+        "worker": 3,
+        "duration": 2.263,
+        "latency_ms": 0,
+        "started": 7.711,
+        "healed": 9.986
+      },
+      {
+        "at": 8.873,
+        "kind": "latency",
+        "worker": 1,
+        "duration": 3.841,
+        "latency_ms": 242,
+        "started": 8.875,
+        "healed": 12.728
+      },
+      {
+        "at": 12.351,
+        "kind": "kill",
+        "worker": 3,
+        "duration": 2.827,
+        "latency_ms": 0,
+        "started": 12.352,
+        "healed": 15.582
+      },
+      {
+        "at": 15.38,
+        "kind": "pause",
+        "worker": 1,
+        "duration": 3.123,
+        "latency_ms": 0,
+        "started": 15.381,
+        "healed": 18.644
+      },
+      {
+        "at": 19.199,
+        "kind": "pause",
+        "worker": 2,
+        "duration": 3.352,
+        "latency_ms": 0,
+        "started": 19.201,
+        "healed": 22.622
+      },
+      {
+        "at": 20.658,
+        "kind": "partition",
+        "worker": 4,
+        "duration": 2.431,
+        "latency_ms": 0,
+        "started": 20.658,
+        "healed": 23.101
+      },
+      {
+        "at": 25.337,
+        "kind": "kill",
+        "worker": 3,
+        "duration": 2.829,
+        "latency_ms": 0,
+        "started": 25.337,
+        "healed": 28.484
+      },
+      {
+        "at": 26.958,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 3.877,
+        "latency_ms": 0,
+        "started": 26.96,
+        "healed": 30.94
+      },
+      {
+        "at": 31.928,
+        "kind": "timeout",
+        "worker": 2,
+        "duration": 2.21,
+        "latency_ms": 0,
+        "started": 31.931,
+        "healed": 34.164
+      },
+      {
+        "at": 33.903,
+        "kind": "reset_peer",
+        "worker": 4,
+        "duration": 3.493,
+        "latency_ms": 0,
+        "started": 33.91,
+        "healed": 37.409
+      },
+      {
+        "at": 36.302,
+        "kind": "timeout",
+        "worker": 1,
+        "duration": 2.982,
+        "latency_ms": 0,
+        "started": 36.302,
+        "healed": 39.318
+      },
+      {
+        "at": 41.884,
+        "kind": "reset_peer",
+        "worker": 3,
+        "duration": 3.961,
+        "latency_ms": 0,
+        "started": 41.884,
+        "healed": 45.856
+      },
+      {
+        "at": 40.471,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 5.327,
+        "latency_ms": 0,
+        "started": 40.473,
+        "healed": 45.904
+      },
+      {
+        "at": 48.611,
+        "kind": "kill",
+        "worker": 2,
+        "duration": 0.872,
+        "latency_ms": 0,
+        "started": 48.612,
+        "healed": 49.912
+      },
+      {
+        "at": 49.685,
+        "kind": "partition",
+        "worker": 1,
+        "duration": 3.405,
+        "latency_ms": 0,
+        "started": 49.686,
+        "healed": 53.099
+      },
+      {
+        "at": 53.326,
+        "kind": "partition",
+        "worker": 4,
+        "duration": 1.168,
+        "latency_ms": 0,
+        "started": 53.327,
+        "healed": 54.514
+      },
+      {
+        "at": 57.578,
+        "kind": "kill",
+        "worker": 4,
+        "duration": 1.26,
+        "latency_ms": 0,
+        "started": 57.58,
+        "healed": 59.382
+      },
+      {
+        "at": 61.323,
+        "kind": "partition",
+        "worker": 3,
+        "duration": 1.185,
+        "latency_ms": 0,
+        "started": 61.324,
+        "healed": 62.519
+      },
+      {
+        "at": 60.22,
+        "kind": "latency",
+        "worker": 1,
+        "duration": 3.794,
+        "latency_ms": 211,
+        "started": 60.221,
+        "healed": 64.026
+      },
+      {
+        "at": 65.294,
+        "kind": "timeout",
+        "worker": 4,
+        "duration": 2.602,
+        "latency_ms": 0,
+        "started": 65.297,
+        "healed": 67.908
+      },
+      {
+        "at": 66.757,
+        "kind": "latency",
+        "worker": 3,
+        "duration": 2.579,
+        "latency_ms": 235,
+        "started": 66.757,
+        "healed": 69.347
+      },
+      {
+        "at": 71.652,
+        "kind": "reset_peer",
+        "worker": 2,
+        "duration": 1.564,
+        "latency_ms": 0,
+        "started": 71.652,
+        "healed": 73.223
+      },
+      {
+        "at": 73.004,
+        "kind": "pause",
+        "worker": 1,
+        "duration": 4.777,
+        "latency_ms": 0,
+        "started": 73.005,
+        "healed": 77.895
+      },
+      {
+        "at": 76.825,
+        "kind": "pause",
+        "worker": 2,
+        "duration": 4.373,
+        "latency_ms": 0,
+        "started": 76.825,
+        "healed": 81.293
+      },
+      {
+        "at": 80.215,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 3.866,
+        "latency_ms": 0,
+        "started": 80.215,
+        "healed": 84.151
+      },
+      {
+        "at": 84.861,
+        "kind": "pause",
+        "worker": 1,
+        "duration": 3.1,
+        "latency_ms": 0,
+        "started": 84.863,
+        "healed": 88.084
+      },
+      {
+        "at": 86.414,
+        "kind": "reset_peer",
+        "worker": 4,
+        "duration": 2.733,
+        "latency_ms": 0,
+        "started": 86.415,
+        "healed": 89.155
+      },
+      {
+        "at": 91.749,
+        "kind": "reset_peer",
+        "worker": 3,
+        "duration": 2.869,
+        "latency_ms": 0,
+        "started": 91.75,
+        "healed": 94.626
+      },
+      {
+        "at": 94.706,
+        "kind": "kill",
+        "worker": 4,
+        "duration": 1.019,
+        "latency_ms": 0,
+        "started": 94.707,
+        "healed": 96.144
+      },
+      {
+        "at": 97.991,
+        "kind": "latency",
+        "worker": 2,
+        "duration": 4.042,
+        "latency_ms": 182,
+        "started": 97.992,
+        "healed": 102.043
+      },
+      {
+        "at": 100.155,
+        "kind": "timeout",
+        "worker": 4,
+        "duration": 2.35,
+        "latency_ms": 0,
+        "started": 100.155,
+        "healed": 102.516
+      },
+      {
+        "at": 106.116,
+        "kind": "latency",
+        "worker": 3,
+        "duration": 2.066,
+        "latency_ms": 238,
+        "started": 106.117,
+        "healed": 108.205
+      },
+      {
+        "at": 107.37,
+        "kind": "pause",
+        "worker": 2,
+        "duration": 5.689,
+        "latency_ms": 0,
+        "started": 107.37,
+        "healed": 113.149
+      },
+      {
+        "at": 111.413,
+        "kind": "pause",
+        "worker": 3,
+        "duration": 3.991,
+        "latency_ms": 0,
+        "started": 111.413,
+        "healed": 115.483
+      },
+      {
+        "at": 116.013,
+        "kind": "partition",
+        "worker": 2,
+        "duration": 1.415,
+        "latency_ms": 0,
+        "started": 116.014,
+        "healed": 117.44
+      },
+      {
+        "at": 119.687,
+        "kind": "timeout",
+        "worker": 2,
+        "duration": 2.515,
+        "latency_ms": 0,
+        "started": 119.688,
+        "healed": 122.213
+      },
+      {
+        "at": 117.582,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 5.669,
+        "latency_ms": 0,
+        "started": 117.582,
+        "healed": 123.365
+      },
+      {
+        "at": 125.223,
+        "kind": "kill",
+        "worker": 2,
+        "duration": 0.846,
+        "latency_ms": 0,
+        "started": 125.223,
+        "healed": 126.499
+      },
+      {
+        "at": 126.432,
+        "kind": "pause",
+        "worker": 1,
+        "duration": 4.243,
+        "latency_ms": 0,
+        "started": 126.433,
+        "healed": 130.787
+      },
+      {
+        "at": 128.867,
+        "kind": "kill",
+        "worker": 4,
+        "duration": 2.193,
+        "latency_ms": 0,
+        "started": 128.868,
+        "healed": 131.582
+      },
+      {
+        "at": 133.999,
+        "kind": "pause",
+        "worker": 1,
+        "duration": 4.434,
+        "latency_ms": 0,
+        "started": 134.004,
+        "healed": 138.519
+      },
+      {
+        "at": 136.778,
+        "kind": "pause",
+        "worker": 3,
+        "duration": 4.59,
+        "latency_ms": 0,
+        "started": 136.779,
+        "healed": 141.455
+      },
+      {
+        "at": 140.964,
+        "kind": "pause",
+        "worker": 2,
+        "duration": 5.073,
+        "latency_ms": 0,
+        "started": 140.964,
+        "healed": 146.127
+      },
+      {
+        "at": 144.877,
+        "kind": "reset_peer",
+        "worker": 1,
+        "duration": 1.68,
+        "latency_ms": 0,
+        "started": 144.877,
+        "healed": 146.565
+      },
+      {
+        "at": 149.793,
+        "kind": "pause",
+        "worker": 2,
+        "duration": 4.104,
+        "latency_ms": 0,
+        "started": 149.794,
+        "healed": 154.009
+      },
+      {
+        "at": 151.176,
+        "kind": "reset_peer",
+        "worker": 4,
+        "duration": 3.298,
+        "latency_ms": 0,
+        "started": 151.178,
+        "healed": 154.488
+      },
+      {
+        "at": 158.647,
+        "kind": "pause",
+        "worker": 1,
+        "duration": 4.152,
+        "latency_ms": 0,
+        "started": 158.648,
+        "healed": 162.887
+      },
+      {
+        "at": 160.113,
+        "kind": "kill",
+        "worker": 3,
+        "duration": 2.816,
+        "latency_ms": 0,
+        "started": 160.114,
+        "healed": 163.336
+      },
+      {
+        "at": 166.755,
+        "kind": "reset_peer",
+        "worker": 3,
+        "duration": 1.445,
+        "latency_ms": 0,
+        "started": 166.756,
+        "healed": 168.208
+      },
+      {
+        "at": 168.847,
+        "kind": "pause",
+        "worker": 2,
+        "duration": 3.411,
+        "latency_ms": 0,
+        "started": 168.848,
+        "healed": 172.37
+      },
+      {
+        "at": 171.556,
+        "kind": "kill",
+        "worker": 4,
+        "duration": 2.424,
+        "latency_ms": 0,
+        "started": 171.556,
+        "healed": 174.363
+      },
+      {
+        "at": 176.773,
+        "kind": "pause",
+        "worker": 1,
+        "duration": 3.172,
+        "latency_ms": 0,
+        "started": 176.774,
+        "healed": 180.042
+      },
+      {
+        "at": 178.378,
+        "kind": "latency",
+        "worker": 2,
+        "duration": 3.275,
+        "latency_ms": 62,
+        "started": 178.378,
+        "healed": 181.66
+      },
+      {
+        "at": 182.179,
+        "kind": "kill",
+        "worker": 3,
+        "duration": 1.696,
+        "latency_ms": 0,
+        "started": 182.18,
+        "healed": 184.329
+      },
+      {
+        "at": 184.613,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 3.906,
+        "latency_ms": 0,
+        "started": 184.613,
+        "healed": 188.593
+      },
+      {
+        "at": 186.818,
+        "kind": "partition",
+        "worker": 1,
+        "duration": 2.888,
+        "latency_ms": 0,
+        "started": 186.818,
+        "healed": 189.723
+      },
+      {
+        "at": 191.048,
+        "kind": "timeout",
+        "worker": 2,
+        "duration": 2.942,
+        "latency_ms": 0,
+        "started": 191.048,
+        "healed": 193.999
+      },
+      {
+        "at": 193.748,
+        "kind": "reset_peer",
+        "worker": 1,
+        "duration": 3.366,
+        "latency_ms": 0,
+        "started": 193.749,
+        "healed": 197.124
+      },
+      {
+        "at": 196.132,
+        "kind": "kill",
+        "worker": 3,
+        "duration": 0.673,
+        "latency_ms": 0,
+        "started": 196.134,
+        "healed": 197.248
+      },
+      {
+        "at": 201.402,
+        "kind": "kill",
+        "worker": 3,
+        "duration": 0.851,
+        "latency_ms": 0,
+        "started": 201.403,
+        "healed": 202.698
+      },
+      {
+        "at": 202.78,
+        "kind": "reset_peer",
+        "worker": 4,
+        "duration": 3.401,
+        "latency_ms": 0,
+        "started": 202.785,
+        "healed": 206.2
+      },
+      {
+        "at": 204.978,
+        "kind": "reset_peer",
+        "worker": 3,
+        "duration": 3.72,
+        "latency_ms": 0,
+        "started": 204.979,
+        "healed": 208.707
+      },
+      {
+        "at": 208.535,
+        "kind": "pause",
+        "worker": 2,
+        "duration": 3.829,
+        "latency_ms": 0,
+        "started": 208.535,
+        "healed": 212.469
+      },
+      {
+        "at": 210.864,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 5.147,
+        "latency_ms": 0,
+        "started": 210.868,
+        "healed": 216.112
+      },
+      {
+        "at": 216.137,
+        "kind": "timeout",
+        "worker": 1,
+        "duration": 1.064,
+        "latency_ms": 0,
+        "started": 216.137,
+        "healed": 217.218
+      },
+      {
+        "at": 219.099,
+        "kind": "reset_peer",
+        "worker": 4,
+        "duration": 3.144,
+        "latency_ms": 0,
+        "started": 219.1,
+        "healed": 222.249
+      },
+      {
+        "at": 220.727,
+        "kind": "latency",
+        "worker": 3,
+        "duration": 3.628,
+        "latency_ms": 242,
+        "started": 220.728,
+        "healed": 224.368
+      },
+      {
+        "at": 225.218,
+        "kind": "timeout",
+        "worker": 2,
+        "duration": 1.143,
+        "latency_ms": 0,
+        "started": 225.218,
+        "healed": 226.369
+      },
+      {
+        "at": 227.47,
+        "kind": "partition",
+        "worker": 4,
+        "duration": 2.65,
+        "latency_ms": 0,
+        "started": 227.472,
+        "healed": 230.13
+      },
+      {
+        "at": 229.965,
+        "kind": "partition",
+        "worker": 2,
+        "duration": 1.773,
+        "latency_ms": 0,
+        "started": 229.965,
+        "healed": 231.747
+      },
+      {
+        "at": 235.469,
+        "kind": "latency",
+        "worker": 1,
+        "duration": 2.036,
+        "latency_ms": 215,
+        "started": 235.471,
+        "healed": 237.512
+      },
+      {
+        "at": 234.312,
+        "kind": "partition",
+        "worker": 2,
+        "duration": 3.276,
+        "latency_ms": 0,
+        "started": 234.313,
+        "healed": 237.599
+      },
+      {
+        "at": 241.354,
+        "kind": "timeout",
+        "worker": 2,
+        "duration": 2.529,
+        "latency_ms": 0,
+        "started": 241.355,
+        "healed": 243.896
+      },
+      {
+        "at": 242.496,
+        "kind": "timeout",
+        "worker": 1,
+        "duration": 1.604,
+        "latency_ms": 0,
+        "started": 242.499,
+        "healed": 244.115
+      },
+      {
+        "at": 247.179,
+        "kind": "partition",
+        "worker": 1,
+        "duration": 1.546,
+        "latency_ms": 0,
+        "started": 247.179,
+        "healed": 248.735
+      },
+      {
+        "at": 248.736,
+        "kind": "latency",
+        "worker": 3,
+        "duration": 2.395,
+        "latency_ms": 97,
+        "started": 248.736,
+        "healed": 251.138
+      },
+      {
+        "at": 250.726,
+        "kind": "timeout",
+        "worker": 1,
+        "duration": 3.187,
+        "latency_ms": 0,
+        "started": 250.726,
+        "healed": 253.922
+      },
+      {
+        "at": 253.332,
+        "kind": "pause",
+        "worker": 3,
+        "duration": 3.867,
+        "latency_ms": 0,
+        "started": 253.333,
+        "healed": 257.359
+      },
+      {
+        "at": 258.525,
+        "kind": "kill",
+        "worker": 2,
+        "duration": 1.607,
+        "latency_ms": 0,
+        "started": 258.525,
+        "healed": 260.566
+      },
+      {
+        "at": 260.055,
+        "kind": "reset_peer",
+        "worker": 4,
+        "duration": 2.597,
+        "latency_ms": 0,
+        "started": 260.056,
+        "healed": 262.669
+      },
+      {
+        "at": 263.184,
+        "kind": "pause",
+        "worker": 1,
+        "duration": 3.112,
+        "latency_ms": 0,
+        "started": 263.185,
+        "healed": 266.368
+      },
+      {
+        "at": 266.006,
+        "kind": "kill",
+        "worker": 3,
+        "duration": 1.816,
+        "latency_ms": 0,
+        "started": 266.006,
+        "healed": 268.203
+      },
+      {
+        "at": 271.917,
+        "kind": "latency",
+        "worker": 2,
+        "duration": 2.461,
+        "latency_ms": 120,
+        "started": 271.917,
+        "healed": 274.387
+      },
+      {
+        "at": 270.111,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 4.497,
+        "latency_ms": 0,
+        "started": 270.112,
+        "healed": 274.702
+      },
+      {
+        "at": 278.371,
+        "kind": "kill",
+        "worker": 2,
+        "duration": 1.004,
+        "latency_ms": 0,
+        "started": 278.372,
+        "healed": 279.766
+      },
+      {
+        "at": 279.749,
+        "kind": "reset_peer",
+        "worker": 1,
+        "duration": 1.218,
+        "latency_ms": 0,
+        "started": 279.75,
+        "healed": 280.977
+      },
+      {
+        "at": 282.655,
+        "kind": "timeout",
+        "worker": 4,
+        "duration": 3.579,
+        "latency_ms": 0,
+        "started": 282.659,
+        "healed": 286.263
+      },
+      {
+        "at": 284.183,
+        "kind": "kill",
+        "worker": 1,
+        "duration": 2.537,
+        "latency_ms": 0,
+        "started": 284.184,
+        "healed": 287.113
+      },
+      {
+        "at": 289.462,
+        "kind": "kill",
+        "worker": 3,
+        "duration": 2.785,
+        "latency_ms": 0,
+        "started": 289.466,
+        "healed": 292.557
+      },
+      {
+        "at": 290.616,
+        "kind": "pause",
+        "worker": 1,
+        "duration": 3.826,
+        "latency_ms": 0,
+        "started": 290.617,
+        "healed": 294.534
+      },
+      {
+        "at": 294.676,
+        "kind": "kill",
+        "worker": 2,
+        "duration": 0.786,
+        "latency_ms": 0,
+        "started": 294.676,
+        "healed": 295.803
+      },
+      {
+        "at": 298.042,
+        "kind": "partition",
+        "worker": 2,
+        "duration": 3.192,
+        "latency_ms": 0,
+        "started": 298.042,
+        "healed": 301.248
+      },
+      {
+        "at": 300.298,
+        "kind": "reset_peer",
+        "worker": 4,
+        "duration": 1.818,
+        "latency_ms": 0,
+        "started": 300.298,
+        "healed": 302.121
+      },
+      {
+        "at": 305.714,
+        "kind": "pause",
+        "worker": 1,
+        "duration": 3.23,
+        "latency_ms": 0,
+        "started": 305.715,
+        "healed": 309.041
+      },
+      {
+        "at": 307.607,
+        "kind": "partition",
+        "worker": 3,
+        "duration": 2.579,
+        "latency_ms": 0,
+        "started": 307.621,
+        "healed": 310.214
+      },
+      {
+        "at": 311.893,
+        "kind": "kill",
+        "worker": 1,
+        "duration": 2.155,
+        "latency_ms": 0,
+        "started": 311.894,
+        "healed": 314.387
+      },
+      {
+        "at": 314.244,
+        "kind": "timeout",
+        "worker": 4,
+        "duration": 2.01,
+        "latency_ms": 0,
+        "started": 314.245,
+        "healed": 316.265
+      },
+      {
+        "at": 317.122,
+        "kind": "pause",
+        "worker": 1,
+        "duration": 3.809,
+        "latency_ms": 0,
+        "started": 317.123,
+        "healed": 321.022
+      },
+      {
+        "at": 319.945,
+        "kind": "partition",
+        "worker": 3,
+        "duration": 3.27,
+        "latency_ms": 0,
+        "started": 319.946,
+        "healed": 323.224
+      },
+      {
+        "at": 324.585,
+        "kind": "partition",
+        "worker": 4,
+        "duration": 2.684,
+        "latency_ms": 0,
+        "started": 324.586,
+        "healed": 327.282
+      },
+      {
+        "at": 327.154,
+        "kind": "reset_peer",
+        "worker": 1,
+        "duration": 2.605,
+        "latency_ms": 0,
+        "started": 327.156,
+        "healed": 329.773
+      },
+      {
+        "at": 331.626,
+        "kind": "timeout",
+        "worker": 3,
+        "duration": 2.503,
+        "latency_ms": 0,
+        "started": 331.627,
+        "healed": 334.138
+      },
+      {
+        "at": 333.478,
+        "kind": "kill",
+        "worker": 1,
+        "duration": 1.448,
+        "latency_ms": 0,
+        "started": 333.486,
+        "healed": 335.347
+      },
+      {
+        "at": 336.978,
+        "kind": "timeout",
+        "worker": 1,
+        "duration": 2.331,
+        "latency_ms": 0,
+        "started": 336.979,
+        "healed": 339.318
+      },
+      {
+        "at": 339.94,
+        "kind": "kill",
+        "worker": 3,
+        "duration": 2.226,
+        "latency_ms": 0,
+        "started": 339.941,
+        "healed": 342.511
+      },
+      {
+        "at": 344.3,
+        "kind": "partition",
+        "worker": 3,
+        "duration": 3.404,
+        "latency_ms": 0,
+        "started": 344.301,
+        "healed": 347.717
+      },
+      {
+        "at": 342.571,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 5.28,
+        "latency_ms": 0,
+        "started": 342.571,
+        "healed": 347.907
+      },
+      {
+        "at": 352.407,
+        "kind": "kill",
+        "worker": 1,
+        "duration": 1.378,
+        "latency_ms": 0,
+        "started": 352.407,
+        "healed": 354.175
+      },
+      {
+        "at": 350.207,
+        "kind": "latency",
+        "worker": 3,
+        "duration": 4.076,
+        "latency_ms": 163,
+        "started": 350.207,
+        "healed": 354.29
+      },
+      {
+        "at": 357.97,
+        "kind": "kill",
+        "worker": 3,
+        "duration": 2.447,
+        "latency_ms": 0,
+        "started": 357.97,
+        "healed": 360.771
+      },
+      {
+        "at": 359.502,
+        "kind": "kill",
+        "worker": 4,
+        "duration": 2.778,
+        "latency_ms": 0,
+        "started": 359.503,
+        "healed": 362.702
+      },
+      {
+        "at": 366.191,
+        "kind": "kill",
+        "worker": 3,
+        "duration": 0.837,
+        "latency_ms": 0,
+        "started": 366.192,
+        "healed": 367.397
+      },
+      {
+        "at": 364.909,
+        "kind": "kill",
+        "worker": 2,
+        "duration": 2.808,
+        "latency_ms": 0,
+        "started": 364.911,
+        "healed": 368.056
+      },
+      {
+        "at": 370.791,
+        "kind": "reset_peer",
+        "worker": 4,
+        "duration": 3.007,
+        "latency_ms": 0,
+        "started": 370.792,
+        "healed": 373.809
+      },
+      {
+        "at": 373.067,
+        "kind": "partition",
+        "worker": 1,
+        "duration": 2.128,
+        "latency_ms": 0,
+        "started": 373.068,
+        "healed": 375.205
+      },
+      {
+        "at": 375.918,
+        "kind": "pause",
+        "worker": 3,
+        "duration": 3.62,
+        "latency_ms": 0,
+        "started": 375.921,
+        "healed": 379.643
+      },
+      {
+        "at": 378.026,
+        "kind": "timeout",
+        "worker": 2,
+        "duration": 3.021,
+        "latency_ms": 0,
+        "started": 378.026,
+        "healed": 381.058
+      },
+      {
+        "at": 384.614,
+        "kind": "kill",
+        "worker": 4,
+        "duration": 1.172,
+        "latency_ms": 0,
+        "started": 384.614,
+        "healed": 386.121
+      },
+      {
+        "at": 383.375,
+        "kind": "timeout",
+        "worker": 2,
+        "duration": 2.933,
+        "latency_ms": 0,
+        "started": 383.376,
+        "healed": 386.35
+      },
+      {
+        "at": 391.649,
+        "kind": "timeout",
+        "worker": 3,
+        "duration": 2.988,
+        "latency_ms": 0,
+        "started": 391.65,
+        "healed": 394.653
+      },
+      {
+        "at": 388.828,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 5.734,
+        "latency_ms": 0,
+        "started": 388.832,
+        "healed": 394.682
+      },
+      {
+        "at": 397.795,
+        "kind": "timeout",
+        "worker": 1,
+        "duration": 3.22,
+        "latency_ms": 0,
+        "started": 397.796,
+        "healed": 401.024
+      },
+      {
+        "at": 399.594,
+        "kind": "pause",
+        "worker": 3,
+        "duration": 5.005,
+        "latency_ms": 0,
+        "started": 399.595,
+        "healed": 404.704
+      },
+      {
+        "at": 405.115,
+        "kind": "timeout",
+        "worker": 2,
+        "duration": 3.858,
+        "latency_ms": 0,
+        "started": 405.115,
+        "healed": 408.983
+      },
+      {
+        "at": 407.56,
+        "kind": "timeout",
+        "worker": 3,
+        "duration": 3.254,
+        "latency_ms": 0,
+        "started": 407.562,
+        "healed": 410.825
+      },
+      {
+        "at": 412.268,
+        "kind": "partition",
+        "worker": 2,
+        "duration": 1.232,
+        "latency_ms": 0,
+        "started": 412.268,
+        "healed": 413.52
+      },
+      {
+        "at": 413.425,
+        "kind": "partition",
+        "worker": 3,
+        "duration": 1.534,
+        "latency_ms": 0,
+        "started": 413.426,
+        "healed": 414.97
+      },
+      {
+        "at": 419.925,
+        "kind": "latency",
+        "worker": 4,
+        "duration": 2.592,
+        "latency_ms": 181,
+        "started": 419.926,
+        "healed": 422.528
+      },
+      {
+        "at": 418.311,
+        "kind": "pause",
+        "worker": 2,
+        "duration": 5.674,
+        "latency_ms": 0,
+        "started": 418.311,
+        "healed": 424.091
+      },
+      {
+        "at": 425.495,
+        "kind": "pause",
+        "worker": 3,
+        "duration": 4.754,
+        "latency_ms": 0,
+        "started": 425.497,
+        "healed": 430.36
+      },
+      {
+        "at": 427.198,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 5.414,
+        "latency_ms": 0,
+        "started": 427.198,
+        "healed": 432.748
+      },
+      {
+        "at": 434.194,
+        "kind": "kill",
+        "worker": 1,
+        "duration": 0.828,
+        "latency_ms": 0,
+        "started": 434.198,
+        "healed": 435.395
+      },
+      {
+        "at": 435.717,
+        "kind": "reset_peer",
+        "worker": 4,
+        "duration": 2.013,
+        "latency_ms": 0,
+        "started": 435.717,
+        "healed": 437.736
+      },
+      {
+        "at": 437.663,
+        "kind": "pause",
+        "worker": 2,
+        "duration": 5.365,
+        "latency_ms": 0,
+        "started": 437.663,
+        "healed": 443.144
+      },
+      {
+        "at": 441.359,
+        "kind": "pause",
+        "worker": 3,
+        "duration": 4.78,
+        "latency_ms": 0,
+        "started": 441.364,
+        "healed": 446.475
+      },
+      {
+        "at": 447.117,
+        "kind": "partition",
+        "worker": 2,
+        "duration": 1.124,
+        "latency_ms": 0,
+        "started": 447.118,
+        "healed": 448.255
+      },
+      {
+        "at": 448.594,
+        "kind": "partition",
+        "worker": 3,
+        "duration": 2.415,
+        "latency_ms": 0,
+        "started": 448.596,
+        "healed": 451.019
+      },
+      {
+        "at": 450.402,
+        "kind": "partition",
+        "worker": 1,
+        "duration": 3.869,
+        "latency_ms": 0,
+        "started": 450.403,
+        "healed": 454.279
+      },
+      {
+        "at": 453.383,
+        "kind": "latency",
+        "worker": 2,
+        "duration": 4.755,
+        "latency_ms": 174,
+        "started": 453.384,
+        "healed": 458.148
+      },
+      {
+        "at": 456.948,
+        "kind": "reset_peer",
+        "worker": 1,
+        "duration": 1.813,
+        "latency_ms": 0,
+        "started": 456.949,
+        "healed": 458.767
+      },
+      {
+        "at": 461.101,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 3.512,
+        "latency_ms": 0,
+        "started": 461.102,
+        "healed": 464.699
+      },
+      {
+        "at": 462.566,
+        "kind": "reset_peer",
+        "worker": 1,
+        "duration": 3.066,
+        "latency_ms": 0,
+        "started": 462.567,
+        "healed": 465.639
+      },
+      {
+        "at": 468.097,
+        "kind": "reset_peer",
+        "worker": 3,
+        "duration": 2.219,
+        "latency_ms": 0,
+        "started": 468.098,
+        "healed": 470.332
+      },
+      {
+        "at": 470.623,
+        "kind": "reset_peer",
+        "worker": 4,
+        "duration": 1.342,
+        "latency_ms": 0,
+        "started": 470.625,
+        "healed": 471.979
+      },
+      {
+        "at": 472.826,
+        "kind": "latency",
+        "worker": 2,
+        "duration": 3.097,
+        "latency_ms": 79,
+        "started": 472.827,
+        "healed": 475.933
+      },
+      {
+        "at": 475.426,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 4.506,
+        "latency_ms": 0,
+        "started": 475.426,
+        "healed": 480.028
+      },
+      {
+        "at": 480.362,
+        "kind": "partition",
+        "worker": 3,
+        "duration": 2.643,
+        "latency_ms": 0,
+        "started": 480.363,
+        "healed": 483.013
+      },
+      {
+        "at": 483.058,
+        "kind": "reset_peer",
+        "worker": 2,
+        "duration": 2.874,
+        "latency_ms": 0,
+        "started": 483.059,
+        "healed": 485.938
+      },
+      {
+        "at": 485.381,
+        "kind": "reset_peer",
+        "worker": 3,
+        "duration": 3.331,
+        "latency_ms": 0,
+        "started": 485.382,
+        "healed": 488.72
+      },
+      {
+        "at": 490.479,
+        "kind": "kill",
+        "worker": 2,
+        "duration": 1.477,
+        "latency_ms": 0,
+        "started": 490.479,
+        "healed": 492.399
+      },
+      {
+        "at": 493.46,
+        "kind": "timeout",
+        "worker": 4,
+        "duration": 1.529,
+        "latency_ms": 0,
+        "started": 493.463,
+        "healed": 495.008
+      },
+      {
+        "at": 496.446,
+        "kind": "latency",
+        "worker": 1,
+        "duration": 2.603,
+        "latency_ms": 221,
+        "started": 496.448,
+        "healed": 499.059
+      },
+      {
+        "at": 498.063,
+        "kind": "reset_peer",
+        "worker": 2,
+        "duration": 2.155,
+        "latency_ms": 0,
+        "started": 498.064,
+        "healed": 500.226
+      },
+      {
+        "at": 502.202,
+        "kind": "pause",
+        "worker": 3,
+        "duration": 5.433,
+        "latency_ms": 0,
+        "started": 502.202,
+        "healed": 507.719
+      },
+      {
+        "at": 504.081,
+        "kind": "pause",
+        "worker": 2,
+        "duration": 3.684,
+        "latency_ms": 0,
+        "started": 504.082,
+        "healed": 507.852
+      },
+      {
+        "at": 512.225,
+        "kind": "partition",
+        "worker": 4,
+        "duration": 3.322,
+        "latency_ms": 0,
+        "started": 512.225,
+        "healed": 515.563
+      },
+      {
+        "at": 513.467,
+        "kind": "pause",
+        "worker": 1,
+        "duration": 4.847,
+        "latency_ms": 0,
+        "started": 513.468,
+        "healed": 518.449
+      },
+      {
+        "at": 518.899,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 5.587,
+        "latency_ms": 0,
+        "started": 518.9,
+        "healed": 524.588
+      }
+    ],
+    "skipped": []
+  },
+  "worker_logs": {
+    "by_level": {
+      "INFO": 5010,
+      "WARNING": 6757
+    },
+    "by_message": {
+      ": started (": 391,
+      "exceeded its": 4006,
+      "orphaned thread run finished": 471,
+      "process pool reset": 1904,
+      "lost the lease": 608,
+      "pruned": 304,
+      "job -> DLQ": 260
+    },
+    "pool_resets": 1904,
+    "pool_starts": {
+      "count": 1581,
+      "max_s": 9.13,
+      "mean_s": 2.198
+    },
+    "timeouts_of_runs_that_cannot_hang": {},
+    "error_samples": []
+  },
+  "cpu_percent_mean": {
+    "ftq-chaos-redis": 24.8,
+    "ftq-chaos-toxiproxy": 27.1,
+    "ftq-chaos-worker-1": 70.2,
+    "ftq-chaos-worker-2": 74.9,
+    "ftq-chaos-worker-3": 78.6,
+    "ftq-chaos-worker-4": 76.0
+  },
+  "run_dir": "chaos/runs/ci"
+}
