@@ -226,6 +226,11 @@ class Run:
                 evidence,
                 Minimums(),
             )
+            # Measured, not estimated: every done key, hash, and log entry is still there
+            # (no TTLs in chaos runs), so this is the whole run's footprint against the
+            # noeviction cap. The 1M run is what sizes it (ADR-039).
+            mem = await redis.info("memory")
+            redis_memory = {k: mem[k] for k in ("used_memory", "used_memory_peak", "maxmemory")}
             report = self._report(
                 result,
                 plan,
@@ -236,6 +241,7 @@ class Run:
                 fault_phase_s,
                 drain_s,
                 time.monotonic() - started,
+                redis_memory,
             )
         finally:
             await redis.aclose()
@@ -403,6 +409,7 @@ class Run:
         fault_phase_s: float,
         drain_s: float,
         total_s: float,
+        redis_memory: dict[str, int],
     ) -> dict[str, Any]:
         a = self.a
         cpu: dict[str, list[float]] = {}
@@ -435,6 +442,7 @@ class Run:
                     "total": round(total_s, 1),
                 },
                 "drained_before_timeout": drained,
+                "redis_memory_bytes": redis_memory,
             },
             "verifier": result,
             "faults": {
@@ -446,7 +454,13 @@ class Run:
             },
             "worker_logs": logs,
             "cpu_percent_mean": {k: round(sum(v) / len(v), 1) for k, v in sorted(cpu.items())},
-            "run_dir": str(self.run_dir.relative_to(REPO_ROOT)),
+            # Relative when inside the repo (the default); a --run-dir elsewhere is kept
+            # absolute rather than crashing after the run and losing the report.
+            "run_dir": str(
+                self.run_dir.relative_to(REPO_ROOT)
+                if self.run_dir.is_relative_to(REPO_ROOT)
+                else self.run_dir
+            ),
         }
 
     def _summary(self, report: dict[str, Any]) -> None:
@@ -488,6 +502,14 @@ class Run:
             v["reclaims_by_delivery_excluding_crashy"],
             v["max_delivery_excluding_crashy"],
             self.max_deliveries,
+        )
+        r = report["run"]
+        mem = r["redis_memory_bytes"]
+        log.info(
+            "  seconds %s | redis memory peak %.0f MiB of maxmemory %.0f MiB",
+            r["seconds"],
+            mem["used_memory_peak"] / 2**20,
+            mem["maxmemory"] / 2**20,
         )
         log.info("  report: %s", self.a.out)
 
