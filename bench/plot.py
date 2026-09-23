@@ -16,6 +16,8 @@ Reads every `<suite>/*.json` that bench/run.py wrote and produces, next to them:
   second, in reject and block mode;
 - `summary.json` / `summary.md`: every number the charts show, per point.
 
+With `--aws`: `scaling.png`, `backpressure.png` and `summary.md` under results/aws.
+
 Nothing is measured here: this selects numbers from the reports and draws them. The
 one derived column, Redis µs per job, is the report's main-thread CPU divided by its
 completed jobs/s.
@@ -447,6 +449,83 @@ def plot_aws_scaling(rows: list[dict[str, Any]], out: Path, subtitle: str) -> No
     _finish(fig, "AWS scaling: completed jobs/s vs workers", out, subtitle)
 
 
+def rolling_per_s(
+    bins: dict[str, Any], seconds: range, width: int, col: int | None = None
+) -> list[float]:
+    """A trailing `width`-second mean of a report's per-second bins (keys are seconds since
+    the load started; `col` picks one column of a list-valued bin). A second with no bin
+    counts as 0: in block mode a producer's bin is the second its call *started*, so a
+    call that waits leaves empty seconds, then a catch-up burst. The mean spreads that
+    back out without inventing jobs: the sum over the run is unchanged."""
+    raw = [bins.get(str(s)) for s in seconds]
+    vals = [float((v[col] if col is not None else v) if v is not None else 0) for v in raw]
+    out = []
+    for i in range(len(vals)):
+        lo = max(0, i - width + 1)
+        out.append(sum(vals[lo : i + 1]) / (i + 1 - lo))
+    return out
+
+
+def plot_aws_backpressure(reports: list[dict[str, Any]], out: Path, subtitle: str) -> None:
+    """One row per mode: depth against the watermarks (left), and offered / accepted /
+    completed per second (right), the steady-state window shaded. In block mode a
+    producer's "offered" is what it managed to submit (it waits instead of being
+    refused), so the rate it was *scheduled* to offer is drawn as its own line."""
+    fig, axes = plt.subplots(len(reports), 2, figsize=(12, 4.4 * len(reports)), squeeze=False)
+    width = 5
+    for (a_depth, a_rate), r in zip(axes, reports, strict=True):
+        spec, win, t0 = r["spec"], r["window"], r["t0_ms"]
+        mode = spec["backpressure"]
+        w0, w1 = (win["start_ms"] - t0) / 1000, (win["end_ms"] - t0) / 1000
+        samples = r["timeline"]["samples"]
+        ts = [(x["t_ms"] - t0) / 1000 for x in samples]
+        for ax in (a_depth, a_rate):
+            ax.axvspan(w0, w1, color=GRID, alpha=0.6, lw=0)
+        a_depth.plot(ts, [x["depth"] for x in samples], color=BLUE)
+        for mark, name in [(spec["high_watermark"], "high"), (spec["low_watermark"], "low")]:
+            a_depth.axhline(mark, color=MUTED, lw=1, ls=":")
+            label = f"{name} {mark / 1000:.0f}K "
+            a_depth.text(1, mark, label, color=INK_2, fontsize=8, ha="right", va="bottom",
+                         transform=a_depth.get_yaxis_transform())  # fmt: skip
+        d = r["depth_in_window"]
+        note = f"window: depth {d['min']:,} to {d['max']:,}"
+        a_depth.text(w0 + 2, spec["high_watermark"] * 1.22, note, color=INK_2, fontsize=8)
+        a_depth.set_ylim(0, spec["high_watermark"] * 1.35)
+        a_depth.yaxis.set_major_formatter(lambda v, _: f"{v / 1000:.0f}K")
+        a_depth.set_xlabel("seconds since the load started (shaded: measurement window)")
+        a_depth.set_ylabel("queue depth (stream + delayed)")
+        a_depth.set_title(f"{mode}: queue depth, sampled every second")
+
+        per_s, done = r["timeline"]["producer_per_s"], r["timeline"]["completed_per_s"]
+        last = max([int(k) for k in per_s] + [int(k) for k in done])
+        secs = range(0, last + 1)
+        xs = list(secs)
+        a_rate.axhline(spec["rate"], color=INK_2, lw=1.2, ls="--",
+                       label=f"scheduled offer {spec['rate']:,.0f}/s")  # fmt: skip
+        if mode == "reject":
+            a_rate.plot(xs, rolling_per_s(per_s, secs, width, 0), color=MUTED, lw=1.5,
+                        label="offered")  # fmt: skip
+        a_rate.plot(xs, rolling_per_s(per_s, secs, width, 1), color=ORANGE, label="accepted")
+        a_rate.plot(xs, rolling_per_s(done, secs, width), color=AQUA, label="completed")
+        a_rate.set_ylim(0, spec["rate"] * 1.45)
+        a_rate.yaxis.set_major_formatter(lambda v, _: f"{v / 1000:.0f}K")
+        a_rate.set_ylabel("jobs per second")
+        a_rate.set_title(f"{mode}: offered, accepted, completed")
+        a_rate.legend(loc="upper right", ncols=2, fontsize=8)
+        t, p = r["throughput"], r["producers"]
+        how = (f"rejected {p['rejected']:,} jobs" if mode == "reject" else
+               f"producers waited {p['blocked']:,} times ({p['blocked_seconds']:.0f} s in all); "
+               f"rejected {p['rejected']:,}")  # fmt: skip
+        # In the x label, so tight_layout leaves room for it.
+        a_rate.set_xlabel(f"seconds since the load started ({width} s trailing mean)\n"
+                          f"window: offered {t['offered_per_s']:,.0f}/s, accepted "
+                          f"{t['accepted_per_s']:,.0f}/s, completed {t['completed_per_s']:,.0f}/s"
+                          f"\n{how}")  # fmt: skip
+    workers = reports[0]["meta"]["workers"]
+    _finish(fig, f"AWS backpressure: {workers} workers, offered 1.5x their capacity", out,
+            subtitle)  # fmt: skip
+
+
 def aws_main(results: Path) -> None:
     _style()
     rows = aws_rows(results)
@@ -457,6 +536,11 @@ def aws_main(results: Path) -> None:
     env = json.loads(first.read_text())["meta"]["environment"]
     subtitle = env.replace(": Redis on", ".\nRedis on", 1)
     plot_aws_scaling(rows, results / "scaling.png", subtitle)
+    bp = [json.loads(f.read_text()) for f in sorted((results / "backpressure").glob("*.json"))
+          if not f.name.endswith(".services.json")]  # fmt: skip
+    if bp:
+        bp.sort(key=lambda r: r["spec"]["backpressure"], reverse=True)  # reject, then block
+        plot_aws_backpressure(bp, results / "backpressure.png", subtitle)
     cols = ["suite", "label", "workers", "offered_per_s", "completed_per_s",
             "redis_main_thread", "e2e_p50_ms", "e2e_p99_ms", "rejected", "blocked", "hosts",
             "exactly_once", "recovered", "git", "date_utc"]  # fmt: skip

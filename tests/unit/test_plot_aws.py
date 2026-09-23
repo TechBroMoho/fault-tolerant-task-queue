@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from bench.plot import aws_rows
+from bench.plot import aws_rows, rolling_per_s
 
 
 def _report(label: str, workers: int, per_s: float, **meta: Any) -> dict[str, Any]:
@@ -37,3 +37,14 @@ def test_rows_come_from_reports_not_snapshots_and_say_which_were_recovered(
         ("backpressure", "w12_reject", 17784, True),
     ]
     assert rows[0]["hosts"] == "2/2" and rows[0]["exactly_once"] is True
+
+
+def test_the_rolling_rate_counts_empty_seconds_as_zero_and_keeps_the_total() -> None:
+    """Block mode: a call that waits leaves seconds with no bin, then a burst. The
+    trailing mean must treat those seconds as 0 jobs (not skip them) and never create
+    or lose jobs over a full window."""
+    bins = {"0": [10, 10, 0], "3": [40, 30, 10]}  # seconds 1 and 2: every call was waiting
+    assert rolling_per_s(bins, range(4), 1, 1) == [10, 0, 0, 30]
+    assert rolling_per_s(bins, range(4), 2, 1) == [10, 5, 0, 15]  # the first point: 1 s only
+    assert rolling_per_s(bins, range(4), 4, 0)[-1] == (10 + 40) / 4
+    assert rolling_per_s({"1": 7}, range(3), 1) == [0, 7, 0]  # scalar bins (completed_per_s)
