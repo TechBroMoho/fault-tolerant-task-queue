@@ -1,6 +1,7 @@
 """Charts and a summary table from the saved benchmark reports.
 
     uv run python -m bench.plot [--results results/local/bench]
+    uv run python -m bench.plot --aws [--results results/aws]
 
 Reads every `<suite>/*.json` that bench/run.py wrote and produces, next to them:
 
@@ -70,13 +71,13 @@ def load(results: Path, suite: str) -> list[dict[str, Any]]:
     return [json.loads(f.read_text()) for f in sorted((results / suite).glob("*.json"))]
 
 
-def _finish(fig: Any, title: str, out: Path) -> None:
+def _finish(fig: Any, title: str, out: Path, subtitle: str = SUBTITLE) -> None:
     # Title and subtitle in fixed points from the top, so they never collide.
     h = fig.get_figheight() * 72
     fig.text(
         0.01, 1 - 10 / h, title, ha="left", va="top", fontsize=13, fontweight="bold", color=INK
     )
-    fig.text(0.01, 1 - 30 / h, SUBTITLE, ha="left", va="top", fontsize=8.5, color=INK_2)
+    fig.text(0.01, 1 - 30 / h, subtitle, ha="left", va="top", fontsize=8.5, color=INK_2)
     fig.tight_layout(rect=(0, 0, 1, 1 - 48 / h))
     fig.savefig(out, dpi=150)
     plt.close(fig)
@@ -257,6 +258,7 @@ def plot_bottleneck(rows: list[dict[str, Any]], out: Path) -> None:
     a2.text(ws[0] - 0.4, cpus + 0.15, f"{cpus:.0f} CPUs in the VM", color=INK_2, fontsize=8)
     a2.set_ylim(0, cpus * 1.2)
     a2.set_xticks(ws)
+    a2.set_xlim(0, max(ws) + 1.5)
     a2.set_xlabel("worker containers")
     a2.set_ylabel("CPUs busy")
     a2.set_title("Whole Docker VM")
@@ -363,6 +365,111 @@ def plot_backpressure(reports: list[dict[str, Any]], out: Path) -> None:
     _finish(fig, f"Backpressure: {offered / 1000:.0f}K jobs/s offered, open loop", out)
 
 
+# ---------------------------------------------------------------- AWS (Phase 8)
+
+AWS_DEFAULT = Path(__file__).resolve().parents[1] / "results" / "aws"
+
+
+def aws_rows(results: Path) -> list[dict[str, Any]]:
+    """One row per saved AWS point (scaling, headline, backpressure), from the reports
+    `deploy/bench.py` wrote. The AWS reports have no Docker-VM `cpu` block, so the local
+    `_row` doesn't apply; what they have is Redis's own CPU, from INFO."""
+    rows = []
+    for suite in ("scaling", "headline", "backpressure"):
+        for f in sorted((results / suite).glob("*.json")):
+            if f.name.endswith(".services.json"):
+                continue
+            r = json.loads(f.read_text())
+            m, t, lat, p = r["meta"], r["throughput"], r["e2e_latency_ms"], r["producers"]
+            rows.append({
+                "suite": suite, "label": m["label"], "workers": m["workers"],
+                "offered_per_s": round(t["offered_per_s"]),
+                "completed_per_s": round(t["completed_per_s"]),
+                "redis_main_thread": r["redis"]["main_thread_busy"],
+                "e2e_p50_ms": lat["p50"], "e2e_p99_ms": lat["p99"],
+                "rejected": p["rejected"], "blocked": p["blocked"],
+                "hosts": f"{p['hosts']['reported']}/{p['hosts']['expected']}",
+                "exactly_once": r["exactly_once"]["ok"],
+                "recovered": "recovered" in m, "git": m.get("git", ""),
+                "date_utc": m.get("date_utc", ""),
+            })  # fmt: skip
+    return rows
+
+
+def plot_aws_scaling(rows: list[dict[str, Any]], out: Path, subtitle: str) -> None:
+    """Jobs/s vs workers above, Redis main-thread CPU below, on a shared workers axis:
+    two panels rather than one chart with two y-scales. The headline runs (12 workers)
+    are drawn as their own points next to the scaling point, and the median is labelled."""
+    scaling = sorted((r for r in rows if r["suite"] == "scaling"), key=lambda r: r["workers"])
+    headline = [r for r in rows if r["suite"] == "headline"]
+    ws = [r["workers"] for r in scaling]
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(7.5, 6.4), sharex=True,
+                                 gridspec_kw={"height_ratios": [3, 2]})  # fmt: skip
+    one = next((r["completed_per_s"] for r in scaling if r["workers"] == 1), None)
+    if one:
+        a1.plot(ws, [one * w for w in ws], color=MUTED, lw=1.2, ls="--")
+    top = max([r["completed_per_s"] for r in scaling] + [0])
+    if one:  # label the reference line near where it leaves the plot, to its left
+        x = top * 1.25 / one
+        a1.text(x - 0.25, one * x, "linear from 1 worker", color=INK_2, fontsize=8,
+                ha="right", va="center")  # fmt: skip
+    a1.plot(ws, [r["completed_per_s"] for r in scaling], color=BLUE, marker="o", ms=7,
+            mec=SURFACE, mew=2, zorder=3)  # fmt: skip
+    for r in scaling:
+        a1.annotate(f"{r['completed_per_s']:,}", (r["workers"], r["completed_per_s"]),
+                    xytext=(0, 9), textcoords="offset points", ha="center", color=INK,
+                    fontsize=8.5)  # fmt: skip
+    if headline:
+        ys = sorted(r["completed_per_s"] for r in headline)
+        hx = headline[0]["workers"] + 0.35
+        a1.scatter([hx] * len(ys), ys, s=40, color=ORANGE, marker="D", edgecolors=SURFACE,
+                   linewidths=1.5, zorder=3)  # fmt: skip
+        med = statistics.median(ys)
+        a1.annotate(f"headline x {len(ys)}: median {med:,.0f}\n({ys[0]:,} to {ys[-1]:,})",
+                    (hx, med), xytext=(8, -26), textcoords="offset points", ha="left",
+                    color=INK, fontsize=8.5)  # fmt: skip
+    a1.set_ylim(0, top * 1.35)
+    a1.set_ylabel("completed jobs/s")
+    a1.set_title("Throughput (saturated: offered load kept ~20K jobs queued)")
+    a2.plot(ws, [100 * r["redis_main_thread"] for r in scaling], color=BLUE, marker="o",
+            ms=7, mec=SURFACE, mew=2)  # fmt: skip
+    for r in scaling:
+        a2.annotate(f"{100 * r['redis_main_thread']:.0f}%", (r["workers"],
+                    100 * r["redis_main_thread"]), xytext=(0, 9), textcoords="offset points",
+                    ha="center", color=INK, fontsize=8.5)  # fmt: skip
+    a2.axhline(100, color=MUTED, lw=1, ls=":")
+    a2.text(0.2, 101, "one full core", color=INK_2, fontsize=8, va="bottom")
+    a2.set_ylim(0, 115)
+    a2.set_ylabel("Redis main thread busy (%)")
+    a2.set_xlabel("workers")
+    a2.set_xticks(ws)
+    a2.set_title("Redis's single main thread")
+    _finish(fig, "AWS scaling: completed jobs/s vs workers", out, subtitle)
+
+
+def aws_main(results: Path) -> None:
+    _style()
+    rows = aws_rows(results)
+    if not any(r["suite"] == "scaling" for r in rows):
+        raise SystemExit(f"no scaling reports under {results}")
+    first = next(f for f in sorted((results / "scaling").glob("*.json"))
+                 if not f.name.endswith(".services.json"))  # fmt: skip
+    env = json.loads(first.read_text())["meta"]["environment"]
+    subtitle = env.replace(": Redis on", ".\nRedis on", 1)
+    plot_aws_scaling(rows, results / "scaling.png", subtitle)
+    cols = ["suite", "label", "workers", "offered_per_s", "completed_per_s",
+            "redis_main_thread", "e2e_p50_ms", "e2e_p99_ms", "rejected", "blocked", "hosts",
+            "exactly_once", "recovered", "git", "date_utc"]  # fmt: skip
+    intro = (
+        f"# AWS benchmark summary\n\n{env}\n\nGenerated by `python -m bench.plot --aws` "
+        "from the reports in this directory; see README.md for which session each point "
+        "came from.\n"
+    )
+    md = [intro, _table(rows, cols)]
+    (results / "summary.md").write_text("\n".join(md) + "\n")
+    print(f"wrote {results / 'summary.md'}")
+
+
 def _table(rows: list[dict[str, Any]], cols: list[str]) -> str:
     lines = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
     for r in rows:
@@ -372,8 +479,13 @@ def _table(rows: list[dict[str, Any]], cols: list[str]) -> str:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--results", type=Path, default=DEFAULT)
-    results = p.parse_args().results
+    p.add_argument("--results", type=Path, default=None)
+    p.add_argument("--aws", action="store_true", help="the Phase 8 reports (results/aws)")
+    a = p.parse_args()
+    if a.aws:
+        aws_main(a.results or AWS_DEFAULT)
+        return
+    results = a.results or DEFAULT
     _style()
     summary: dict[str, Any] = {}
     md = [

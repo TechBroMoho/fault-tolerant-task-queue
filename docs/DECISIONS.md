@@ -2393,10 +2393,22 @@ second, independent loadgen on the same queue would break its exactly-once check
   now waits up to 180 s for the whole report. `python -m deploy.bench recover` reads a
   point's report back from its own stream (label, suite, run id checked) and marks it
   `meta.recovered`. Used for scaling/w02 and backpressure/w12_reject.
-- **Known limitation, not fixed yet:** one failed AWS CLI call ends the session. `aws
+- **Limitation found in part 2 (fixed afterwards, $0; see below):** one failed AWS CLI call ended the session. `aws
   ecs describe-tasks` exited 255 twice in part 2 (the same call by hand: exit 0), and
   `_run` has no retry, and the exception carries no stderr to the log. The per-point
   snapshot is written only after the pair finishes, so a crash mid-point loses it
   (w12_reject has no `services.json`). The fix to make before another billable session:
   a bounded retry for read-only polls, stderr in the error, and the snapshot written as
   soon as it's taken.
+- **The fix (after part 2):**
+  - Read-only calls (an allowlist: `sts get-caller-identity`, ECS `describe-*` and
+    `list-*`, `logs get-log-events` / `filter-log-events`) get 3 attempts with doubling
+    backoff (2 s, 4 s). Anything else, including `start-task` and `update-service`,
+    fails on its first error: a retried `start-task` could start a second loadgen. An
+    allowlist, so a call added later isn't retried until someone decides it's safe.
+  - `_run` raises `CommandError`, a `CalledProcessError` whose message includes stderr.
+  - The snapshot is written right after it's taken, before the pair runs. A crash
+    mid-point now leaves `<label>.services.json` with no report, which is what
+    `recover` looks for.
+  - 6 new tests; mutants caught: no retry (2 tests fail), retry every call (2), stderr
+    dropped (2), snapshot written after the pair as before (1: the new test).

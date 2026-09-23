@@ -54,6 +54,7 @@ uv run python -m bench.loadgen --help   # the load generator alone: needs only F
 uv run python -m bench.loadgen --hosts 2 --run-id R ...   # coordinator of a 2-host run (ADR-047); on the other host:
 uv run python -m bench.loadgen --producer-only --run-id R   # takes the coordinator's spec, offers its share
 uv run python -m bench.plot             # charts + summary.md from the saved reports
+uv run python -m bench.plot --aws       # AWS scaling.png + summary.md from results/aws/
 TF_VAR_alert_email=... make aws-base   # budget alarm + ECR repo (idle $0; applied once)
 make aws-image                    # build linux/amd64, push to ECR as the git short SHA
 make aws-plan [TF_VARS="-var worker_hosts=6 -var workers=12 -var loadgen_hosts=1"]  # plan + itemized estimate, $0

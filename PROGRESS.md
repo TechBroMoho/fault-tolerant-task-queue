@@ -5,15 +5,13 @@
 - **Current phase:** Phase 8, session part 2 done (2026-09-23). **9 of 10 points saved;
   backpressure/w12_block has no result.** Phase 8 acceptance is NOT met yet:
   - w12_block is missing (the driver crashed in its FLUSHALL poll; see the log below);
-  - the AWS charts aren't drawn: `bench/plot.py` only reads local reports (it needs the
-    Docker VM `cpu` block), so it needs an AWS mode.
+  - (done since: the driver retries read-only polls, and the AWS scaling chart is drawn.)
   - Torn down and verified CLEAN at 20:32:39 UTC. Only the budget and the empty ECR repo
     remain ($0 idle).
 - **Headline (12 workers, 3 × 300 s):** median **19,240 jobs/s** (19,106 to 19,367),
   exactly-once True in all three. Redis's main thread is 96% busy: it's the ceiling,
   from 8 workers up (w08 19,194/s, w12 19,426/s).
-- **Next:** decide with Mohammed whether w12_block is worth one more short session
-  (~$0.20), make the driver survive a transient AWS CLI error, and add AWS charts.
+- **Next:** a short session for backpressure/w12_block only, if Mohammed approves.
 - **TODO:** re-check the spend after ~24 h. The budget's ActualSpend was still $0.00 at
   20:32 UTC (last refreshed 14:22 UTC, before any of today's sessions).
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
@@ -21,6 +19,23 @@
   $0.26, part 2 $1.13.
 
 ## Phase log
+
+### Phase 8 follow-up: driver retry and the AWS chart (2026-09-23, $0)
+
+- **Driver (ADR-048):** bounded retry for read-only AWS polls only (3 attempts, 2 s then
+  4 s); state-changing calls are never retried; stderr in every failed command's
+  message; each point's services snapshot written as soon as it's taken. 6 new tests,
+  4 mutants caught (and the "snapshot after the pair" mutant only by the new test).
+- **`python -m bench.plot --aws`:** `results/aws/scaling.png` (jobs/s vs workers above,
+  Redis main-thread CPU below, shared x axis; the 3 headline runs beside w12) and
+  `results/aws/summary.md`. 1 unit test for which rows it takes (a snapshot with no
+  report is not a row; recovered points are flagged).
+
+```
+$ make check > log 2>&1; echo "make check exit=$?"
+make check exit=0
+===================== 198 passed, 43 deselected in 18.65s ======================
+```
 
 ### Phase 8 session, part 2 (2026-09-23)
 

@@ -234,8 +234,37 @@ class Backend(Protocol):
 Runner = Callable[[list[str]], str]
 
 
+class CommandError(subprocess.CalledProcessError):
+    """A failed command whose message carries its stderr. Phase 8 lost the reason for
+    two `aws ecs describe-tasks` exit-255s because CalledProcessError's message doesn't
+    include it. Still a CalledProcessError, so existing handlers keep working."""
+
+    def __str__(self) -> str:
+        err = (self.stderr or "").strip()[-2000:]
+        return f"{super().__str__()} stderr: {err or '(empty)'}"
+
+
 def _run(cmd: list[str]) -> str:
-    return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise CommandError(p.returncode, cmd, p.stdout, p.stderr)
+    return p.stdout
+
+
+# AWS CLI calls that only read. Only these are retried: a retried write could act twice
+# (a second start-task is a second loadgen). An allowlist, so a call added later is
+# not retried until someone decides it's safe.
+READ_ONLY_CALLS = frozenset({
+    ("sts", "get-caller-identity"),
+    ("ecs", "describe-services"),
+    ("ecs", "describe-tasks"),
+    ("ecs", "describe-container-instances"),
+    ("ecs", "list-tasks"),
+    ("ecs", "list-container-instances"),
+    ("logs", "get-log-events"),
+    ("logs", "filter-log-events"),
+})  # fmt: skip
+READ_ATTEMPTS = 3
 
 
 def _wait(what: str, done: Callable[[], bool], within: float, every: float) -> None:
@@ -252,15 +281,34 @@ class AwsBackend:
 
     name = "aws"
 
-    def __init__(self, outputs: dict[str, Any], runner: Runner = _run, poll_s: float = 5) -> None:
+    def __init__(
+        self, outputs: dict[str, Any], runner: Runner = _run, poll_s: float = 5,
+        retry_s: float = 2,
+    ) -> None:  # fmt: skip
         self._run = runner
         self._poll = poll_s
+        self._retry_s = retry_s
         self.cluster: str = outputs["cluster"]
         self.task_def: str = outputs["loadgen_task_definition"]
         self.account = json.loads(self._aws("sts", "get-caller-identity"))["Account"]
 
     def _aws(self, *args: str) -> str:
-        return self._run(["aws", *args, "--output", "json"])
+        """One AWS CLI call. A read-only call is retried up to READ_ATTEMPTS times with
+        doubling backoff (Phase 8: one transient exit 255 ended the whole session); any
+        other call fails on its first error."""
+        cmd = ["aws", *args, "--output", "json"]
+        attempts = READ_ATTEMPTS if tuple(args[:2]) in READ_ONLY_CALLS else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._run(cmd)
+            except subprocess.CalledProcessError as e:
+                if attempt == attempts:
+                    raise
+                why = scrub(str(e), getattr(self, "account", ""))  # unset in the first call
+                log.warning("%s %s failed (attempt %d/%d), retrying: %s",
+                            args[0], args[1], attempt, attempts, why)  # fmt: skip
+                time.sleep(self._retry_s * 2 ** (attempt - 1))
+        raise AssertionError("unreachable")
 
     def _ecs(self, *args: str) -> Any:
         return json.loads(self._aws("ecs", *args, "--cluster", self.cluster))
@@ -537,6 +585,13 @@ def run_session(
         backend.flush()
         backend.set_workers(p.workers)
         snapshot = backend.snapshot()
+        # Written now, not after the pair: a crash mid-point must not lose the evidence
+        # of what was running (Phase 8 lost w12_reject's this way). It also marks the
+        # point as "ran, no report yet" for `recover`.
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.with_name(f"{p.label}.services.json").write_text(
+            backend.scrub(json.dumps(snapshot, indent=1)) + "\n"
+        )
         env = ENVIRONMENT if backend.name == "aws" else "local Docker (driver test)"
         meta = {
             "suite": p.suite, "label": p.label, "workers": p.workers,
@@ -549,11 +604,7 @@ def run_session(
             producer_command(run_id),
             within=p.warmup + p.measure + p.cooldown + 1200,
         )
-        out.parent.mkdir(parents=True, exist_ok=True)
         base = out.with_suffix("")
-        base.with_name(f"{p.label}.services.json").write_text(
-            backend.scrub(json.dumps(snapshot, indent=1)) + "\n"
-        )
         base.with_name(f"{p.label}.coordinator.txt").write_text(
             backend.scrub("\n".join(x for x in pair.coordinator_log if not x.startswith("R:")))
         )

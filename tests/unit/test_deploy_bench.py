@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import shlex
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -382,3 +383,77 @@ def test_recover_reads_back_the_same_runs_report_and_marks_it(tmp_path: Path) ->
     assert saved["meta"]["run_id"] == "rid"  # the scaling run's, not headline's w02
     assert "loadgen/loadgen/bbb" in saved["meta"]["recovered"]
     assert "run rid" in (tmp_path / "scaling" / "w02.producer.txt").read_text()
+
+
+# ---------------------------------------------------------------- transient CLI errors
+
+
+def _failing(fake: FakeAws, op: str, times: int, stderr: str = "") -> Any:
+    """`fake`, except the first `times` calls of `op` exit 255 with `stderr`."""
+    left = {"n": times}
+
+    def run(cmd: list[str]) -> str:
+        if op in cmd and left["n"] > 0:
+            left["n"] -= 1
+            fake.calls.append(cmd)
+            raise bench.CommandError(255, cmd, "", stderr)
+        return fake(cmd)
+
+    return run
+
+
+def _backend(runner: Any) -> AwsBackend:
+    return AwsBackend({"cluster": "ftq", "loadgen_task_definition": "td"}, runner, 0, retry_s=0)
+
+
+def test_a_read_only_poll_survives_transient_cli_errors() -> None:
+    """Phase 8 part 2: one describe-tasks exit 255 ended the session, twice."""
+    fake = FakeAws()
+    backend = _backend(_failing(fake, "describe-tasks", times=2))
+    pair = backend.run_pair(["coord"], ["prod"], within=5)
+    assert pair.coordinator_exit == 0
+    assert sum("describe-tasks" in c for c in fake.calls) > 2  # the 2 failures were retried
+
+
+def test_a_read_only_poll_gives_up_after_three_attempts_with_stderr() -> None:
+    fake = FakeAws()
+    backend = _backend(_failing(fake, "describe-services", times=99, stderr="Throttling"))
+    with pytest.raises(bench.CommandError, match="Throttling"):
+        backend.set_workers(3)
+    assert sum("describe-services" in c for c in fake.calls) == bench.READ_ATTEMPTS == 3
+
+
+@pytest.mark.parametrize("op", ["start-task", "update-service"])
+def test_a_call_that_changes_state_is_never_retried(op: str) -> None:
+    """A retried start-task could start a second loadgen; a retried update-service is
+    only harmless by luck. Neither is on the read-only allowlist."""
+    fake = FakeAws()
+    backend = _backend(_failing(fake, op, times=1))
+    with pytest.raises(bench.CommandError):
+        if op == "start-task":
+            backend.run_pair(["coord"], ["prod"], within=5)
+        else:
+            backend.set_workers(3)
+    assert sum(op in c for c in fake.calls) == 1
+
+
+def test_a_failed_command_carries_its_stderr() -> None:
+    with pytest.raises(bench.CommandError, match=r"exit status 255.*stderr: boom") as e:
+        bench._run(["sh", "-c", "echo boom >&2; exit 255"])
+    assert isinstance(e.value, subprocess.CalledProcessError)  # old handlers still work
+
+
+def test_the_snapshot_is_saved_before_the_pair_runs(tmp_path: Path) -> None:
+    """Phase 8 part 2: a crash during w12_reject's pair lost its snapshot."""
+
+    class Crashing(FakeBackend):
+        def run_pair(self, coordinator: list[str], producer: list[str], within: float) -> Any:
+            raise RuntimeError("driver crashed mid-point")
+
+    points = session_points(SessionSpec(worker_counts=(4,), suites=("scaling",)))
+    with pytest.raises(RuntimeError, match="mid-point"):
+        run_session(Crashing(_report()), points, tmp_path, deadline_s=1e9)
+    snap = json.loads((tmp_path / "scaling" / "w04.services.json").read_text())
+    assert len(snap["worker_tasks"]) == 4
+    assert snap["account"] == "<acct>"  # scrubbed like every other saved file
+    assert not (tmp_path / "scaling" / "w04.json").exists()  # still resumable
