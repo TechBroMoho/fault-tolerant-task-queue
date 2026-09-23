@@ -84,8 +84,10 @@ passed.
     - Redis CPU 19.3 % and 18.5 % against 24.8–26.2 %;
     - Toxiproxy 19.1 % and 19.5 % against 27.1–29.6 %.
   - GitHub-hosted runners aren't uniform hardware (these ran in six different Azure
-    regions). The workflow didn't log the CPU model, so the chip can't be named. It
-    does now.
+    regions). The workflow didn't log the CPU model, so the chip behind #7/#8 can't be
+    named. It does now, and the first run with it shows the spread within a single
+    workflow run: [run 35861752180](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35861752180)
+    (639e3fa, all green) ran `check` on an AMD EPYC 7763 and `chaos` on an AMD EPYC 9V45.
 - **chaos-scale #4 ([run 35838915586](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35838915586), 4 min 31 s) was not a 1M run.**
   It was the Phase 5 check of the oversubscribed setup: `workflow_dispatch` with
   N = 100,000 and 8 workers on the 4-vCPU runner. It passed (0 timeouts of runs that
