@@ -69,9 +69,10 @@ class Point:
     workers: int
     concurrency: int
     loadgen_args: tuple[str, ...]
+    redis_io_threads: int = 1
 
 
-def compose_spec(concurrency: int) -> dict[str, Any]:
+def compose_spec(concurrency: int, io_threads: int = 1) -> dict[str, Any]:
     worker_env = {
         "FTQ_REDIS_URL": "redis://redis:6379/0",
         "FTQ_QUEUE": "bench",
@@ -98,6 +99,10 @@ def compose_spec(concurrency: int) -> dict[str, Any]:
                     "4gb",
                     "--maxmemory-policy",
                     "noeviction",
+                    # 1 = Redis's default: one thread does all command execution and
+                    # socket I/O. More threads offload only the socket reads/writes.
+                    "--io-threads",
+                    str(io_threads),
                 ],
                 "ports": [f"127.0.0.1:{REDIS_PORT}:6379"],
                 "healthcheck": {
@@ -133,10 +138,10 @@ class Stack:
     async def compose(self, *args: str, within: float = 300) -> str:
         return (await sh(*self._compose, *args, within=within)).out
 
-    async def fresh(self, workers: int, concurrency: int) -> None:
+    async def fresh(self, workers: int, concurrency: int, io_threads: int) -> None:
         """A fresh Redis (no data, no AOF) and `workers` new worker containers."""
         RUNS.mkdir(parents=True, exist_ok=True)
-        self.file.write_text(json.dumps(compose_spec(concurrency), indent=2) + "\n")
+        self.file.write_text(json.dumps(compose_spec(concurrency, io_threads), indent=2) + "\n")
         await self.down()
         await self.compose("up", "-d", "--wait", "redis")
         await self.compose("up", "-d", "--no-deps", "--scale", f"worker={workers}", "worker")
@@ -263,7 +268,7 @@ def _git_rev() -> str:
 
 async def run_point(stack: Stack, p: Point) -> dict[str, Any]:
     log.info("[%s] %s: %d workers, concurrency %d", p.suite, p.label, p.workers, p.concurrency)
-    await stack.fresh(p.workers, p.concurrency)
+    await stack.fresh(p.workers, p.concurrency, p.redis_io_threads)
     sampler = CpuSampler(stack)
     sampling = asyncio.create_task(sampler.run())
     meta = {
@@ -272,6 +277,7 @@ async def run_point(stack: Stack, p: Point) -> dict[str, Any]:
         "environment": ENVIRONMENT,
         "workers": p.workers,
         "worker_concurrency": p.concurrency,
+        "redis_io_threads": p.redis_io_threads,
         "date_utc": datetime.now(UTC).isoformat(timespec="seconds"),
         "git": _git_rev(),
     }
@@ -332,7 +338,8 @@ def _per_worker(
 def _reproduce(p: Point) -> str:
     return (
         f"uv run python -m bench.run point --suite {p.suite} --label {p.label} "
-        f"--workers {p.workers} --concurrency {p.concurrency} -- {' '.join(p.loadgen_args)}"
+        f"--workers {p.workers} --concurrency {p.concurrency} --io-threads {p.redis_io_threads}"
+        f" -- {' '.join(p.loadgen_args)}"
     )
 
 
@@ -377,14 +384,23 @@ def capacity(suite: str, workers: int) -> float:
 
 def points(a: argparse.Namespace) -> list[Point]:
     if a.suite == "concurrency":
+        # Repeat 1 is labelled c010 (the first sweep predates repeats), then c010_r2...
         return [
-            Point("concurrency", f"c{c:03d}", 1, c, tuple(_saturate(a)))
+            Point("concurrency", f"c{c:03d}" + (f"_r{r}" if r > 1 else ""), 1, c,
+                  tuple(_saturate(a)))
+            for r in range(a.repeat_from, a.repeats + 1)
             for c in a.concurrency_values
-        ]
+        ]  # fmt: skip
+    if a.suite == "iothreads":
+        return [
+            Point("iothreads", f"w{a.workers:02d}_io{a.io_threads}_r{r}", a.workers,
+                  a.concurrency, tuple(_saturate(a)), a.io_threads)
+            for r in range(a.repeat_from, a.repeats + 1)
+        ]  # fmt: skip
     if a.suite == "scaling":
         return [
             Point("scaling", f"w{w:02d}_r{r}", w, a.concurrency, tuple(_saturate(a)))
-            for r in range(1, a.repeats + 1)
+            for r in range(a.repeat_from, a.repeats + 1)
             for w in a.worker_counts
         ]
     cap = capacity("scaling", a.workers)
@@ -417,7 +433,10 @@ def points(a: argparse.Namespace) -> list[Point]:
 
 def _args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument("suite", choices=["concurrency", "scaling", "latency", "backpressure", "point"])
+    p.add_argument(
+        "suite",
+        choices=["concurrency", "scaling", "latency", "backpressure", "iothreads", "point"],
+    )
     p.add_argument("--skip-build", action="store_true", help="reuse ftq-worker:local as is")
     p.add_argument("--concurrency", type=int, default=50, help="FTQ_CONCURRENCY per worker")
     p.add_argument("--warmup", type=int, default=10)
@@ -429,6 +448,8 @@ def _args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--concurrency-values", type=int, nargs="+", default=[10, 25, 50, 100])
     p.add_argument("--worker-counts", type=int, nargs="+", default=[1, 2, 4, 8, 12])
     p.add_argument("--repeats", type=int, default=3)
+    p.add_argument("--repeat-from", type=int, default=1, help="add repeats to a saved suite")
+    p.add_argument("--io-threads", type=int, default=1, help="Redis io-threads (iothreads, point)")
     p.add_argument("--workers", type=int, default=8, help="latency/backpressure fleet")
     p.add_argument("--load-fractions", type=float, nargs="+", default=[0.1, 0.25, 0.5, 0.75, 0.9])
     p.add_argument("--overload", type=float, default=1.5, help="backpressure: x capacity")
@@ -446,7 +467,10 @@ def _args(argv: list[str] | None) -> argparse.Namespace:
 
 async def main_async(a: argparse.Namespace) -> int:
     if a.suite == "point":
-        todo = [Point(a.point_suite, a.label, a.workers, a.concurrency, tuple(a.loadgen_args))]
+        todo = [
+            Point(a.point_suite, a.label, a.workers, a.concurrency, tuple(a.loadgen_args),
+                  a.io_threads)
+        ]  # fmt: skip
     else:
         todo = points(a)
     if not a.skip_build:

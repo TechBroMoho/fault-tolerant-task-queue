@@ -8,7 +8,7 @@ import pytest
 
 from bench import analysis
 from bench.analysis import Window
-from bench.loadgen import LoadSpec, make_payload
+from bench.loadgen import LoadSpec, command_costs, make_payload
 
 
 def test_percentile_is_nearest_rank_and_never_interpolates() -> None:
@@ -101,3 +101,17 @@ def test_payload_is_padded_to_the_requested_json_size() -> None:
     assert p["latency_ms"] == 5
     # Fields are never truncated to fit: a small target just gets no padding.
     assert make_payload(LoadSpec(redis_url="", payload_bytes=1))["pad"] == ""
+
+
+def test_command_costs_are_deltas_per_job_sorted_by_time() -> None:
+    before = {"cmdstat_xadd": {"calls": 10, "usec": 100}, "cmdstat_ping": {"calls": 5, "usec": 5}}
+    after = {
+        "cmdstat_xadd": {"calls": 30, "usec": 300, "usec_per_call": 10.0},
+        "cmdstat_ping": {"calls": 5, "usec": 5},  # unchanged: not in the result
+        "cmdstat_evalsha": {"calls": 20, "usec": 800},  # new since `before`
+    }
+    costs = command_costs(before, after, jobs=10)
+    assert list(costs) == ["evalsha", "xadd"]
+    assert costs["xadd"] == {"calls": 20, "usec": 200, "calls_per_job": 2.0, "usec_per_job": 20.0}
+    assert costs["evalsha"]["usec_per_job"] == 80.0
+    assert command_costs(before, after, jobs=0)["xadd"]["usec_per_job"] == 0.0

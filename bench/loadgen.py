@@ -288,6 +288,30 @@ async def _environment(redis: aioredis.Redis) -> dict[str, Any]:
     }
 
 
+def command_costs(
+    before: dict[str, Any], after: dict[str, Any], jobs: int
+) -> dict[str, dict[str, float]]:
+    """What Redis spent per command over the run (`INFO commandstats` deltas), and per
+    completed job. `usec` is time inside the command on the main thread. A script's
+    `evalsha` time INCLUDES the commands it ran, which are also listed on their own
+    (XADD inside commit.lua counts as xadd too), so the rows overlap: compare evalsha
+    with the plain commands the clients sent (xreadgroup, xlen, ...), not the sum."""
+    out: dict[str, dict[str, float]] = {}
+    for name, stats in after.items():
+        prev = before.get(name, {"calls": 0, "usec": 0})
+        calls = int(stats["calls"]) - int(prev["calls"])
+        usec = int(stats["usec"]) - int(prev["usec"])
+        if calls <= 0:
+            continue
+        out[name.removeprefix("cmdstat_")] = {
+            "calls": calls,
+            "usec": usec,
+            "calls_per_job": round(calls / jobs, 3) if jobs else 0.0,
+            "usec_per_job": round(usec / jobs, 2) if jobs else 0.0,
+        }
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]["usec"]))
+
+
 async def _read_results(
     redis: aioredis.Redis, keys: Keys, after_id: str, window: Window
 ) -> tuple[list[tuple[int, int]], Counter[str], Counter[str]]:
@@ -324,6 +348,7 @@ async def run(spec: LoadSpec, meta: dict[str, Any]) -> dict[str, Any]:
         last: Any = await redis.xrevrange(keys.results, count=1)
         results_after = last[0][0] if last else "0-0"
         counters0: Any = await redis.hgetall(keys.stats)
+        commands0: Any = await redis.info("commandstats")
 
         samples: list[dict[str, Any]] = []
         stop = asyncio.Event()
@@ -358,6 +383,7 @@ async def run(spec: LoadSpec, meta: dict[str, Any]) -> dict[str, Any]:
         window = Window.of_run(t0_ms, spec.warmup, spec.measure)
         times, per_job, by_worker = await _read_results(redis, keys, results_after, window)
         counters1: Any = await redis.hgetall(keys.stats)
+        commands1: Any = await redis.info("commandstats")
         dlq = await redis.xlen(keys.dead)
     finally:
         await redis.aclose()
@@ -366,6 +392,7 @@ async def run(spec: LoadSpec, meta: dict[str, Any]) -> dict[str, Any]:
         spec, meta, env, consumers, window, t0_ms, samples, produced, times, per_job,
         by_worker, {k: int(counters1.get(k, 0)) - int(counters0.get(k, 0)) for k in COUNTERS},
         dlq, drained, drain_s,
+        command_costs(commands0, commands1, len(per_job)),
     )  # fmt: skip
 
 
@@ -385,6 +412,7 @@ def _report(
     dlq: int,
     drained: bool,
     drain_s: float,
+    commands: dict[str, dict[str, float]],
 ) -> dict[str, Any]:
     in_window = range(spec.warmup, spec.warmup + spec.measure)
     per_second: dict[int, list[int]] = {}
@@ -460,6 +488,7 @@ def _report(
         },
         "drain": {"drained": drained, "s": round(drain_s, 2)},
         "counters": counters,
+        "redis_commands": commands,
         # Jobs each worker (by worker_id: host-pid-suffix) finished inside the window.
         "completed_in_window_by_worker": dict(sorted(by_worker.items())),
         "histograms": {
