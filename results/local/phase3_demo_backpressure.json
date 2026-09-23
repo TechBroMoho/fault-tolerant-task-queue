@@ -1,0 +1,54 @@
+{
+  "jobs": 20000,
+  "job_type": "send_email",
+  "payload": {
+    "latency_ms": 5
+  },
+  "batch": 500,
+  "enqueue_seconds": 3.882,
+  "enqueue_per_second": 5152.3,
+  "drain_seconds": 4.264,
+  "throughput_per_second": 4690.7,
+  "completed": 20000,
+  "missing": 0,
+  "duplicate_results": 0,
+  "producer": {
+    "accepted": 20000,
+    "duplicates": 0,
+    "rejected": 0,
+    "blocked": 5032,
+    "blocked_seconds": 3.5121637930860743
+  },
+  "stats": {
+    "queue": "default",
+    "depth": 0,
+    "in_flight": 0,
+    "undelivered": 0,
+    "delayed": 0,
+    "dlq": 0,
+    "consumers": 4,
+    "full": false,
+    "watermarks": {
+      "high": 2000,
+      "low": 1500
+    },
+    "counters": {
+      "processed": 70000,
+      "duplicates_suppressed": 0,
+      "effects_applied": 70000,
+      "effects_suppressed": 0,
+      "retried": 0,
+      "scheduled": 0,
+      "dead": 0,
+      "late_successes": 0,
+      "requeued": 0,
+      "reclaimed": 0,
+      "heartbeats": 0,
+      "lease_lost": 0,
+      "consumers_pruned": 0,
+      "timeouts": 0,
+      "rejected": 0,
+      "blocked": 5032
+    }
+  }
+}

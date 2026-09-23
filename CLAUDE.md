@@ -33,13 +33,18 @@ A from-scratch, Celery-style distributed task queue on Redis Streams: at-least-o
 ```
 make setup        # uv sync --locked (no pre-commit hooks yet)
 make fmt          # ruff format + safe autofixes
-make check        # fmt-check + lint + typecheck + tests
-make test         # pytest (needs Redis: `make up`; fails, never skips, without it)
-make up / down    # docker compose up --wait / down -v (redis only so far; toxiproxy, workers later)
+make check        # fmt-check + lint + typecheck + FAST tests (`-m "not slow"`, ~16 s)
+make check-all    # fmt-check + lint + typecheck + EVERY test (~55 s); what CI must run
+make test         # fast pytest set (needs Redis: `make up`; fails, never skips, without it)
+make test-all     # every test, including `slow` (subprocess / process-pool / >1 s tests)
+make up [WORKERS=N] / down   # redis (+ N worker containers from docker/Dockerfile) / down -v
 uv run ftq worker                 # run one worker (FTQ_* env config; SIGTERM drains)
-uv run ftq enqueue TYPE --payload JSON [--idempotency-key K]
+uv run ftq enqueue TYPE --payload JSON [--idempotency-key K]   # exit 2 on QueueFull
+uv run ftq stats                  # JSON: depth, in_flight, delayed, dlq, consumers, full, counters
+uv run ftq bench --jobs N [--type T --payload JSON --batch B]  # enqueue, wait, exactly-once check
 uv run ftq dlq list [--limit N]   # DLQ entries as JSON lines
 uv run ftq dlq requeue JOB_ID... | --all   # back on the stream, attempt 0, same job_id
+uv run python bench/pipelining.py # enqueue batching + worker drain measurement -> results/local/
 make chaos N=...  # chaos run + verifier → results/local/chaos_report.json   [stub until Phase 4]
 make bench ...    # local load test + charts                               [stub until Phase 6]
 make aws-plan / aws-up / aws-bench / aws-down / aws-verify-clean   # BILLABLE except plan/verify [stubs until Phase 7]

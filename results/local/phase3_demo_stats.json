@@ -1,0 +1,32 @@
+{
+  "queue": "default",
+  "depth": 0,
+  "in_flight": 0,
+  "undelivered": 0,
+  "delayed": 0,
+  "dlq": 0,
+  "consumers": 4,
+  "full": false,
+  "watermarks": {
+    "high": 100000,
+    "low": 80000
+  },
+  "counters": {
+    "processed": 50000,
+    "duplicates_suppressed": 0,
+    "effects_applied": 50000,
+    "effects_suppressed": 0,
+    "retried": 0,
+    "scheduled": 0,
+    "dead": 0,
+    "late_successes": 0,
+    "requeued": 0,
+    "reclaimed": 0,
+    "heartbeats": 0,
+    "lease_lost": 0,
+    "consumers_pruned": 0,
+    "timeouts": 0,
+    "rejected": 0,
+    "blocked": 0
+  }
+}

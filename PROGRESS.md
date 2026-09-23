@@ -2,16 +2,163 @@
 
 ## Status
 
-- **Current phase:** Phase 2 (reliability: leases + reaper, heartbeats, retries with backoff,
-  delayed scheduler, DLQ + CLI, blocking handlers in pools, safe consumer pruning): **complete
-  and reviewed** (post-gate skeptical review, see "Phase 2 review" below).
-- **Next:** Phase 3 (multiple worker processes, batching/pipelining measured before and after,
-  backpressure with hysteresis, `ftq stats`, JSON logs, **plus a per-job handler timeout**,
-  per Mohammed). Starts on Mohammed's go-ahead.
+- **Current phase:** Phase 3 (multiple worker processes, backpressure with hysteresis,
+  pipelined `enqueue_many`, `ftq stats`, JSON logs, **per-job timeouts**, the worker Docker
+  image): **complete**, awaiting Mohammed's review.
+- **Next:** Phase 4 (chaos harness: per-worker Toxiproxy, kills/pauses/network faults,
+  verifier I1–I5, mutation tests, N=100,000 locally). Starts on Mohammed's go-ahead.
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
 - **AWS:** nothing created. Spend to date: $0.
 
 ## Phase log
+
+### Phase 3: Concurrency, backpressure, observability, per-job timeouts (2026-09-22)
+
+**Built**
+- **Per-job timeout (Mohammed's requirement, ADR-030).** `FTQ_JOB_TIMEOUT` (default 300 s),
+  overridable with `register(..., timeout=)` / `register_sync(..., timeout=)`. The worker
+  waits on each run's future for at most the timeout, then fails the attempt with
+  `HandlerTimeout` (retry, or DLQ at `max_attempts`; the `timeouts` counter is incremented
+  inside retry.lua/dead.lua). Then it stops the run where it can:
+  - async handlers are cancelled;
+  - a process-pool job's pool is reset (every child SIGKILLed), and the bystander jobs
+    are resubmitted at the same attempt;
+  - a thread-pool job's thread becomes an orphan. Heartbeats stop, it keeps its slot until
+    it returns, its late result is discarded (never sent to commit), and `ftq worker`
+    hard-exits after the drain if orphaned threads are still alive.
+  - A handler that swallows its cancellation is orphaned the same way.
+  - Process-pool runs take one of `process_pool_size` permits first, so queueing for a
+    child never counts toward the timeout.
+  - ADR-010's lifetime bound now includes the timeout, and the worker refuses to start if
+    a per-type timeout isn't covered by the TTL.
+- **Backpressure (ADR-031).** The admission check is inside `enqueue.lua` (depth = `XLEN` +
+  `ZCARD delayed`, atomic with the `XADD`), with a per-queue hysteresis flag.
+  - `reject` raises `QueueFull`; `block` polls with jitter until the depth falls below
+    `low_watermark` or `block_timeout` runs out.
+  - An idempotent repeat is answered even when full.
+  - This deviates from SPEC's cached client-side check, and the ADR explains why: exact,
+    no extra round trip, and N producers can't overshoot.
+  - New counters: `rejected`, `blocked`, `timeouts`.
+- **`enqueue_many`**, one pipelined round trip. Measured before and after (ADR-032, below).
+  Commit batching was measured and not built yet: the worker is CPU-bound.
+- **`ftq stats`** (JSON: depth, in_flight, undelivered, delayed, dlq, consumers, full,
+  watermarks, counters). **`ftq bench --jobs N`** enqueues N jobs in block mode, waits for
+  every first commit, and checks exactly-once against the results log. `ftq enqueue`
+  exits 2 on `QueueFull`.
+- **JSON logs (ADR-033):** `logs.py` (formatter, a `ContextLogger` that merges `worker_id`
+  with per-job `job_id`/`attempt`/`job_type`), `FTQ_LOG_FORMAT=json|text`. INFO =
+  lifecycle only.
+- **Multiple worker processes:** `docker/Dockerfile` (multi-stage uv build, `python:3.12.13-slim-bookworm`,
+  non-root uid 10001, 255 MB), a Compose `worker` service behind a profile,
+  `make up WORKERS=N`.
+- **Test split (ADR-034):** `make test` / `make check` = fast set; `make test-all` /
+  `make check-all` = everything (CI must run `check-all`). 5 existing tests that take over
+  1 s were marked `slow` (plus 1 new one); none was changed otherwise.
+- 26 new tests (139 total): 11 timeout, 7 backpressure, 1 multi-process, 7 unit. Two
+  existing tests changed:
+  - The ADR-010 bound test now asserts the new formula, and also that a longer timeout
+    invalidates a TTL that was enough.
+  - The keys test covers `:full`.
+
+**Acceptance evidence** (Redis 8.8.3 via `make up`):
+
+```
+$ make check > check.log 2>&1; echo "make check exit=$?"
+make check exit=0
+  56 files already formatted / All checks passed! / Success: no issues found in 49 source files
+  ===================== 119 passed, 20 deselected in 15.90s ======================
+
+$ make check-all > checkall.log 2>&1; echo "make check-all exit=$?"
+make check-all exit=0
+  ============================= 139 passed in 51.68s =============================
+
+$ for i in 1 2 3 4 5; do uv run pytest -q ...; done       # flakiness, full suite
+exit 0 x5: 56.66 / 59.49 / 62.87 / 58.46 / 56.68 s          # why the split was needed
+
+$ docker compose stop redis && uv run pytest -q -m "not slow"; echo $?   # ADR-012
+58 passed, 20 deselected, 61 errors in 4.43s                 # pytest exit (redis down)=1
+```
+
+SPEC demo, `make up WORKERS=4` + `ftq bench --jobs 50000` (4 worker containers, concurrency
+10 each, `send_email` with no latency; raw: `results/local/phase3_demo_bench.json`, rerun
+`phase3_demo_bench_run2.json`, stats after the rerun `phase3_demo_stats.json`):
+
+```
+run 1: enqueue 35 696 jobs/s, drained in 2.68 s = 18 659 jobs/s; completed 50000, missing 0, duplicate_results 0
+run 2: enqueue 38 382 jobs/s, drained in 2.51 s = 19 938 jobs/s; completed 50000, missing 0, duplicate_results 0
+$ uv run ftq stats   (after run 2, fresh stack)
+depth 0, in_flight 0, undelivered 0, delayed 0, dlq 0, consumers 4, full false,
+processed 50000, effects_applied 50000, duplicates_suppressed 0, rejected 0, blocked 0
+worker logs for run 2: 4 lines total, all INFO "started"   (per-job lines are DEBUG)
+```
+
+These are smoke numbers: a 2.5 s run whose drain overlaps the enqueue, one producer, on a
+laptop. They are **not** the Phase 6 steady-state benchmark and shouldn't be quoted as
+throughput.
+
+Backpressure demo, same stack: `FTQ_HIGH_WATERMARK=2000 FTQ_LOW_WATERMARK=1500 ftq bench
+--jobs 20000 --payload '{"latency_ms": 5}'` (block mode; raw:
+`results/local/phase3_demo_backpressure.json`):
+
+```
+completed 20000, missing 0, duplicate_results 0; producer: accepted 20000, rejected 0,
+blocked 5032 (jobs that had to wait), blocked_seconds 3.51; drain 4.26 s = 4 691 jobs/s
+```
+
+Batching measured before and after (`uv run python bench/pipelining.py`; raw:
+`results/local/pipelining.{txt,json}`; 20 000 jobs, 3 runs, median):
+
+```
+enqueue() one at a time    3 957 jobs/s   x1.0
+enqueue_many, batch 10    11 421          x2.9
+enqueue_many, batch 100   20 910          x5.3   (range 15 817-22 211: noisy, see ADR-032)
+enqueue_many, batch 500   47 615          x12.0
+worker drain at concurrency 1 / 10 / 50: 1 114 / 3 859 / 7 641 jobs/s, worker CPU 0.27 / 0.62 / 0.93
+```
+
+Mutation checks: scripted, one bug at a time, each file restored and sha256-verified. The
+relevant test file was run each time:
+
+```
+orphans don't hold a slot                         -> CAUGHT (orphaned_thread_keeps_its_slot)
+no hard exit over stuck threads                   -> CAUGHT (sigterm_exits_promptly..., 10 s timeout)
+process pool not reset on timeout                 -> CAUGHT (test hung; killed after 90 s)
+bystanders fail instead of restarting             -> CAUGHT (pool_reset_restarts_bystanders)
+timeout clock includes waiting for a pool child   -> CAUGHT (waiting_for_a_pool_child...)
+wait for a cancelled async run to stop            -> CAUGHT (swallows_its_cancellation)
+orphaned thread's late result gets committed      -> CAUGHT (duplicates_suppressed 1 != 0;
+                                                     commit.lua suppressed it: still 1 result)
+heartbeat keeps running after a timeout           -> CAUGHT (lease_lost 1 != 0)
+a timeout doesn't count as an attempt             -> CAUGHT (always_hangs_ends_in_the_dlq)
+retry.lua doesn't count timeouts                  -> CAUGHT
+enqueue admits at depth == high                   -> CAUGHT
+no hysteresis (opens below high)                  -> CAUGHT
+delayed set not counted in depth                  -> CAUGHT
+full check before the idempotency lookup          -> MISSED, test strengthened -> CAUGHT
+blocked counted on every poll                     -> CAUGHT
+in-script depth disabled (a stale client check)   -> CAUGHT (concurrent_producers_never_overshoot)
+```
+
+**Decisions worth Mohammed's review**
+- ADR-031 deviates from SPEC §4's recommended design: the admission check is inside the
+  script instead of a cached client-side check.
+- ADR-030: `ftq worker` hard-exits (`os._exit(0)`) when orphaned threads are still alive
+  after the drain. A timed-out thread keeps its slot. A process-pool timeout resets the
+  whole pool, and its bystanders restart from scratch without losing an attempt.
+- ADR-032: no worker-side commit batching yet. The default `concurrency` stays 10 (7.6K jobs/s
+  at 50 vs 3.9K at 10 for one in-process worker) until Phase 6 tunes it.
+- Logs are JSON by default (`FTQ_LOG_FORMAT=text` for terminals).
+
+**Open issues**
+- Batch-100 pipelined sends on this laptop sometimes take ~2× longer than the linear curve;
+  unexplained (ADR-032). Re-check on Linux before quoting batch-size numbers.
+- Hung threads accumulate until they return, and a worker whose slots are all held by
+  orphans stops fetching (visible, by design, ADR-030). A restart clears it.
+- The hysteresis flag only changes on an enqueue (ADR-031). `ftq stats` compensates.
+- Carried: `max_deliveries` / `max_attempts` sizing (Phase 4, ADR-008); results/effects logs
+  are never trimmed (ADR-021); the private `_processes` map (ADR-028, now also used by the
+  pool reset); the network-fault paths still untested until Toxiproxy (Phase 4).
+- CI (Phase 5) must run `make check-all`, not `make check`.
 
 ### Phase 2 review (2026-09-22)
 
@@ -480,3 +627,28 @@ pytest exit (redis up)=0
   (10 s / 30 s) already met the new rule, so no default changed. Lesson: a safety bound
   written as "N beats per lease" has to count the time a beat takes, not just the
   interval.
+- **2026-09-22 (Phase 3): a design flaw caught before it shipped: queued process jobs
+  would have timed out.** The first version of the timeout started each job's clock when
+  it was submitted to the process pool. With `concurrency` 10 > `process_pool_size` 2,
+  jobs wait *inside* the executor for a child. A job could time out while queued, and
+  its pool reset would kill the jobs that were running, which then restarted and queued
+  again: a cascade. Found by asking what the timeout measures when the pool is smaller
+  than the worker. Fixed with a semaphore of `process_pool_size` permits taken before the
+  clock starts. A test (three 1 s jobs, a 1.5 s timeout, one child) proves it, and removing
+  the semaphore makes the test fail. Lesson: a timeout must say which wait it bounds.
+- **2026-09-22 (Phase 3): a test that couldn't fail.** The first
+  `test_an_idempotent_repeat_is_answered_even_when_full` sent its repeat *before* anything
+  had tripped the full flag, so a script that checked the flag before the idempotency key
+  still passed. The mutation run caught it (MISSED). The test now trips the flag first and
+  asserts it's set before the repeat.
+- **2026-09-22 (Phase 3): an unverified claim written into an ADR.** The first draft of
+  ADR-033 said the demo "produced only lifecycle lines". Nobody had looked, and the
+  containers' logs were already gone. The demo was rerun and the log lines counted (4,
+  all INFO "started") before committing, and the ADR now states that number. Same lesson
+  as Phase 2's `__main__` guard: check it, then write it.
+- **2026-09-22 (Phase 3): a mutant that hung the harness.** With the pool reset disabled,
+  the hung child kept the test process alive past pytest's 40 s timeout: the worker's pool
+  shutdown waits for its children. The mutation harness now runs each test run in its own
+  session and SIGKILLs the whole process group after 90 s, counting that as caught. The
+  stray pytest and pool-child processes from the first attempt were found with `pgrep` and
+  killed.

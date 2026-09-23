@@ -265,6 +265,14 @@ times, each after a full lease, then wait up to the backoff cap. A non-zero
 backlog, and a job that heartbeats for a very long time (both extend a job's life without
 redeliveries). DEAD records never expire: they live as long as their DLQ entry (ADR-027).
 
+*Phase 3 note (ADR-030).* The per-job timeout closes the second gap: a heartbeating job can
+no longer run forever. One delivery now ends within `timeout + visibility_timeout` (the run
+times out and is retried, or its worker dies and the lease expires), so the bound became
+`max_attempts × (max_deliveries × (job_timeout + visibility_timeout) + job_backoff_cap)`.
+Defaults: 5 × (10 × 330 s + 300 s) = 18 000 s; ×10 = 50 h, still under the 7-day TTL. A
+handler type registered with a longer timeout is checked against the TTL when the worker
+starts (`Settings.check_ttl_covers`), and the worker refuses to start if it isn't covered.
+
 ---
 
 ## ADR-011: Per-worker Toxiproxy topology is deferred to Phase 4
@@ -704,6 +712,8 @@ asserts both.
   work. It's simple for async handlers (`asyncio.wait_for`), but needs a kill for
   process-pool jobs. No Phase 4 chaos job hangs forever.
   *Phase 2 review (Mohammed): add a per-job timeout in Phase 3; details to follow.*
+  *Phase 3: resolved by ADR-030. A hung run now times out and is retried; a job that
+  always hangs ends in the DLQ.*
 - Not yet tested: that a heartbeat failing with a Redis error is retried at the next
   interval. It needs network fault injection (Toxiproxy, Phase 4).
 
@@ -832,6 +842,9 @@ function `fn(job: Job) -> result`, run via `loop.run_in_executor`.
 - **Thread pool:** one thread per slot (`concurrency`), so a blocking handler never waits
   for a thread. A thread can't be killed, so an abandoned blocking handler keeps the
   process alive until it returns, and `docker stop` escalates to SIGKILL.
+  *(Phase 3, ADR-030: `ftq worker` now exits by itself after the drain even with such
+  threads left, and a timed-out thread keeps its slot, so "never waits for a thread"
+  still holds.)*
 - `cpu_task` is now a process-pool handler.
 
 *Phase 2 review (Mohammed): the spawn start method and the private `_processes` map are
@@ -893,3 +906,251 @@ count intact, and the entry is then reclaimed and completed. The same consumer i
 by a live worker once it owns nothing, and a running worker prunes empty consumers while
 leaving a crashed one's job in the PEL. A unit test requires the PEL check to come before
 the `DELCONSUMER` call. Mutation check: see PROGRESS.md, Phase 2.
+
+---
+
+## ADR-030: Per-job timeouts: stop waiting, fail the attempt, stop the run where possible
+
+*Status: accepted (Phase 3: `Settings.job_timeout`, `register(..., timeout=)`,
+`Worker._run_handler` / `_stop_run`, the `timeouts` counter in retry.lua and dead.lua).*
+
+**Context.** ADR-025's limitation: a handler that hangs on a healthy worker keeps its lease
+forever, because its heartbeats keep it alive. It's never reclaimed and never DEAD: stuck
+in the PEL, with its slot taken. Mohammed's requirement: a per-job timeout (a configurable
+default, overridable per job type); on timeout, cancel async handlers, kill the process for
+process-pool handlers, and for thread-pool handlers stop heartbeating, retry, and make sure
+a late commit from the orphaned thread is suppressed. A timeout counts as a failed attempt,
+so a job that always hangs ends in the DLQ.
+
+**Options for the async case.**
+1. `asyncio.wait_for(handler(), timeout)`. It cancels the handler, then **waits for it to
+   finish cancelling**. A handler that catches `CancelledError` and carries on (bad, but
+   possible in user code) would make the timeout wait forever, or even return a result
+   that then gets committed.
+2. **Run the handler as its own future and only wait on it** (`asyncio.wait({run},
+   timeout)`). Past the deadline the worker stops waiting, whatever the run does. Chosen.
+
+**Decision.** One rule for every kind of handler. The worker waits on the run's future for
+at most the timeout (`timeout=` on the handler type, else `FTQ_JOB_TIMEOUT`, default
+300 s). When that passes, it raises `HandlerTimeout` into the normal failure path:
+heartbeat stopped (cancelled and awaited, as before any transition), then `retry.lua` or,
+at `max_attempts`, `dead.lua` with reason `max_attempts` and the error
+`HandlerTimeout: run exceeded its Ns timeout (<kind> handler)`. Both scripts increment
+`timeouts` in the same atomic step as the transition. Then it stops the run as far as
+its kind allows:
+
+- **async:** `cancel()`. A cooperative handler is gone within a loop iteration. One that
+  swallows the cancellation becomes an orphan (below).
+- **process pool:** kill the child with SIGKILL (a hung handler may ignore SIGTERM). One
+  child of a `ProcessPoolExecutor` can't be killed without breaking the pool: the pool
+  fails every future with `BrokenProcessPool` (verified on 3.12.13: running and queued
+  futures both fail within ~4 ms). So the pool is **reset**: every child is killed and the
+  next job starts a fresh pool. The other jobs running in the reset pool did nothing wrong,
+  so they are **resubmitted at the same attempt** without touching Redis (the worker
+  remembers which pools it reset on purpose). Before the reset was deliberate, a broken
+  pool counted as a failed attempt for every job in it, and it still does for a pool that
+  breaks by itself (a crashing child, ADR-028).
+- **thread pool:** nothing can stop a thread. It becomes an orphan.
+
+**Orphans.** A run the worker stopped waiting for that is still running: a thread, or an
+async handler that ignored its cancellation.
+- **It keeps its slot** until it returns: `free = concurrency − in_flight − orphans`. It
+  still uses a thread (or loop time). Without this, the next thread job could wait inside
+  the executor behind the hung thread, with its own timeout clock running. And a worker
+  whose threads have all hung would keep fetching jobs it can't run. Tested with
+  concurrency 1: the retry waits undelivered in the stream until the orphan returns.
+- **Its result is discarded.** Only the job's own coroutine could commit it, and that
+  coroutine has already sent the job down the retry path. When the orphan finishes, a
+  WARNING is logged ("orphaned thread run finished Ns after the worker stopped waiting;
+  its result was discarded") and nothing else happens. That's what "a late commit is
+  suppressed" means here: it is never sent. It is also covered a second time: if a late
+  commit did reach Redis, commit.lua is first-wins, and the retry's commit would make it
+  a suppressed duplicate. A mutation check that makes the orphan's result commit shows
+  exactly that (`duplicates_suppressed` 0 → 1, still one result), and the test catches it.
+- **Heartbeats stop at the timeout.** Tested: `lease_lost` stays 0. A heartbeat still
+  running after the retry acked the entry would be refused, and would count there.
+- **Shutdown.** The interpreter joins pool threads at exit, so a thread that never returns
+  would keep a stopped worker alive forever and the grace period wouldn't bound shutdown.
+  After the drain, if any timed-out or abandoned handler thread is still running, `ftq
+  worker` logs it and calls `os._exit(0)`. Everything the queue needs is already in Redis:
+  those jobs were retried, or are in the PEL for a reaper. This is what `docker stop`'s
+  SIGKILL would do anyway, just without the 30 s+ wait.
+
+**Process-pool jobs wait for a free child before their clock starts.** With `concurrency`
+(10) > `process_pool_size` (2), process jobs queue *inside* the executor. If that wait
+counted, a queued job could time out without having run, and its pool reset would kill
+the jobs that were running. So a process-pool run first takes one of `process_pool_size`
+permits (an `asyncio.Semaphore`), and the timeout covers only the run. It still includes
+starting a fresh child after a reset (~0.3 s with spawn). Tested: three 1 s jobs with a
+1.5 s timeout share one child, and none times out.
+
+**Consequences.**
+- A job that always hangs costs `max_attempts × timeout` of worker time, then goes to the
+  DLQ (tested: 3 attempts, `timeouts` = 3, `dlq_reason` max_attempts).
+- Timeouts bound delivery length, which fixes ADR-010's lifetime bound (see its Phase 3
+  note). A per-type timeout the TTL can't cover makes the worker refuse to start.
+- Hung threads accumulate until they return. Enough of them reduce a worker's capacity to
+  zero, and it stops fetching. That's visible (WARNING per timeout; `threads_still_running`)
+  and it's the honest state: the threads really are used up. A restart clears them.
+- A pool reset loses the progress of the bystander jobs (they start over). Timeouts should
+  be rare, so this trade is fine; the alternative, one executor per job, costs a process
+  spawn per job.
+- **Semantics:** a timed-out run may have done part of its work, or all of it, just too
+  late. Effects go through the ledger, so a retry never applies them twice.
+- Mutation checks, one at a time, each file restored and sha256-verified afterwards
+  (PROGRESS.md, Phase 3): all 10 timeout mutants are caught.
+
+---
+
+## ADR-031: Backpressure is checked inside enqueue.lua, with a global hysteresis flag
+
+*Status: accepted (Phase 3: `enqueue.lua`, `Client.enqueue` / `enqueue_many`, `QueueFull`).*
+
+**Context.** SPEC §4: `enqueue()` checks queue depth (`XLEN` + the delayed set) against a
+high watermark. It raises `QueueFull` in `reject` mode, and waits until depth < the low
+watermark in `block` mode (hysteresis). SPEC recommends caching the depth check for
+50–100 ms so it doesn't double Redis load.
+
+**Options.**
+1. **Client-side check with a cached depth** (the SPEC recommendation): one extra round
+   trip per cache period per producer. Between refreshes, each producer admits whatever
+   it sends, so P producers at rate R overshoot the watermark by up to about P × R × 100 ms.
+   The hysteresis state would be per producer.
+2. **The check inside enqueue.lua**, atomic with the `XADD`: `XLEN` and `ZCARD` are O(1),
+   the script already runs, so it adds no round trip and has no staleness.
+3. Enforce a stream cap with `XADD … MAXLEN`: it trims old entries, i.e. loses jobs
+   (ADR-016). Never.
+
+**Decision.** (2), a deviation from SPEC's recommendation (hence this ADR). It is strictly
+more precise at no extra cost.
+- `depth = XLEN(stream) + ZCARD(delayed)`. `XLEN` is undelivered + in flight, because every
+  exit `XDEL`s (ADR-016). Delayed retries are counted because they will come back (ADR-026).
+- **Hysteresis state is one key per queue** (`ftq:{q}:full`). It is set when an enqueue sees
+  `depth ≥ high` and deleted when one sees `depth < low`; in between, the answer depends on
+  the flag. Without the gap, a queue hovering at the watermark would flip between accept
+  and reject on every enqueue. The config requires `low < high`.
+- **Hard bound:** an enqueue never adds at `depth ≥ high`, so enqueues alone can't push the
+  depth past `high_watermark`, however many producers there are. Tested: 4 producers × 40
+  concurrent enqueues against `high = 50` admit exactly 50. A mutation that disables the
+  in-script depth (standing in for a stale client-side check) fails that test.
+- **What bypasses admission:** retry scheduling (it moves a job from the stream to the
+  delayed set: depth unchanged), the scheduler (delayed → stream: unchanged), and `dlq
+  requeue` (an operator action, +1 per job). Accepted jobs are never refused later.
+- **An idempotent repeat is answered even when full.** It adds nothing, and the producer
+  learns its job exists. The idempotency lookup comes before admission, and the key is only
+  claimed after admission, so a refused job leaves no key behind.
+- **reject:** raise `QueueFull(depth)` at once; the script counts `rejected`.
+  **block:** re-send every `block_poll_interval` (±50 % jitter, so blocked producers don't
+  poll in lockstep) until admitted or `block_timeout`. The first refusal counts `blocked`
+  once per job; re-polls count nothing (tested: one blocked job = 1, not one per poll). A
+  block that gives up raises `QueueFull` and counts `rejected` too, so `rejected` means
+  "QueueFull was raised" in both modes.
+- **`enqueue_many`** pipelines one script call per job. Each job is admitted on its own, so
+  a batch can straddle the watermark. In reject mode the exception carries `.accepted` (the
+  job_id per position, or None). In block mode only the refused jobs are re-sent, with the
+  same job_ids, so a re-send can't duplicate one.
+
+**Consequences.**
+- The flag changes only on an enqueue. If producers stop while the queue drains, the flag
+  stays set until the next enqueue sees `depth < low`. `ftq stats` reports `full` the way
+  the next enqueue would see it (flag set and depth ≥ low).
+- Watermarks travel with each call, so producers of one queue should share them. Mixed
+  watermarks still keep the bound for each producer's own `high`, but the shared flag's
+  hysteresis blurs.
+- `QueueFull` is the library's 429. An HTTP layer would map it to `429 + Retry-After`
+  (ADR-015).
+
+---
+
+## ADR-032: Batching and pipelining: pipelined enqueue_many yes, commit batching not yet
+
+*Status: accepted (Phase 3). Measured with `bench/pipelining.py`; raw output in
+`results/local/pipelining.{txt,json}`. The worker side is revisited in Phase 6.*
+
+**Context.** SPEC Phase 3: batch and pipeline where it matters, measured before and after.
+The candidates are the producer's one-round-trip-per-job `enqueue()` and the worker's
+per-job commit (fetching is already batched by `XREADGROUP COUNT`).
+
+**Measured** (20 000 `send_email` jobs, 3 runs, median [min–max]; M-series laptop, Redis 8.8.3
+in Docker Desktop, one producer or one worker process):
+
+```
+enqueue() one at a time        3957 jobs/s [3504-4003]    x1.0
+enqueue_many, batch 10        11421        [11288-13049]  x2.9
+enqueue_many, batch 100       20910        [15817-22211]  x5.3
+enqueue_many, batch 500       47615        [46068-47822]  x12.0
+
+worker drain, concurrency 1    1114 jobs/s   worker CPU/wall 0.27
+worker drain, concurrency 10   3859                          0.62
+worker drain, concurrency 50   7641                          0.93
+```
+
+**Decision.**
+- **Producer: yes.** `Client.enqueue_many` sends one pipelined round trip (not a MULTI
+  transaction; each script is atomic by itself) of per-job enqueue scripts. It is 12×
+  faster at batch 500, and `ftq bench` uses it (default batch 500). Per-job admission
+  (ADR-031) is kept, so batching changes no semantics.
+- **Worker commits: not now.** Throughput rises with concurrency (1.1K → 3.9K → 7.6K jobs/s)
+  because concurrent jobs already overlap their commit round trips. At concurrency 50 the
+  worker uses 0.93 of a CPU: it is CPU-bound in Python, not waiting on the network.
+  Coalescing commits into pipelines would cut per-command overhead, but it would add
+  latency (a batching window) and a second commit path next to the most
+  correctness-critical script. That is worth doing only if Phase 6's profile shows
+  per-command overhead dominating. The default `concurrency` stays 10 until then;
+  Phase 6 measures the knob properly.
+
+**Consequences / an open observation.** One pipelined send's cost was linear in this
+committed run (0.27 ms + ~16 µs per job). But in ad-hoc probes on the same laptop, sends of
+50–300 jobs sometimes took ~2× longer (batch 100: 4–6 ms instead of ~2.4 ms), and batch-100
+enqueue rates vary across runs (15.8K–22.2K). Plain `PING` pipelines don't show it, and it
+isn't explained yet. The working hypothesis is Docker Desktop's port-forwarding path on
+macOS, to be re-checked on Linux (Phase 6 / AWS) before any batch-size number is quoted.
+The conclusion above holds in every run.
+
+---
+
+## ADR-033: JSON logs with context fields; INFO means lifecycle only
+
+*Status: accepted (Phase 3: `logs.py`, `FTQ_LOG_FORMAT`, the worker's `ContextLogger`).*
+
+**Context.** SPEC Phase 3: JSON logs carrying job_id, attempt, and worker_id, and a default
+level that doesn't log every job (CI noise; CloudWatch ingestion cost at 10K jobs/s).
+
+**Decision.**
+- Stdlib `logging` with a small `JsonFormatter` (no new dependency): `ts`, `level`,
+  `logger`, `msg`, plus `worker_id`, `job_id`, `job_type`, `attempt`, and `entry_id` when
+  a record has them. Context goes in `extra=`, never in the message, so messages stay
+  constant and greppable. `FTQ_LOG_FORMAT=text` gives the classic line with the context
+  appended, for terminals.
+- The worker logs through a `ContextLogger` that adds `worker_id` to every record and
+  *merges* per-call `extra`. (The 3.12 stdlib `LoggerAdapter` replaces it;
+  `merge_extra` only arrives in 3.13.)
+- Levels: INFO = lifecycle (started, draining, stopped, pool reset/replaced, consumers
+  pruned). A job's normal path (running, committed, retry scheduled) is DEBUG. Anything
+  unusual about a job (a timeout, the DLQ, a lost lease, a late success, an orphan
+  finishing) is WARNING, and is rare by construction. Checked in the Phase 3 demo: 50 000 jobs
+  across 4 worker containers produced 4 log lines in total, one INFO "started" per worker.
+
+**Consequences.** A chaos post-mortem can filter every worker's logs by `job_id`. Phase 8
+still sets WARNING on AWS, per CLAUDE.md.
+
+---
+
+## ADR-034: Fast and slow test sets
+
+*Status: accepted (Phase 3: `make test` / `test-all`, `make check` / `check-all`).*
+
+**Context.** SPEC Phase 2 set a 60 s budget for the test suite. With Phase 3 the full suite
+took 52–63 s (5 runs, 139 tests): subprocess workers, process pools with the spawn start
+method, and lease-length waits.
+
+**Decision** (per Mohammed's instruction). Every test that takes over ~1 s, starts real
+subprocesses, or uses a process pool is marked `slow`. `make test` / `make check` run
+`-m "not slow"`: 119 tests in ~16 s, the dev loop. `make test-all` / `make check-all` run
+everything, and CI (Phase 5) must call `check-all`. No test was weakened, shortened, or
+removed to save time. The stale-worker, ownership, commit, backpressure, and multi-worker
+exactly-once logic stay in the fast set, except the subprocess-based multi-worker test.
+
+**Consequences.** A green `make check` alone is not the phase gate; the gate is
+`check-all`. The slow set is where the real-process evidence lives (SIGTERM, crash loops,
+process pools, multi-process exactly-once).
