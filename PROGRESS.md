@@ -2,25 +2,93 @@
 
 ## Status
 
-- **Current phase:** Phase 6 (local benchmark harness): **complete**, awaiting
-  Mohammed's review. Local / Docker Desktop numbers only (not the headline).
-  - Redis's single main thread is the bottleneck from 4 workers up.
-  - Throughput per worker count varied up to ~1.7× between two sessions on the same
-    code (ADR-042).
-- **Follow-up done:** CI #7's chaos failure (I4 `kills = 2 < 3`, a harness scheduling
-  gap, fixed in ADR-043), and the 1M record: 7 of 7 passing 1M runs on the current
-  queue code.
-- **Current phase:** Phase 8, **paused mid-session at Mohammed's request** (2026-09-23).
-  - Torn down and verified CLEAN at 16:01:32 UTC.
-  - 3 of 10 points done: scaling w01, w02, w04.
-  - **Resume:** `git checkout wip/driver-report-race`, fix the one test noted below,
-    merge, then run a new session. The driver skips saved points.
-  - **TODO next session start:** re-check Cost Explorer (Phase 7 ≈ $0.06, Phase 8
-    part 1 ≈ $0.26 at list prices).
+- **Current phase:** Phase 8, session part 2 done (2026-09-23). **9 of 10 points saved;
+  backpressure/w12_block has no result.** Phase 8 acceptance is NOT met yet:
+  - w12_block is missing (the driver crashed in its FLUSHALL poll; see the log below);
+  - the AWS charts aren't drawn: `bench/plot.py` only reads local reports (it needs the
+    Docker VM `cpu` block), so it needs an AWS mode.
+  - Torn down and verified CLEAN at 20:32:39 UTC. Only the budget and the empty ECR repo
+    remain ($0 idle).
+- **Headline (12 workers, 3 × 300 s):** median **19,240 jobs/s** (19,106 to 19,367),
+  exactly-once True in all three. Redis's main thread is 96% busy: it's the ceiling,
+  from 8 workers up (w08 19,194/s, w12 19,426/s).
+- **Next:** decide with Mohammed whether w12_block is worth one more short session
+  (~$0.20), make the driver survive a transient AWS CLI error, and add AWS charts.
+- **TODO:** re-check the spend after ~24 h. The budget's ActualSpend was still $0.00 at
+  20:32 UTC (last refreshed 14:22 UTC, before any of today's sessions).
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
-- **AWS:** only the budget and an empty ECR repo remain (both $0 idle). Spend to date ≈ $0.06 (estimate; Cost Explorer lags ~24 h, re-check).
+- **AWS spend to date ≈ $1.45** (list prices, estimates): Phase 7 $0.06, Phase 8 part 1
+  $0.26, part 2 $1.13.
 
 ## Phase log
+
+### Phase 8 session, part 2 (2026-09-23)
+
+Approved by Mohammed: ~$0.75 expected, hard stop at ≈ $1.27.
+**Points 1–3 (w01, w02, w04) came from the earlier session (part 1, code d853d21);**
+every other point below is from this one (code 7510107; `src/`, `bench/`, `docker/`,
+`pyproject.toml`, `uv.lock` are identical between the two: `git diff --stat` empty).
+
+- **Before anything billable ($0):**
+  - `wip/driver-report-race` finished: the old pair test's fake `aws` now returns a
+    dumped report (as a real exit-0 run leaves one) and the test also asserts the driver
+    hands it back. E501 fixed. `make check` exit 0, 191 passed. Squash-merged as
+    7510107 and pushed.
+  - Cost check through the free Budgets API (Cost Explorer's API is $0.01 a call and
+    never used here): ActualSpend $0.00, last refreshed 14:22 UTC, before both sessions.
+  - `make aws-plan` (L2', 18 vCPUs, `redis_maxmemory=6500mb`): 24 resources, $0.8487/h.
+- **Timeline (UTC):**
+  - Image `ftq:7510107` pushed. Applied 19:11:55 → 19:12:31, 24 resources.
+  - Driver started 19:12:51 (`--deadline-min 75`), skipping the 3 saved points.
+  - w08 19:13 → 19:20, w12 → 19:27, headline r1 → 19:37, r2 → 19:48, r3 → 19:58.
+    Each took ~1.5 × its planned time (w08 7.4 min vs 4.9).
+  - **19:58–20:02 backpressure/w12_reject ran to completion (coordinator exit 0), but
+    the driver crashed while polling its tasks:** `aws ecs describe-tasks` exited 255,
+    no stderr captured (the driver's `subprocess.run` keeps it only in the exception).
+    The point's `services.json` snapshot was held in memory and lost.
+  - The report was read back from its own CloudWatch stream with `python -m
+    deploy.bench recover` (run id `backpressure-w12_reject-01e4b9e3` checked).
+    `meta.recovered` states the real cause. Not a rerun.
+  - 20:08:52 driver resumed for w12_block; **crashed again at 20:09:33 the same way**,
+    this time polling the FLUSHALL task, before any loadgen started, so nothing was
+    measured. The same `describe-tasks` call run by hand at 20:09:47 exited 0.
+  - I decided on one retry of w12_block (it had produced no number, so no result was
+    being replaced), inside the cap. **But I didn't start it until 20:30:45**: 21 min
+    passed between my own two commands (file timestamps: 20:09:47 → 20:30:45). The
+    point couldn't finish before the 20:40 hard stop, so I killed it at 20:31:02
+    (it had only printed its start line) and tore down.
+  - `make aws-down` 20:31:02 → 20:32:26: 24 destroyed. verify-clean CLEAN at 20:32:39.
+  - Up 19:12:31 → 20:32:26 ≈ 80 min: **≈ $1.13** (list prices).
+- **12 running workers, evidence:** `results/aws/evidence/describe-services-12-workers.json`,
+  the full `aws ecs describe-services` output (account id scrubbed) taken 19:30:42
+  during headline/w12_r1: worker desired 12, running 12, pending 0, one COMPLETED
+  deployment; its events show the w12 point's 12 tasks stopped and 12 new ones
+  started. Each point's driver snapshot (`<label>.services.json`) has the per-task
+  view with EC2 instance ids.
+- **Results** (`results/aws/{scaling,headline,backpressure}/`; every point 2/2 hosts):
+
+  ```
+  suite        point       workers  completed/s  exactly-once  e2e p50/p99 ms  redis main  note
+  scaling      w01          1        3,564        True          6,106/6,679     0.26        part 1
+  scaling      w02          2        7,314        True          2,942/3,224     0.47        part 1, RECOVERED
+  scaling      w04          4       13,375        True          1,575/1,821     0.75        part 1
+  scaling      w08          8       19,194        True          1,051/1,406     0.93
+  scaling      w12         12       19,426        True          1,023/1,379     0.96
+  headline     w12_r1      12       19,240        True          1,026/1,424     0.96
+  headline     w12_r2      12       19,106        True          1,032/1,443     0.96
+  headline     w12_r3      12       19,367        True          1,020/1,411     0.96
+  backpressure w12_reject  12       17,784        True          9,749/13,616    0.99        RECOVERED
+  backpressure w12_block   12       -             -             -               -           FAILED: driver crash in flush; not measured
+  ```
+
+  - Headline median 19,240/s, spread 19,106 to 19,367 (1.4%).
+  - w12_reject: offered 28,856/s (1.5 × the headline median), accepted 17,681/s,
+    **rejected 1,424,186**, depth 150,861 to 199,670 in the window, exactly-once True
+    over 2,759,680 accepted jobs.
+  - The latencies of the saturated points are mostly queueing: the loadgen keeps the
+    depth near ~20K (depth min ≥ 18,508 in every scaling/headline point).
+  - 8 → 12 workers adds 1%: Redis's main thread is the bottleneck, as locally in
+    Phase 6.
 
 ### Phase 8 session, part 1 (2026-09-23, paused)
 
@@ -1567,8 +1635,28 @@ pytest exit (redis up)=0
 |---|---|---|---|
 | 2026-09-23 | Budget (no actions, $0) and ECR repo (kept, empty) | kept | $0 |
 | 2026-09-23 | Phase 7 stack: 1 m7i-flex.large (~19 min), 1 c7i-flex.large (~17 min), 2 × 30 GB gp3, 2 public IPv4, 23 resources; ECR image 55 MB (~20 min). All destroyed, verify-clean 14:56:50 UTC | ~20 min | ≈ $0.06 (list prices; re-check Cost Explorer after ~24 h) |
+| 2026-09-23 | Phase 8 part 1: L2' stack (1 m7i-flex.large, 8 c7i-flex.large, 9 × 30 GB gp3, 9 public IPv4, 24 resources), 15:43:13 → ~16:01; image ftq:d853d21. verify-clean 16:01:32 UTC | ~18 min | ≈ $0.26 (list prices) |
+| 2026-09-23 | Phase 8 part 2: same stack, 19:12:31 → 20:32:26; image ftq:7510107 (deleted by aws-down). verify-clean 20:32:39 UTC | ~80 min | ≈ $1.13 (list prices; approved cap ≈ $1.27) |
 
 ## Things that went wrong
+
+- **2026-09-23 (Phase 8 part 2): the driver crashed twice on one intermittent AWS CLI
+  error, and a crash loses the point's snapshot.** `aws ecs describe-tasks` exited 255
+  twice in this session (the same call by hand: exit 0). The driver has no retry for a
+  failed CLI call, and `subprocess.run` drops stderr, so the cause wasn't recorded.
+  The first crash cost w12_reject's snapshot (the report was recovered); the second
+  cost w12_block. Lesson: a long unattended driver needs a bounded retry on read-only
+  polls, and it should write each piece of evidence the moment it has it.
+- **2026-09-23 (Phase 8 part 2): my hard-stop guard would have killed itself.** It ran
+  `pkill -f "deploy.bench run"`, a string in its own command line, so at the hard stop
+  it would have exited before `make aws-down`. The driver-exit watcher had the same
+  self-match and would never have finished. Found while reading the process list after
+  the first crash; both replaced with the `[d]eploy[.]bench` pattern, which can't match
+  itself. Lesson: a safety net gets the same scrutiny as the code it guards.
+- **2026-09-23 (Phase 8 part 2): 21 minutes went missing between two of my commands**
+  (20:09:47 → 20:30:45), with the stack up (~$0.30). That's what put the w12_block
+  retry past the hard stop. Lesson: before relaunching anything billable, check the
+  clock against the hard stop first.
 
 - **2026-09-23 (Phase 8 prep): I repeated the Phase 6 leftover-keys slowdown, then
   misdiagnosed it.** A hand-run two-host loadgen check left ~32K keys in the dev Redis,

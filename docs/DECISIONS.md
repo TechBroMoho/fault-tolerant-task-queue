@@ -2384,3 +2384,19 @@ second, independent loadgen on the same queue would break its exactly-once check
   - Faster than that, Redis refuses writes (`noeviction`) and the run fails loudly.
 - **The coordinator** reads the whole results log into memory: up to ~2 GB at 6.5M jobs
   on a 4 GiB host. It's a risk to watch in the first headline run.
+
+**Outcome on AWS (Phase 8, parts 1 and 2), and the limitations it exposed.**
+- 9 of 10 points saved. `start-task` on named instances and `list-container-instances
+  --filter` worked first time; every pair ran on 2 distinct hosts.
+- **Report race (part 1, fixed in 7510107):** the driver read the coordinator's log
+  before CloudWatch had any of it and called 0 lines "no report". After exit 0 or 1 it
+  now waits up to 180 s for the whole report. `python -m deploy.bench recover` reads a
+  point's report back from its own stream (label, suite, run id checked) and marks it
+  `meta.recovered`. Used for scaling/w02 and backpressure/w12_reject.
+- **Known limitation, not fixed yet:** one failed AWS CLI call ends the session. `aws
+  ecs describe-tasks` exited 255 twice in part 2 (the same call by hand: exit 0), and
+  `_run` has no retry, and the exception carries no stderr to the log. The per-point
+  snapshot is written only after the pair finishes, so a crash mid-point loses it
+  (w12_reject has no `services.json`). The fix to make before another billable session:
+  a bounded retry for read-only polls, stderr in the error, and the snapshot written as
+  soon as it's taken.

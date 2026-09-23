@@ -1,0 +1,91 @@
+{
+ "taken_at_utc": "2026-09-23T19:20:46+00:00",
+ "services": [
+  {
+   "serviceName": "worker",
+   "desiredCount": 12,
+   "runningCount": 12,
+   "pendingCount": 0
+  },
+  {
+   "serviceName": "redis",
+   "desiredCount": 1,
+   "runningCount": 1,
+   "pendingCount": 0
+  }
+ ],
+ "worker_tasks": [
+  {
+   "task": "03237c11f261458cb3f8859e710aea5b",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-03e39afa6c986205a",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "0b006916fc884be488ca2e69618b00c1",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-0cdcb5785471d0a9a",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "2aa50c35038f47daaf8d1ef335f0cf02",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-0cdcb5785471d0a9a",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "31db650f4bc94b99b19fdb0e2b62b077",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-065ad64788fd149fd",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "52c63f2d6f7f4de4bdc95942e75043a8",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-065ad64788fd149fd",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "808cad9da7ed4d18b00c9eb23c3c6f64",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-081a7bfcf3e93c463",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "93c202dd36684451a8300508ffe43f2d",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-03327256f4168416a",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "a553c646c87840dab3a72975d2ea4832",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-081a7bfcf3e93c463",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "b8b2e63db1cd40b0bd081f747892aad4",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-09b334f58cecaf462",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "bdc93cf99f7c44b6aea1886fbf3523eb",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-03327256f4168416a",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "dcdbb77e17934c79b96144bae6054bca",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-09b334f58cecaf462",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "ecd094b6b0c74e3590c6a5a54523d808",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-03e39afa6c986205a",
+   "instance_type": "c7i-flex.large"
+  }
+ ]
+}
