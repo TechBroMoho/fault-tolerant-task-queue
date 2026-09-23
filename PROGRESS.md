@@ -44,9 +44,18 @@ make check-all exit=0
 ======================= 219 passed in 229.67s (0:03:49) ========================
 ```
 
-- The suite took 229 s, against 122 s earlier today. The new loadgen tests add ~18 s,
-  and no single test is slower than 8 s (`--durations`). The rest is machine variance
-  (load average 3.0); nothing else in the suite runs the changed code.
+- The suite took 229 s, against 122 s earlier today. **I first put that down to machine
+  load. That was wrong.** Mohammed pointed at the Phase 6 cause, and it was the same:
+  - my local CLI check had left 31,960 keys (7-day TTLs) in the dev Redis's db 0;
+  - every test's teardown SCANs the keyspace.
+  - Deleted: 135 s.
+  - Fix: tests now use db 15 (`conftest.py`), so hand-run tools, which default to db 0,
+    can't slow them. `test_startup` had a hardcoded `/0` in its forwarder URL; it now
+    uses the test's db.
+  - After the fix: `make check-all` exit 0, 219 passed in 132.7 s. Both dbs were empty
+    afterwards.
+  - I also deleted 815 old keys from 165 `test-*` queues, from earlier runs. A full run
+    added none, so they're not a live leak.
 
 ### Phase 7 session: deploy, smoke, loadgen measurement, teardown (2026-09-23)
 
@@ -1497,6 +1506,16 @@ pytest exit (redis up)=0
 | 2026-09-23 | Phase 7 stack: 1 m7i-flex.large (~19 min), 1 c7i-flex.large (~17 min), 2 × 30 GB gp3, 2 public IPv4, 23 resources; ECR image 55 MB (~20 min). All destroyed, verify-clean 14:56:50 UTC | ~20 min | ≈ $0.06 (list prices; re-check Cost Explorer after ~24 h) |
 
 ## Things that went wrong
+
+- **2026-09-23 (Phase 8 prep): I repeated the Phase 6 leftover-keys slowdown, then
+  misdiagnosed it.** A hand-run two-host loadgen check left ~32K keys in the dev Redis,
+  and `make check-all` went from ~122 s to 229 s.
+  - I blamed machine load without checking the keyspace, although this log already
+    recorded the exact cause. Mohammed caught it.
+  - The structural fix is tests in Redis db 15, so the lesson doesn't depend on
+    remembering it.
+  - Lesson: before explaining a slowdown by "the machine", check the causes already
+    written down here.
 
 - **2026-09-23 (Phase 7): the first teardown left 2 ECR images, and verify-clean caught
   it.**

@@ -20,7 +20,10 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from ftq.config import Settings, make_redis
 from ftq.keys import Keys
 
-REDIS_URL = os.environ.get("FTQ_REDIS_URL", "redis://localhost:6379/0")
+# Database 15, not 0: every test's teardown SCANs its database for its queue's keys, so
+# data left in db 0 by hand-run tools (the loadgen, `ftq bench`, which default to db 0)
+# made the whole suite ~1.8-2.3x slower, twice (PROGRESS, Phases 6 and 8 prep).
+REDIS_URL = os.environ.get("FTQ_REDIS_URL", "redis://localhost:6379/15")
 
 
 @pytest_asyncio.fixture

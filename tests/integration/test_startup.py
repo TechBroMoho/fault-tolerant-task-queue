@@ -62,7 +62,9 @@ async def test_worker_started_while_redis_is_unreachable_waits_then_runs(
 ) -> None:
     port = _free_port()
     target = aioredis.Redis.from_url(REDIS_URL).connection_pool.connection_kwargs
-    s = with_(settings, redis_url=f"redis://127.0.0.1:{port}/0", retry_attempts=0)
+    # Same database as the test's own client (conftest: db 15), through the forwarder.
+    db = target.get("db", 0)
+    s = with_(settings, redis_url=f"redis://127.0.0.1:{port}/{db}", retry_attempts=0)
     job_id = await Client(r, settings).enqueue("send_email", {"to": "a@example.com"})
 
     worker_redis = make_redis(s)
