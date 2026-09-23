@@ -2,14 +2,206 @@
 
 ## Status
 
-- **Current phase:** Phase 5 (GitHub Actions CI: `make check-all`, Docker build, and a
-  100K chaos run on every push; 1M chaos nightly and on demand): **complete**, awaiting
-  Mohammed's review. CI found a real bug, the pool-reset cascade (ADR-039), fixed.
-- **Next:** Phase 6 (local benchmark harness). Starts on Mohammed's go-ahead.
+- **Current phase:** Phase 6 (local benchmark harness): **complete**, awaiting
+  Mohammed's review. Local / Docker Desktop numbers only (not the headline).
+  - Redis's single main thread is the bottleneck from 4 workers up.
+  - Throughput per worker count varied up to ~1.7× between two sessions on the same
+    code (ADR-042).
+- **Next:** Phase 7 (AWS deployment, BILLABLE). Starts with $0 read-only pre-flight on
+  Mohammed's go-ahead. Nothing billable is created without an itemized estimate and an
+  explicit "yes".
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
 - **AWS:** nothing created. Spend to date: $0.
 
 ## Phase log
+
+### Phase 6: Local benchmark harness (2026-09-23)
+
+**Built** (ADR-041)
+- **`bench/loadgen.py`: the benchmark itself.** It needs only `FTQ_REDIS_URL` and
+  running workers, so Phase 8 runs it unchanged from the worker image
+  (`python -m bench.loadgen`).
+  - Producers: multi-process and open loop. Every 10 ms tick, each one sends what has
+    come due as one `enqueue_many`. Or saturation mode (`--rate 0 --max-depth D`):
+    back-to-back batches held to a bounded backlog.
+  - Configurable job type, payload fields, and payload size.
+  - Every second it samples depth, counters, Redis CPU (main thread), and memory,
+    against Redis `TIME`.
+  - Then it waits for the drain and reads the append-only results log:
+    - completion throughput over the steady-state window [warmup, warmup + measure);
+    - end-to-end p50/p95/p99/p99.9 (enqueue → commit, both Redis `TIME`, 1 ms
+      resolution);
+    - enqueue call latency with batch sizes;
+    - accepted/rejected/blocked counts;
+    - per-worker completions;
+    - `INFO commandstats` per job;
+    - an exactly-once check (accepted = distinct results, no job_id twice, empty DLQ,
+      drained).
+  - The raw histograms are stored, so every percentile can be recomputed.
+- **`bench/run.py`: the local Docker driver.** Its own Compose project (`ftq-bench`,
+  Redis on 6391) with a fresh Redis and N workers for every point. The loadgen runs as
+  a container on the same network. Suites: `concurrency`, `scaling`, `latency`,
+  `backpressure`, `iothreads`, `point`.
+  - CPU evidence:
+    - each container's cgroup `cpu.stat` (exact CPU time);
+    - the whole VM's `/proc/stat`;
+    - both timestamped by the VM clock (= Redis's), so no clock offset.
+  - Jobs per CPU-second per worker.
+  - Worker logs are saved and their lines counted in the report.
+- **`bench/plot.py`** writes these into `results/local/bench/`, all labelled local:
+  - `scaling.png` (per session);
+  - `bottleneck.png`;
+  - `redis_cost.png`;
+  - `concurrency.png`;
+  - `latency.png`;
+  - `backpressure.png`;
+  - `summary.md` / `summary.json`.
+- `bench/analysis.py`: the pure arithmetic (window, nearest-rank percentiles,
+  upper-edge histograms, interpolated CPU). `make bench` runs scaling + latency +
+  backpressure + charts.
+- The worker image now carries `bench/`. matplotlib is a dev dependency, and mypy now
+  covers `bench/`, which found a broken committed script (below).
+- New tests, 186 → 200:
+  - `test_bench_analysis.py`: 11 unit tests;
+  - `test_loadgen.py`: 3 real-Redis runs (open-loop rate, latency window, and the
+    exactly-once verdict; the saturation guard; a run that didn't drain is *not*
+    exactly-once, and refusals are counted as refusals).
+- **Fixed:** `bench/lease_starvation.py` had been broken since Phase 3 (a helper's
+  signature changed). It's re-run, exit 0.
+
+**Acceptance: charts + raw JSON committed; the bottleneck analysis with evidence.**
+- 59 points across all suites (`results/local/bench/*/`). **Every one exactly-once:**
+  0 duplicate results, 0 missing, empty DLQ, and 0 retries, reclaims, lease losses, or
+  DLQ moves. Worker logs: 2 lines in total, both the `MaxConnectionsError` warning at
+  concurrency 100 (below).
+- Reproduce any point with its report's `meta.reproduce`, or a suite with
+  `uv run python -m bench.run <suite>`.
+- Environment:
+  - MacBook Pro M4 (Mac16,1): 4 performance + 6 efficiency cores.
+  - Docker Desktop 29.4.3: 10 vCPUs, 7.75 GiB.
+  - Redis 8.8.3: AOF everysec, noeviction, 4 GB.
+  - Jobs: `send_email`, 100 B payload, `FTQ_CONCURRENCY=50`.
+- Code: the first set (concurrency r1, scaling r1–r3, latency, backpressure) ran on the
+  clean commit bab46ca. The diagnostic runs ran on 5e2555a, which only adds
+  commandstats, the io-threads knob, and repeats; the loadgen measurement code is
+  unchanged otherwise. Each report's `meta.git` has its commit.
+
+**Scaling** (saturated, completed jobs/s in the 30 s window; two sessions, ADR-042 §4):
+
+```
+workers   session A 10:09-10:24 UTC (3 runs)   session B 10:41-10:52 UTC (2 runs)   Redis main thread   busiest worker
+1          5,808  6,157  6,783   (6,157)        7,817  7,827   (7,822)              0.35-0.38           1.00
+2          9,052 10,527 12,312  (10,527)       13,776 15,348  (14,562)              0.61-0.66           0.97-0.99
+4         13,833 14,068 19,091  (14,068)       20,333 21,386  (20,860)              0.89-0.94           0.90-0.92
+8         14,137 14,714 14,821  (14,714)       22,713 25,717  (24,215)              0.91-0.93           0.64-0.77
+12        11,160 12,487 12,937  (12,487)       20,823 23,624  (22,223)              0.88-0.91           0.42-0.51
+```
+
+**Bottleneck (ADR-042):**
+- **1–2 workers:** the workers are CPU-bound (each ~1.0 core).
+- **4 or more workers: Redis's single main thread.** It's 0.88–0.94 busy, the workers
+  wait (0.42–0.77 of a core each), and throughput stops rising.
+- **Per job:**
+  - 3 Lua script calls (enqueue, commit, ledger), 18–25 µs;
+  - ~1/13 of an `XREADGROUP`;
+  - the main thread's total is 36–79 µs, so about half of it is socket I/O, parsing,
+    and the event loop outside commands.
+- **The two sessions differ because the host did,** not the queue or the method:
+  - the same commands per job, at 62–65 µs vs 36–40 µs per job for 8 workers;
+  - interleaved saturation and fixed-rate runs agreed;
+  - AC power, no Low Power Mode, no thermal warnings;
+  - the cause (performance/efficiency-core placement or host load) wasn't isolated.
+- **Redis io-threads 4** (paired, interleaved, 4 producers, backlog full): 21.0–21.5K
+  against 23.0–24.6K with io-threads 1. The main thread fell to 0.70 busy, but the extra
+  threads cost ~0.8 cores on a VM already ~8/10 busy. Locally, total CPU is the next
+  limit. Phase 8 should re-test it with Redis on its own instance.
+- **The load generator** was never CPU-bound (0.08–0.49 of a core per process). But it
+  is latency-bound at one call in flight per process, so above ~20K/s it needs 4
+  processes. At 12 workers the backlog fell to ≤ 198, and those points partly measure
+  the producers.
+
+**Concurrency** (1 worker, 3 repeats, completed jobs/s):
+- 10: 6,192 / 6,257 / 6,288;
+- 25: 6,797 / 7,422 / 7,509;
+- 50: 6,799 / 7,944 / 8,100;
+- 100: 7,877 / 8,002 / 8,114.
+
+At 10, fetches return 2 jobs per `XREADGROUP`, and Redis spends 53–55 µs per job
+against 43–44 µs at 50. The benchmark uses 50, and the library default stays 10
+(ADR-042).
+
+**Latency** (8 workers, open loop, session A timing 10:25–10:29 UTC; offered 10–90 % of
+that session's 14,714/s median):
+
+```
+offered/s   completed/s   e2e p50   p95    p99     enqueue call p50 / p99 (jobs per call, median)
+ 1,471       1,471.3       2 ms     21     241     1.4 / 15.3 ms (7)
+ 3,678       3,678.0       3        17      43     1.5 / 15.5 (18)
+ 7,357       7,357.2       3        15      46     1.6 / 19.7 (37)
+11,035      11,033.9       5        18      41     2.2 / 27.2 (55)
+13,246      13,278.0       6        27      55     2.7 / 38.7 (67)
+```
+
+The 241 ms p99 at the lowest load is as measured: a VM-level stall is the likely cause
+(that run's producers also lagged 0.40 s at one point, the most of the five). It isn't
+explained further.
+
+**Backpressure** (8 workers, 22,071 jobs/s offered open loop, watermarks 20,000 /
+15,000):
+- **reject:** 21,991/s offered, 20,911/s accepted, 20,469/s completed. 54,525 jobs
+  rejected; the script's own `rejected` counter agrees exactly. Depth peaked at 18,433
+  in the window (19,780 over the whole run), under the 20,000 high watermark.
+- **block:** 11,281 jobs had to wait (12.97 s of waiting in total), 0 rejected, 20,639/s
+  completed. Depth peaked at 19,493 over the whole run.
+- Offered was only ~1.07× what this fleet completed at that time: the 1.5× was relative
+  to session A's median. The reject run's depth passed the low watermark only after
+  ~28 s, so Phase 8's backpressure demo should offer well above measured capacity.
+
+**Mutation checks** (scripted, one at a time, each file restored and sha256-verified):
+
+```
+analysis: histogram rounds down (floor)                -> CAUGHT
+analysis: busy_fraction extrapolates past its samples  -> CAUGHT
+analysis: percentile rank floored (interpolates)       -> CAUGHT
+loadgen: exactly-once ignores drain and missing        -> CAUGHT
+loadgen: latency not limited to the window             -> CAUGHT
+loadgen: no depth guard                                -> CAUGHT
+loadgen: refused jobs counted as accepted              -> CAUGHT
+loadgen: offered/accepted window includes the warmup   -> CAUGHT
+```
+
+**Decisions for Mohammed's review**
+- ADR-041: the harness design. Notably, saturation holds a bounded backlog rather than
+  using the queue's own `block` mode, whose re-polls would load Redis with refused
+  enqueues.
+- ADR-042:
+  - benchmark at `FTQ_CONCURRENCY=50`, with the library default kept at 10;
+  - Redis io-threads stays 1 locally;
+  - no commit batching until AWS data says Redis-bound below target.
+- How to quote local numbers: a range per worker count, never one "capacity". Every
+  saturated run with ≥ 4 workers did ≥ 11,160 jobs/s, but the headline is Phase 8's.
+
+**Open issues**
+- **The worker's Redis connection pool isn't sized for its concurrency.**
+  `MaxConnectionsError` (redis-py's default is 100 connections) appeared at
+  concurrency 100. No job was affected, but it's latent. It's flagged as a separate task
+  (test first, then size the pool or use a blocking pool).
+- The session-to-session drift on this laptop is unexplained (ADR-042 §4).
+- Phase 8 needs an ECS driver for the loadgen and task-level CPU from the ECS metadata
+  stats endpoint (to be verified), plus ≥ 4 producer processes.
+- Carried: the flaky Phase 3 test (no failure since); results/effects logs never
+  trimmed (ADR-021); the retry-ownership check has no verifier-level evidence
+  (ADR-037). Five `chaos-scale` runs were dispatched on GitHub at 10:04 UTC on c0f5657.
+  They're not part of this phase, and I didn't check their results.
+
+**Evidence (local)**
+
+```
+$ make check-all > log 2>&1; echo "make check-all exit=$?"      (run after the last code change)
+make check-all exit=0
+  77 files already formatted / All checks passed! / Success: no issues found in 71 source files
+  ======================= 200 passed in 121.10s (0:02:01) ========================
+```
 
 ### Phase 5: CI on GitHub Actions (2026-09-23)
 
@@ -1029,6 +1221,63 @@ pytest exit (redis up)=0
 | (none yet) | | | $0 |
 
 ## Things that went wrong
+
+- **2026-09-23 (Phase 6): my first capacity number didn't survive a second session.**
+  - The first scaling set (3 repeats, 10:09–10:24 UTC) put 8 workers at 14.1–14.8K
+    jobs/s. Minutes later, the backpressure runs completed 20.5K/s on the same fleet,
+    and the backpressure chart's title called 22K/s "1.5× capacity".
+  - Two explanations fit: the saturation method costs Redis extra per job, or the
+    machine changed. I tested both instead of picking one.
+    - Interleaved saturation / fixed-rate pairs: saturation wasn't lower (19.0 / 24.8 /
+      20.2K against 19.1 / 14.7 / 22.2K).
+    - `INFO commandstats`, added for this: the same commands per job in every run.
+    - Two more scaling repeats later: 8 workers at 22.7K and 25.7K.
+  - Redis's main thread needed 62–65 µs per job at 8 workers in the first session and
+    36–40 µs later, for identical work. The host changed, not the queue (ADR-042).
+  - The scaling chart now shows each session separately, and the backpressure title
+    states the offered rate, not a multiple of a capacity that moved.
+  - Lesson: on a shared laptop, one session's median isn't "the capacity". Repeat
+    across sessions, and check the per-unit cost, not just the total.
+- **2026-09-23 (Phase 6): the benchmark found a latent connection-pool limit in the
+  worker.**
+  - At `FTQ_CONCURRENCY=100`, both runs logged one WARNING: `maintenance pass failed:
+    network:MaxConnectionsError`.
+  - redis-py 8.1's asyncio pool defaults to 100 connections and raises as soon as
+    they're all in use. `make_redis` doesn't size it, and a worker's in-flight jobs,
+    heartbeats, fetch, and maintenance can together need more than 100.
+  - No job was affected (0 retries, reclaims, lease losses, or DLQ moves in any of the
+    runs), but the limit is real. It's flagged as a separate task rather than changed
+    inside a benchmark phase (ADR-042, open issues).
+  - Found only because the driver saves every worker's log and the report counts the
+    lines.
+- **2026-09-23 (Phase 6): a committed measurement script had been broken since Phase 3.**
+  `bench/lease_starvation.py` called `start_worker_process(..., **ENV)`. Phase 3
+  (fdf7387) changed the helper to take `env=`, so the script raised `TypeError`. Nothing
+  type-checked `bench/`. Adding `bench` to mypy's files (for the new harness) found it.
+  It's fixed and re-run (exit 0; cpu_task max idle 198–201 ms against a 1 s lease). The
+  committed Phase 2 output was produced before the break, so it stands.
+- **2026-09-23 (Phase 6): my own leftover data slowed the test suite 2.3×.** After two
+  smoke runs of the loadgen against the dev Redis (its default URL), `make check-all`
+  took 270 s instead of ~118 s. Every integration test's teardown SCANs the whole
+  keyspace for its queue's keys, and the smoke runs had left 56K keys (7-day TTLs).
+  Deleting those two queues' keys restored 118.6 s. The benchmark driver never touches
+  the dev Redis (its own Compose project, port 6391); only hand-run loadgen smoke tests
+  did.
+- **2026-09-23 (Phase 6): smaller slips, each caught before it cost a result.**
+  - The first scaling chart had a conclusion for a title ("stops scaling at 4 workers")
+    before any data existed. It's neutral now.
+  - The first loadgen sent one job per call at low rates. It sent whatever had come due
+    during the previous call instead of waiting for the tick. Caught in the smoke run
+    (median batch 1); now it's 10 per tick at 1K/s per producer.
+  - `argparse.REMAINDER` swallowed the driver's own flags and passed them to the loadgen
+    (it failed, nothing was recorded).
+  - I ran `bench/plot.py` on the host during the measurement window of
+    `method/w08_saturate_r1`: a few CPU-seconds on a 10-core host, disclosed here and
+    left in.
+  - The io-threads runs with 2 producer processes never kept the backlog full (depth
+    min 77–350). They measured the load generator (one ~40 ms call of 500 jobs in
+    flight per process), not Redis. They were re-run with 4 producers. The 2-producer
+    runs stay committed, and ADR-042 says what they are.
 
 - **2026-09-23 (Phase 5): the pool-reset cascade.** CI's first chaos runs on a 4-vCPU
   runner failed I1/I3: healthy `hang_process` jobs ended DEAD (6, 22, and 35 false DEADs

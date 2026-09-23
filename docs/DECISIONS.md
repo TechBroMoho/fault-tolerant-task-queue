@@ -1673,3 +1673,272 @@ and 16 GB (`nproc`, `docker info`, both recorded in every chaos report).
   so the nightly run needs re-enabling if the repo goes quiet.
 - A red `ci` badge means a real failure: no retries.
 
+
+---
+
+## ADR-041: The benchmark harness: what it measures, and how
+
+*Status: accepted (Phase 6: `bench/loadgen.py`, `bench/run.py`, `bench/analysis.py`,
+`bench/plot.py`).*
+
+**Context.** SPEC Phase 6: a load generator (multi-process, target or max rate,
+configurable job type and payload size), then:
+- steady-state throughput;
+- end-to-end p50/p95/p99 from Redis `TIME`;
+- enqueue latency and backpressure counts;
+- a 1–12 worker scaling curve;
+- charts, and a bottleneck analysis with CPU evidence.
+
+Phase 8 runs the same benchmark on AWS, where the laptop can't reach Redis (it's never
+public) and the load generator runs as an ECS task.
+
+**Decisions.**
+- **One self-contained program, `bench/loadgen.py`, is the benchmark.**
+  - It needs only a Redis URL and running workers. It produces the load, samples, waits
+    for the drain, reads the results, and writes one JSON report.
+  - Every number in the report comes from Redis or from its own processes. It never
+    needs the host.
+  - So Phase 8 runs it unchanged from the worker image (`python -m bench.loadgen`; the
+    image now carries `bench/`, a few KB).
+  - `bench/run.py` is only the *local* driver (a Docker Compose fleet plus CPU
+    accounting). Phase 8 needs an ECS equivalent of that driver, not a second benchmark.
+- **Latency and throughput come from the queue's own records.**
+  - Each results-log entry (ADR-021) carries `enqueued_at_ms` and `finished_at_ms`, both
+    stamped by Lua from Redis `TIME` (ADR-020). No producer or worker clock is involved.
+  - Completion throughput is the number of first commits whose `finished_at_ms` falls in
+    the window, divided by the window.
+  - End-to-end latency covers jobs whose `enqueued_at_ms` falls in the window. They all
+    finish, because the run waits for the drain.
+  - Resolution is 1 ms, because the scripts stamp whole milliseconds. Sub-millisecond
+    latencies read as 0 or 1. Changing the stamp format would touch commit.lua and the
+    job model for a benchmark-only gain, so it stays as it is.
+- **The steady-state window** is [t0 + warmup, t0 + warmup + measure), where t0 is Redis
+  `TIME` when producing starts. Defaults are 10 s warmup, 30 s window, and 5 s cooldown.
+  Producers keep producing through the cooldown, so their stop never falls in the window.
+  30 s is short for a headline (SPEC §9 asks for ≥ 5 min on AWS). Locally it's enough to
+  validate the harness, and it keeps a 15-run scaling curve under 20 minutes.
+- **Open-loop producers.**
+  - Each of `--processes` spawned processes offers `rate / processes` jobs/s on a fixed
+    10 ms tick grid. Each tick it sends whatever has come due, as one `enqueue_many`
+    pipeline (ADR-032), up to `--batch`.
+  - A slow send makes the next batch bigger. That keeps the offered rate independent of
+    how the queue responds, which avoids coordinated omission. If the producer itself
+    falls behind, `max_lag_s` shows it.
+  - The enqueue latency reported is the round trip of one `enqueue_many` call, reported
+    alongside the batch sizes: a call of 50 jobs isn't a single-job latency.
+- **Saturation (throughput) runs keep a bounded backlog: `--rate 0 --max-depth D`.**
+  - Producers send batches back to back, but hold off while `XLEN ≥ D` (D = 20,000
+    locally). The workers always have work and never wait for it. The backlog and
+    Redis's memory stay bounded, so each point can drain in seconds and be
+    exactly-once checked.
+  - Rejected alternatives:
+    - *Use the queue's own `block` backpressure.* A blocked `enqueue_many` re-sends its
+      whole batch every `block_poll_interval`. At batch 500 and 50 ms that's ~10,000
+      refused script calls per second per producer. Redis spends CPU refusing jobs, and
+      a capacity curve would really measure the producer count. Backpressure gets its
+      own runs instead.
+    - *Offer a fixed rate above capacity with no cap.* The backlog grows without bound,
+      and enqueuing more than can be served takes Redis time away from the workers.
+    - *A rate sweep per worker count* to find the knee. It's standard, but 5–10× the
+      runs.
+  - End-to-end latency in a saturation run is mostly queueing: about D / throughput by
+    Little's law. It's reported, but the latency numbers come from the latency runs.
+  - The run records the minimum depth inside the window. If it ever reaches 0, the
+    producers didn't keep up, and the point measured the load generator, not the queue.
+- **Latency runs** use an open-loop rate at fixed fractions of the measured capacity (the
+  median of the scaling runs at that worker count). **Backpressure runs** offer 1.5× that
+  capacity in `reject` and `block` mode, with watermarks 20,000 / 15,000.
+- **Exactly-once check on every point.** After the drain, every accepted job must have
+  exactly one results-log entry: `accepted == distinct job_ids with a result`, no job_id
+  twice, and an empty DLQ. A run that didn't drain is reported as not exactly-once rather
+  than as a pass (tested). It's a lighter check than the chaos verifier (no effects log,
+  no faults). Its job is to catch a benchmark that "wins" by losing or duplicating work.
+- **CPU evidence** (for the bottleneck analysis):
+  - **Redis's main thread** comes from `INFO cpu`
+    (`used_cpu_{user,sys}_main_thread`, sampled every second). Every command and script
+    runs on that one thread, so 1.0 is Redis's ceiling. This works anywhere, AWS
+    included.
+  - **Containers (local)** use each container's cgroup v2 `cpu.stat` `usage_usec`, read
+    every 2 s by `docker exec`, and interpolated at the window's edges. That's exact CPU
+    time, not `docker stats`' sampled percentage.
+  - **The whole Docker VM** uses `/proc/stat`, which isn't namespaced, so any container
+    sees the VM's.
+  - Each reading is timestamped by `date` inside the VM. That's the same kernel clock as
+    Redis `TIME`, so the CPU windows line up with the loadgen's without a host-to-VM
+    clock offset.
+  - The `docker exec` calls cost some CPU of their own. It shows up as the VM's busy
+    total exceeding the containers' sum.
+  - **Per worker:** the results log records which worker committed each job, so the
+    driver computes each worker's jobs/s and **jobs per CPU-second**. That separates
+    "a worker got slower per job" from "a worker got less CPU".
+  - For Phase 8, container CPU should come from the ECS task-metadata stats endpoint
+    (free; to be verified then). The Redis and loadgen numbers already work there.
+- **Every point starts from nothing:** `docker compose down -v`, a fresh Redis (AOF
+  everysec, `noeviction`, 4 GB cap: ADR-013's settings with room for about a million
+  jobs' keys), and N fresh workers. The loadgen waits until all N consumers have
+  registered. The scaling repeats are interleaved (1, 2, 4, 8, 12, then again), so slow
+  drift over the session doesn't all land on one worker count.
+- **The local harness runs the loadgen in a container** on the Compose network. That
+  matches AWS, and keeps macOS's port-forwarding path, which ADR-032 suspected of
+  adding noise, out of every measured round trip.
+
+**Consequences.**
+- Charts and `summary.md` are generated from the saved reports (`bench/plot.py`). They
+  select and draw; they compute nothing new.
+- Tests: `test_bench_analysis.py` (the arithmetic and payload sizing, 11 unit tests) and
+  `test_loadgen.py` (3 real-Redis runs). Eight planted bugs in the analysis and the
+  loadgen were all caught (PROGRESS.md, Phase 6).
+- Local numbers are labelled local in every report (`meta.environment`), chart
+  subtitle, and summary. They are not the headline (SPEC §9 is Phase 8's job).
+
+---
+
+## ADR-042: Where the local bottleneck is, with evidence (and what it means for Phase 8)
+
+*Status: accepted (Phase 6). Every number below comes from the reports in
+`results/local/bench/` (one JSON per run; `summary.md` tabulates them). Environment for
+all of them: MacBook Pro M4 (Mac16,1: 4 performance + 6 efficiency cores), Docker
+Desktop 29.4.3 VM with 10 vCPUs and 7.75 GiB, Redis 8.8.3 (AOF everysec, noeviction),
+`send_email` jobs with no latency and a 100 B payload. **Local numbers, not the
+headline.***
+
+**Context.** SPEC Phase 6 asks where the bottleneck is (the workers' CPU, Redis, or the
+load generator), with evidence. Phase 8 needs to know what to expect on AWS and which
+knobs matter.
+
+**Findings.**
+
+1. **1–2 workers: the workers are CPU-bound.**
+   - Each worker used a full core: 0.97–1.00 in every 1- and 2-worker run.
+   - Redis's main thread wasn't the limit: 0.35–0.38 at 1 worker, 0.61–0.66 at 2.
+   - One worker completes 5.8–8.1K jobs/s (every 1-worker run at concurrency ≥ 50).
+   - A worker is one Python process (asyncio, one core) running three Lua-script round
+     trips per job, plus its share of a fetch.
+2. **4 workers and up: Redis's single main thread is the bottleneck.**
+   - It was 0.88–0.94 busy in every saturated run at 4, 8, and 12 workers. Every command
+     and script runs on that one thread.
+   - Meanwhile the workers stopped using a full core, because they were waiting on
+     Redis. The busiest worker was at:
+     - 0.90–0.92 at 4 workers;
+     - 0.64–0.77 at 8;
+     - 0.42–0.51 at 12.
+   - Past 4 workers, throughput stops rising (table below).
+   - At 12 workers the backlog fell to 198 or less in all 5 runs (depth minimum 0–198).
+     The producers share that saturated Redis too, so those points are partly limited
+     by the load generator.
+3. **What Redis spends per job** (`INFO commandstats` deltas, `redis_commands` in the
+   reports).
+   - The command mix is the same in every run:
+     - 3 script calls per job: enqueue, commit, ledger;
+     - ~1 `XLEN` per job (inside enqueue.lua);
+     - `XREADGROUP` at 0.078 calls per job at 8 workers (~13 jobs per read), 0.095 at
+       1 worker, 0.49 at `FTQ_CONCURRENCY` 10 (2 per read).
+   - The scripts (`evalsha`, including the commands inside them) took 18–25 µs per job.
+     The main thread's total was 36–79 µs per job. So roughly half of Redis's time per
+     job is outside command execution: reading and writing sockets, parsing, and the
+     event loop.
+4. **Redis's time per job drifted during the session; the work didn't.**
+   - At 8 workers, the same saturated run cost 62–65 µs per job in the first session
+     (10:09–10:24 UTC) and 36–40 µs from 10:41 (`redis_cost.png`).
+   - The command counts per job were identical, so throughput moved with it:
+
+     ```
+     completed jobs/s, saturated, concurrency 50  (each run; median)
+     workers   session A 10:09-10:24 UTC (3 runs)   session B 10:41-10:52 UTC (2 runs)
+     1          5,808  6,157  6,783   (6,157)        7,817  7,827   (7,822)
+     2          9,052 10,527 12,312  (10,527)       13,776 15,348  (14,562)
+     4         13,833 14,068 19,091  (14,068)       20,333 21,386  (20,860)
+     8         14,137 14,714 14,821  (14,714)       22,713 25,717  (24,215)
+     12        11,160 12,487 12,937  (12,487)       20,823 23,624  (22,223)
+     ```
+
+   - The saturation method isn't the cause. Interleaved at 8 workers (10:34–10:40),
+     saturation completed 19.0 / 24.8 / 20.2K/s, and an open-loop 22K/s offer in reject
+     mode completed 19.1 / 14.7 / 22.2K/s. The 14.7K run is one where the producers
+     fell behind (only 15.6K/s offered).
+   - Power isn't the cause either: AC power, Low Power Mode off, no thermal or
+     performance warnings recorded (`pmset`).
+   - The cause is on the host, and I couldn't isolate it. The candidates are macOS
+     scheduling the VM's vCPU threads on performance vs efficiency cores, and competing
+     host load (WindowServer and the desktop app used about a core earlier in the
+     session).
+   - The honest local statement is a range per worker count, not one number.
+5. **Redis `io-threads 4` offloads socket I/O but didn't help here.**
+   - Paired with io-threads 1, interleaved, 8 workers, 4 producer processes, with the
+     backlog full (depth ≥ 19.3K) in all six runs:
+     - io-threads 1: 23.0 / 24.6 / 24.6K jobs/s;
+     - io-threads 4: 21.0 / 21.0 / 21.5K jobs/s.
+   - With io-threads 4:
+     - the main thread fell from 0.92–0.93 busy to 0.70, and from 37.7–39.7 to
+       32.6–33.4 µs per job, which confirms that socket I/O is part of its load;
+     - but the Redis container used 1.89–1.91 cores instead of 1.07–1.10, on a VM
+       that already had ~8 of 10 CPUs busy;
+     - so the workers got less (busiest 0.67–0.69 against 0.72–0.74).
+   - On this machine, total CPU is the next limit once the main thread is relieved.
+   - The three earlier io-threads runs with 2 producer processes (21.3–21.5K) never kept
+     the backlog full (depth minimum 77–350). They measured the load generator, not
+     Redis, and are kept only as a record.
+6. **The load generator is latency-bound, not CPU-bound.**
+   - Each producer process keeps one `enqueue_many` call in flight.
+   - A 500-job call's median took 11.8–62.9 ms across the saturated runs, rising with
+     Redis's load; 32–55 ms at 8 workers. At 8 workers that's ≤ ~9–16K jobs/s per
+     process, whatever its CPU (0.08–0.49 of a core per process across all saturated
+     runs).
+   - Above ~20K/s it needs 4 processes (used for the io-threads pairs). The scaling
+     runs used 2, and their backlog stayed full up to 8 workers, which the depth minimum
+     in each report shows.
+7. **Per-worker efficiency falls as workers are added.** Jobs per worker-CPU-second
+   (`per_worker` in the reports) went from 5.8–6.8K at 1 worker to ~2.7–2.9K at 8 and
+   ~2.2–2.6K at 12 (session A). The per-job commands barely change (above). So each
+   worker's CPU time does less per job as the VM fills up. It's the same unexplained
+   host effect as finding 4, and probably more context switches and wake-ups per job
+   while waiting on Redis. It's not attributed further.
+
+**Decisions.**
+- **The local benchmark fleet runs at `FTQ_CONCURRENCY=50`.** Three repeats, one worker,
+  medians:
+  - 10: 6,257;
+  - 25: 7,422;
+  - 50: 7,944;
+  - 100: 8,002 jobs/s.
+
+  50 and 100 are within the noise. 10 is lower in every repeat: it fetches 2 jobs per
+  `XREADGROUP`, and Redis's per-job cost rises to 53–55 µs. 100 hit the connection-pool
+  limit (below).
+- **The library default stays `concurrency = 10`** (it's in Mohammed's hands). A
+  thread-pool handler gets `concurrency` threads (ADR-028), so 50 is a heavier default
+  for every user. The benchmark and the Phase 8 deployment set `FTQ_CONCURRENCY=50`
+  explicitly.
+- **Redis stays at io-threads 1** locally (measured worse). **Phase 8 should repeat the
+  io-threads pair.** There, Redis has its own instance and its extra threads don't
+  compete with the workers. That's a hypothesis to test, not a result.
+- **No commit batching yet** (ADR-032 revisited). About half of Redis's per-job time is
+  outside command execution, and per-command overhead is what batching reduces. So it's
+  the right lever if Phase 8 is Redis-bound below the target. It would add a second
+  commit path next to the most correctness-critical script, so only with evidence from
+  AWS.
+
+**Consequences.**
+- **What the local numbers support.**
+  - Every saturated run with 4 or more workers completed at least 11,160 jobs/s. The
+    median by session was 12.5–14.7K (session A) and 20.9–24.2K (session B). The
+    highest single run was 25,717.
+  - Every one of the 59 points (all suites) was exactly-once: accepted = distinct
+    results, 0 duplicate results, 0 missing, empty DLQ.
+  - None of this is the headline. SPEC §9's 10K+ claim needs Phase 8's AWS runs
+    (≥ 5 min windows, 3 repeats).
+- **What to expect on AWS (an estimate, not a measurement).** The cap is Redis's main
+  thread at roughly 1 / (µs per job). That's ~13K jobs/s at 79 µs and ~28K at 36 µs.
+  Where AWS lands depends on how fast one m7i-flex vCPU runs this work. Phase 8 must
+  report the Redis main-thread busy fraction and µs per job alongside throughput, the
+  way these reports do, and use ≥ 4 producer processes.
+- **Open issue found by the benchmark: the worker's Redis connection pool isn't sized
+  for its concurrency.**
+  - Both `FTQ_CONCURRENCY=100` runs logged `maintenance pass failed:
+    network:MaxConnectionsError`.
+  - redis-py 8.1's asyncio pool defaults to 100 connections and raises (doesn't wait)
+    when they're all in use. `make_redis` doesn't set a limit.
+  - No job was affected in any run (0 retries, reclaims, lease losses, or DLQ moves).
+    But a commit or heartbeat that hits it under load could cost an attempt or a lease.
+  - Flagged as its own task (reproduce with a test, then size the pool or use a
+    blocking pool) for Mohammed to schedule.

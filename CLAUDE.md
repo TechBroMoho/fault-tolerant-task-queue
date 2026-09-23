@@ -49,7 +49,7 @@ make chaos N=100000 [CHAOS_WORKERS=8] [SEED=s]  # chaos run + verifier -> result
 uv run python -m chaos.run --help                # same, all knobs (--rate, --out, --keep, --skip-build ...)
 gh workflow run chaos-scale.yml -f jobs=N [-f workers=W]   # chaos on a GitHub runner (1M nightly; ~35 min)
 make bench [BENCH_ARGS=...]   # scaling + latency + backpressure + charts -> results/local/bench/ (~25 min; background)
-uv run python -m bench.run {concurrency|scaling|latency|backpressure|point} --help   # one suite (local Docker)
+uv run python -m bench.run {concurrency|scaling|latency|backpressure|iothreads|point} --help   # one suite (local Docker)
 uv run python -m bench.loadgen --help   # the load generator alone: needs only FTQ_REDIS_URL + running workers (Phase 8 reuses it)
 uv run python -m bench.plot             # charts + summary.md from the saved reports
 make aws-plan / aws-up / aws-bench / aws-down / aws-verify-clean   # BILLABLE except plan/verify [stubs until Phase 7]
