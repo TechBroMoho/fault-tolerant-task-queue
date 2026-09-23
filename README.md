@@ -18,7 +18,7 @@ Requires [uv](https://docs.astral.sh/uv/) and Docker.
 make setup      # install Python 3.12 deps from uv.lock
 make up         # start Redis (Docker Compose); `make up WORKERS=4` adds 4 worker containers
 make check      # format check + lint + mypy --strict + fast tests (~16 s)
-make check-all  # the same with every test, including the `slow` ones (~75 s; what CI runs)
+make check-all  # the same with every test, including the `slow` ones (~85 s; what CI runs)
 make chaos N=100000   # chaos run + verifier (8 workers, faults, I1-I5) -> results/local/chaos_report.json
 ```
 

@@ -249,12 +249,17 @@ Chaos settings (`chaos/run.py`, not the library defaults): lease `L` = 2 s,
 
 | Run (seed) | Code | Highest delivery reached | Reclaims at 2 / 3 / 4 / 5+ |
 |---|---|---|---|
-| 115930751 | 464635e | 5 | 603 / 87 / 8 / 1 |
-| 2145370571 | 464635e | 5 | 691 / 93 / 27 / 2 |
-| 425084029 | 464635e | 5 | 802 / 96 / 24 / 2 |
-| 4 earlier runs | b4f6779 and before | 5, 6, 6, 7 | |
+| 2102781500 | b8fca66 (final) | 6 | 791 / 99 / 27 / 6 |
+| 1464630989 | b8fca66 (final) | 6 | 658 / 81 / 17 / 8 |
+| 622097151 | b8fca66 (final) | 5 | 797 / 100 / 25 / 1 |
+| 115930751, 2145370571, 425084029 | 464635e | 5, 5, 5 | |
+| 236340187, 1280290511, 1661764791, 371414021 | uncommitted, b4f6779 | 6, 6, 7, 5 | |
 
-Nothing came within 5 deliveries of the limit, so 12 holds with a wide margin. The one
+(Reports: `results/local/chaos_report*.json`, `results/local/chaos_history/`, and
+`results/local/chaos_failures/`.)
+
+Across all ten 100K runs, nothing came within 5 deliveries of the limit, so 12 holds with
+a wide margin. The one
 count past 12 in any run was a crashy job's lost reclaim (ADR-036, I3). The library
 defaults (10 and 5) are unchanged. Production has no deliberate crash loops, and its
 lease is 30 s.
@@ -1036,6 +1041,12 @@ permits (an `asyncio.Semaphore`), and the timeout covers only the run. It still 
 starting a fresh child after a reset (~0.3 s with spawn). Tested: three 1 s jobs with a
 1.5 s timeout share one child, and none times out.
 
+*Phase 4 review:* a job waiting for a pool permit keeps its lease. Its heartbeat task
+starts in `Worker._process` before `_run_handler` takes the permit. This is tested:
+`test_a_job_waiting_for_a_pool_child_keeps_its_lease` shows Redis idle staying under a
+0.5 s lease while job 2 waits 2.5 s, and it fails if heartbeats start only after the
+permit.
+
 **Consequences.**
 - A job that always hangs costs `max_attempts × timeout` of worker time, then goes to the
   DLQ (tested: 3 attempts, `timeouts` = 3, `dlq_reason` max_attempts).
@@ -1210,8 +1221,9 @@ process pools, multi-process exactly-once).
 *Phase 4: confirmed by Mohammed. Phase 5 CI will call `make check-all`.* The new Phase 4
 tests over ~1 s are `slow` too: crash isolation (real crashing processes), startup
 against an unreachable Redis, the built-in hang handlers, and the verifier's mutation
-checks (two in-process workers, ~1.7 s each). The fast set is 134 tests in ~15 s; the
-full suite is 164 tests in ~72 s.
+checks (two in-process workers, ~1.7 s each). At the Phase 4 gate the fast set was 134
+tests in ~15 s and the full suite 164 in ~72 s. After the review: 149 fast in ~17 s, 182
+in ~86 s.
 
 ---
 
@@ -1260,6 +1272,14 @@ slow-job reclaims are unchanged. The first shared crash puts the companions at d
 2. If they crash together again, they're at 3: suspects, split across workers, never
 again next to the crashy job. So a crash chain costs a companion at most one extra
 delivery beyond the batch reclaim.
+
+*Phase 4 review: capped at `max_deliveries`.* The threshold the scripts use is
+`Settings.suspect_threshold = min(suspect_deliveries, max_deliveries)`. With a lower
+`max_deliveries` (e.g. 2, with the default threshold 3), entries went to the DLQ before
+they could ever be suspects, and the companions followed the crashy job again. The
+crash-isolation test is parametrized over `max_deliveries` {3, 2}; at 2 it failed
+before the cap. With `max_deliveries` 1 every redelivery goes to the DLQ unrun, so no
+suspect can exist; that setting means "never redeliver".
 
 **Consequences.**
 - At most W suspects run at once across W workers. A suspect waits for a free suspect
@@ -1311,8 +1331,8 @@ be lost and "accepted" is unambiguous.
 **Supervisor.** Workers have no restart policy; the orchestrator restarts any worker that
 exited, as ECS would, and counts restarts by exit code (70 = crashy). A deliberately
 killed worker is left down until the injector restarts it. The hold is checked both
-before and after reading container states, because the first debug run caught the
-supervisor double-counting a restart.
+before and after reading container states, because debug run 2 recorded one restart
+with exit code 137 (a deliberate kill, double-counted as a crash).
 
 **Job mix** (`chaos/mix.py`, per 100K jobs):
 - 94.4 % `send_email` with 0–20 ms latency;
@@ -1362,12 +1382,17 @@ enqueue time plus a 20 s tail, so faults hit jobs from the first to the last.
   because their fault phases (32 s and 36 s) were too short. The 100K run's is ~70 s. The
   minimums were not lowered.
 
+**W1, worker health** (added in the Phase 4 review, beyond SPEC): the run fails on any
+worker exit not caused by a crashy job (exit code 70), and on any ERROR or non-JSON line
+in the worker logs. The supervisor restarts every exited worker, so without W1 a worker
+bug (the ADR-038 startup crash was one) passes silently.
+
 **Worker count: 8.** Docker Desktop has 10 CPUs and 7.75 GiB (`docker info`). A saturated
 worker is one busy Python process, about 1 CPU, so 8 workers plus Redis plus Toxiproxy
 fit in 10 CPUs even at saturation. That matters: a starved worker would miss heartbeats
 and lose leases for reasons that aren't scheduled faults. Measured at 2,000 jobs/s
-(`docker stats`, mean of samples, in each report): the whole stack used 3.1–4.3 CPUs,
-the busiest worker 0.65–1.0, Redis 0.1–0.2, and Toxiproxy 0.15–0.3. 12 workers would oversubscribe the machine at saturation
+(`docker stats`, mean of samples, in each committed 100K report): the whole stack used
+3.1–4.8 CPUs, the busiest worker 0.65–1.04, Redis 0.11–0.25, and Toxiproxy 0.14–0.36. 12 workers would oversubscribe the machine at saturation
 for no gain in fault coverage.
 
 **Chaos worker settings.**
@@ -1391,7 +1416,9 @@ go to `chaos/runs/<time>/` (gitignored).
 ## ADR-037: Verifier mutation checks, and why the retry-ownership mutant can't fail them
 
 *Status: accepted (Phase 4: `tests/integration/test_chaos_verifier.py`). The retry-ownership
-point is **for Mohammed's review**: it deviates from SPEC §7's wording.*
+point deviated from SPEC §7's wording; **Mohammed accepted it (2026-09-22)**: the Phase 2
+tests catch the planted bug, and the verifier not seeing it is defence in depth, not a gap.
+SPEC §7 was amended to match.*
 
 **Context.** SPEC §7 wants mutation checks proving the verifier catches bugs:
 - ledger without NX → I2 fails;
@@ -1432,11 +1459,10 @@ enforce it:
 - the Phase 2 script and stale-worker tests (3 fail under this mutant, re-run in Phase 4);
 - the new control test above.
 
-**What Mohammed should decide.** Accept this as the SPEC §7 mutation check for retry
-ownership (the verifier by design sees outcomes, and the defence in depth makes this bug
-outcome-free). Or ask for more: an append-only log of every transition, which would
-let the verifier count runs per attempt. That would be a new piece of instrumentation in
-the hot path, so this ADR doesn't add it unasked.
+**Decision (Mohammed, 2026-09-22).** Accepted as the SPEC §7 mutation check for retry
+ownership. The alternative, an append-only log of every transition so the verifier could
+count runs per attempt, was not adopted: it would add instrumentation to the hot path for
+a bug the Phase 2 tests already catch.
 
 ---
 

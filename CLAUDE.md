@@ -34,7 +34,7 @@ A from-scratch, Celery-style distributed task queue on Redis Streams: at-least-o
 make setup        # uv sync --locked (no pre-commit hooks yet)
 make fmt          # ruff format + safe autofixes
 make check        # fmt-check + lint + typecheck + FAST tests (`-m "not slow"`, ~16 s)
-make check-all    # fmt-check + lint + typecheck + EVERY test (~75 s); what CI must run (Phase 5 confirmed)
+make check-all    # fmt-check + lint + typecheck + EVERY test (~85 s); what CI must run (Phase 5 confirmed)
 make test         # fast pytest set (needs Redis: `make up`; fails, never skips, without it)
 make test-all     # every test, including `slow` (subprocess / process-pool / >1 s tests)
 make up [WORKERS=N] / down   # redis (+ N worker containers from docker/Dockerfile) / down -v

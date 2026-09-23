@@ -3,8 +3,8 @@
 ## Status
 
 - **Current phase:** Phase 4 (the chaos harness: per-worker Toxiproxy, kills, pauses and
-  network faults, a supervisor, verifier I1–I5, mutation tests, and 3 × N=100,000 local
-  runs): **complete**, awaiting Mohammed's review.
+  network faults, a supervisor, verifier I1–I5 + W1, mutation tests, and 3 × N=100,000
+  local runs) plus its post-gate review: **complete**, awaiting Mohammed's review.
 - **Next:** Phase 5 (GitHub Actions CI; it calls `make check-all`, confirmed by Mohammed;
   measure N=1M on a hosted runner to choose per-push vs nightly). Starts on Mohammed's
   go-ahead.
@@ -12,6 +12,123 @@
 - **AWS:** nothing created. Spend to date: $0.
 
 ## Phase log
+
+### Phase 4 review (2026-09-22)
+
+A skeptical post-gate review, asked for by Mohammed: look for correctness bugs, tests or
+verifier rules that can't fail, and doc claims with no result file behind them. Plus a
+specific hypothesis about the flaky test. Every fix was preceded by a failing test or a
+surviving mutant.
+
+**Mohammed's decisions:**
+- ADR-037 accepted as is, and SPEC §7's wording amended to match.
+- `AGENTS.md` (from another tool) deleted.
+
+**Bugs fixed**
+- **The suspect rule didn't cover low `max_deliveries`** (a real bug in the ADR-035 fix).
+  With `max_deliveries` below `suspect_deliveries` (e.g. 2 with the default 3), entries
+  reached the DLQ before they could become suspects, so a crashy job's companions
+  followed it there again.
+  - The existing crash-loop test runs with exactly `max_deliveries=2`, but has no
+    companions.
+  - `test_crash_isolation` is now parametrized over `max_deliveries` {3, 2}. At 2, all 4
+    innocent jobs ended DEAD in both orderings.
+  - Fix: `Settings.suspect_threshold = min(suspect_deliveries, max_deliveries)`.
+- **The verifier ignored sick workers.** The supervisor restarted any worker that exited,
+  so a crash with a traceback (like the ADR-038 startup bug) only showed up to someone
+  reading logs. New check **W1_workers_healthy**: fail on any exit not caused by a
+  crashy job, or any ERROR or non-JSON worker log line.
+
+**Tests that couldn't fail, now fixed.** Nine verifier failure branches had no test that
+made them fail: stray effects, results for jobs never accepted, a non-DEAD job in the DLQ,
+a missing DLQ entry, poison with the wrong attempt count, a wrong reason, hang_forever with
+a non-timeout error, each I5 leftover, and W1. Each now has one. The mutation round then
+showed one of *those* tests couldn't fail either. The I5 "pel" case left its entry in the
+stream too, so the stream check failed first, and a verifier that ignored the PEL still
+passed (MISSED). The case now deletes the pending entry's data, so only the PEL check can
+see it (CAUGHT).
+
+**Doc claims corrected** (each checked against a committed result file):
+- "3.1–4.3 CPUs": 4.3 came from an uncommitted run. The reports are committed now, and
+  the range is restated from them (3.1–4.8).
+- "Consumers pruned 23–34" was the count of log lines; the counter says 37–41.
+- "Duplicate commits suppressed" misnamed `duplicates_suppressed`, which also counts
+  dropped retry/DLQ copies.
+- "Failed 2 of 5 runs": only one of the two failures was ever identified as that test.
+- "The first debug run caught the supervisor double-counting": it was debug run 2.
+- ADR-008's "4 earlier runs" had three uncommitted reports behind it. All 100K reports of
+  the phase are now in `results/local/chaos_history/` or `chaos_failures/`.
+
+**Re-run on the final code.** The verifier changed, so the three 100K acceptance runs
+were redone on `b8fca66`: all PASSED, W1 included (Phase 4 section above). The 464635e
+set stays as history.
+
+**The flaky test: the hypothesis, and what was ruled out.**
+`test_waiting_for_a_pool_child_does_not_count_toward_the_timeout` (1 failure in 6 passes
+at the gate; reclaims in 3 of 39 instrumented probe runs). Mohammed's hypothesis was that heartbeats only start once a
+job gets a pool child, so a job waiting longer than its lease is reclaimed while
+healthy.
+- **Ruled out.** In `Worker._process` the heartbeat task starts before `_run_handler`
+  takes the pool permit. The new `test_a_job_waiting_for_a_pool_child_keeps_its_lease`
+  runs one child and a 0.5 s lease: job 1 spins 2.5 s while job 2 waits for the permit,
+  and a sampler reads both entries' Redis idle time every 20 ms. It passes 8/8, with
+  idle staying under the lease and no reclaims or reruns.
+- **The test really can catch it.** With the hypothesized bug planted (the heartbeat
+  starts inside the permit), it fails: "a lease lapsed: idle reached 612 ms", deliveries
+  up to 3. The file was restored and sha256-verified.
+- **Also ruled out.**
+  - Event-loop stalls: worst 3 ms over 12 runs, one of which reclaimed.
+  - Redis latency events: none ≥ 50 ms in 15 runs, and `aof_delayed_fsync` 0.
+  - A Redis clock jump: a sampler compared Redis `TIME` with the host's monotonic clock
+    every 20 ms for 420 s and 400 s. Worst skew was 36 ms isolated and 60 ms under load
+    (the fast suite running alongside in a loop). A jump would be ≥ 400 ms, the lapse
+    needed.
+- **Not reproduced since.** 0 failures in 80 runs (40 isolated, 40 under that load),
+  against 4 occurrences earlier that evening (the gate failure and 3 probe runs). Every
+  one whose counters were captured came with reclaims (`reclaimed` 1–3). They happened right after heavy chaos
+  runs in Docker Desktop, and a VM-level stall of Redis is the leading unconfirmed
+  suspect.
+- The test's assertions are unchanged. Its failure message now includes
+  `reclaimed`/`lease_lost`/`heartbeats`, so a future failure (in CI, say) says which it
+  was.
+
+**Mutation checks** (review round; scripted, each file restored and sha256-verified):
+
+```
+config: suspect threshold not capped at max_deliveries  -> CAUGHT (3 failed: test_config, crash_isolation[2-*])
+verifier: W1 ignores unexpected exits                   -> CAUGHT
+verifier: W1 ignores error lines                        -> CAUGHT
+verifier: I2 ignores stray effects                      -> CAUGHT
+verifier: I2b ignores results of unaccepted jobs        -> CAUGHT
+verifier: I3 tolerates a missing DLQ entry              -> CAUGHT
+verifier: I3 ignores non-DEAD jobs in the DLQ           -> CAUGHT
+verifier: I3 ignores hang_forever's error               -> CAUGHT
+verifier: I5 ignores the PEL                            -> MISSED, test fixed -> CAUGHT
+worker: heartbeats start only once a pool child is ours -> CAUGHT (keeps_its_lease: idle 612 ms)
+```
+
+**Checked and found fine** (reasoned through, no change):
+- The put-back leaves the entry owned by the reaper that returned it. A stale previous
+  owner's transitions get `LEASE_LOST` either way, and its commit is still first-wins.
+- A suspect task that finishes before `_suspects.add` can't be counted: the add happens
+  synchronously right after `create_task`, before the task first runs.
+- The crashy subtraction in the report's histogram is exact even with lost reclaims:
+  each delivery count is claimed and counted exactly once.
+- The drain only starts after every fault is healed (the injector's tasks are awaited
+  first), and the final SIGTERM drain leaves anything unfinished in the PEL, where I5
+  sees it.
+
+**Evidence**
+
+```
+$ make check-all > log 2>&1; echo "make check-all exit=$?"
+make check-all exit=0
+  68 files already formatted / All checks passed! / Success: no issues found in 61 source files
+  ======================== 182 passed in 86.06s (0:01:26) ========================
+$ make check > log 2>&1; echo "make check exit=$?"
+make check exit=0
+  ===================== 149 passed, 33 deselected in 17.01s ======================
+```
 
 ### Phase 4: Chaos testing harness (2026-09-22)
 
@@ -46,9 +163,10 @@
     now waits.
 - **`max_deliveries` / `max_attempts` sized** for chaos at 12 / 8, with a false-DEAD
   estimate (ADR-008): ≈ 1.5 × 10⁻³ per 100K run, driven by slow jobs. The observed
-  highest delivery of any non-crashy job was 5–7 across all 7 runs.
+  highest delivery of any non-crashy job was 5–7 across all ten 100K runs.
 - **Worker count: 8** (ADR-036). Docker has 10 CPUs and 7.75 GiB; 8 saturated workers plus
-  Redis plus Toxiproxy fit in 10 CPUs. The runs measured 3.1–4.3 CPUs in use.
+  Redis plus Toxiproxy fit in 10 CPUs. The committed 100K runs measured 3.1–4.8 CPUs in
+  use.
 - **Mutation tests** (`test_chaos_verifier.py`): ledger without NX → I2 fails; commit
   without its done check → I2b fails; retry without its ownership check → **the verifier
   can't see it** (ADR-037, below).
@@ -75,41 +193,46 @@ make check-all exit=0
   ======================== 164 passed in 72.17s (0:01:12) ========================
 ```
 
-**N = 100,000, three runs, all PASSED** on code `464635e` (random seeds; raw reports
-`results/local/chaos_report.json`, `chaos_report_run2.json`, `chaos_report_run3.json`).
-The reports say `464635e-dirty`: the only uncommitted files were CLAUDE.md, README.md,
-and docs/DECISIONS.md. `git diff 464635e -- src chaos tests Makefile pyproject.toml
-uv.lock docker` was empty. Reports now list dirty paths themselves. Reproduce with the
-`run.reproduce` command in each report, e.g.
-`uv run python -m chaos.run --jobs 100000 --workers 8 --concurrency 16 --seed 115930751 --rate 2000 --fault-tail 20`.
+**N = 100,000, three runs, all PASSED** on code `b8fca66`, the final Phase 4 code after the
+review (random seeds; raw reports `results/local/chaos_report.json`,
+`chaos_report_run2.json`, `chaos_report_run3.json`). Each report's `run.git` lists its
+dirty paths: PROGRESS.md, docs/DECISIONS.md, docs/SPEC.md, and the renames of the older
+reports into `results/local/chaos_history/`. `git diff b8fca66 -- src chaos tests Makefile
+pyproject.toml uv.lock docker` was empty. Reproduce with each report's `run.reproduce`, e.g.
+`uv run python -m chaos.run --jobs 100000 --workers 8 --concurrency 16 --seed 2102781500 --rate 2000 --fault-tail 20`.
 
 ```
-seed        I1-I5  SUCCEEDED/DEAD  dup results  dup effects  kills pauses net  crash    reclaimed  dup commits  timeouts  pool    max delivery    time
-                                   (log)        (log)                           restarts            suppressed            resets  (non-crashy)
-115930751   PASS   99974 / 26      0            0            7     8      18   36       735        309          384       208     5 (limit 12)    88.6 s
-2145370571  PASS   99974 / 26      0            0            5     5      24   36       849        240          374       187     5               83.9 s
-425084029   PASS   99974 / 26      0            0            6     7      22   36       960        251          375       196     5               82.0 s
+seed        I1-I5+W1  SUCCEEDED/DEAD  dup results  dup effects  kills pauses net  crash    reclaimed  duplicates  timeouts  pool    max delivery   time
+                                      (log)        (log)                           restarts            suppressed            resets  (non-crashy)
+2102781500  PASS      99974 / 26      0            0            6     5      23   36       959        253         388       206     6 (limit 12)   93.5 s
+1464630989  PASS      99974 / 26      0            0            5     7      20   36       800        266         369       188     6              79.6 s
+622097151   PASS      99974 / 26      0            0            5     5      23   36       959        278         373       190     5              85.0 s
 ```
 
 Each run: 100,000 accepted jobs.
 - I1: 99,974 SUCCEEDED and 26 DEAD (20 poison and 3 hang_forever after 8 attempts, 3
   crashy at delivery 13), `late_successes` 0.
 - I2: 97,824 effects logged for the 97,824 jobs with effects, each key exactly once.
-  Effects suppressed: 327 / 261 / 265.
+  Effects suppressed: 326 / 312 / 277.
 - I2b: 99,974 results, one per SUCCEEDED job.
 - I3: the DLQ holds exactly those 26.
 - I5: stream, PEL, and delayed set all 0.
-- Worker logs: 0 ERROR lines. Orphaned threads that finished late: 42–45. Consumers
-  pruned under chaos: 23–34.
+- W1: 0 unexpected worker exits and 0 ERROR or non-JSON log lines.
+- Planned faults skipped (a worker a crashy job had just killed can't be paused or
+  killed): 1 / 0 / 2.
+- Orphaned threads that finished late: 46–47. Consumers pruned under chaos
+  (`consumers_pruned`): 37–41.
+- `duplicates_suppressed` counts every redundant copy the scripts dropped: duplicate
+  commits, and retry or DLQ moves that found the job already terminal.
+- CPU (`docker stats` means): 4.3–4.8 CPUs in total, busiest worker 0.82–0.93, Redis
+  0.23–0.25, Toxiproxy 0.33–0.36. Across all six committed 100K reports it's 3.1–4.8.
 - Run 1's summary as printed:
 
 ```
-==== chaos run PASSED (seed 115930751, 100000 jobs, 8 workers) ====
-  I1_no_loss ok | I2_no_duplicate_effects ok | I2b_no_duplicate_results ok | I3_dlq_correct ok
-  I4_faults_happened ok | I5_drained ok
-  faults {'kills': 7, 'pauses': 8, 'network_windows': 18, ... 'skipped': 0} | crash restarts {'70': 36}
-  processed 99974 dead 26 reclaimed 735 duplicates_suppressed 309 effects_suppressed 327 timeouts 384 lease_lost 62
-  ... excluding crashy jobs: {2: 603, 3: 87, 4: 8, 5: 1} (max 5, max_deliveries 12)
+==== chaos run PASSED (seed 2102781500, 100000 jobs, 8 workers) ====
+  faults {'kills': 6, 'pauses': 5, 'network_windows': 23, ... 'skipped': 1} | crash restarts {'70': 36}
+  processed 99974 dead 26 reclaimed 959 duplicates_suppressed 253 effects_suppressed 326 timeouts 388 lease_lost 66
+  ... excluding crashy jobs: {2: 791, 3: 99, 4: 27, 5: 5, 6: 1} (max 6, max_deliveries 12)
 ```
 
 **Every chaos run of this phase**, including the failures (none was dropped):
@@ -124,13 +247,19 @@ seed 1280290511              b4f6779     100K   PASSED
 seed 1661764791              b4f6779     100K   FAILED: I3 crashy at delivery 14; I4 pauses 2 < 3
                                                 (raw: results/local/chaos_failures/2026-09-22_seed1661764791_I3_I4.json)
 seed 371414021               b4f6779     100K   PASSED
-3 acceptance runs (above)    464635e     100K   PASSED x3
+seeds 115930751, 2145370571, 425084029
+                             464635e     100K   PASSED x3 (the first acceptance set; before W1)
+3 acceptance runs (above)    b8fca66     100K   PASSED x3 (with W1)
 ```
+
+Every one of those reports is committed except the three debug runs:
+`results/local/chaos_history/` holds the pre-commit run, the two passing b4f6779 runs,
+and the 464635e set; `results/local/chaos_failures/` holds the failed run.
 
 The seed-1661764791 failure is written up below. The verifier's I3 expectation was wrong
 and the fault plan left I4 to chance; the system was right. Both were fixed with
-tests, I4's minimums were not lowered, and the three acceptance runs are the next ones
-after that fix.
+tests, and I4's minimums were not lowered. The 464635e set was the next three runs
+after that fix; the b8fca66 set was the next three after the review's fixes.
 
 Mutation checks. Scripted, one bug at a time, each file restored and sha256-verified:
 
@@ -184,7 +313,7 @@ ADR-037.
 - Chaos settings (lease 2 s, `max_deliveries` 12, `max_attempts` 8, 16 slots per worker)
   are the chaos run's, not new library defaults.
 
-**Open issues**
+**Open issues** (as of the gate; the review below updates the first one)
 - **A flaky Phase 3 test, found by this phase's repeat runs:**
   `test_waiting_for_a_pool_child_does_not_count_toward_the_timeout` failed 1 of 6 passes
   of the new-test set.
@@ -925,10 +1054,26 @@ pytest exit (redis up)=0
   4. The supervisor could count a deliberately killed worker as crashed if the kill was
      healed between its two reads. It now checks the hold before and after reading
      states.
-  5. That same stale-retry test asserted exact reclaim counts. Under load it failed 2 of
-     5 runs (`reclaimed` 2): the needless retry sometimes lands on A, and B then reclaims
-     it too. It now asserts the mutant's actual signature (`retried` = 1) and the
+  5. That same stale-retry test asserted exact reclaim counts. Under load it failed with
+     `reclaimed` 2 (`assert 2 == 1`): the needless retry sometimes lands on A, and B
+     then reclaims it too. (A draft said "2 of 5 runs". Only one of that loop's two
+     failures was identified as this test; the other wasn't captured.) It now asserts the mutant's actual signature (`retried` = 1) and the
      verifier's verdict, which don't depend on timing.
   6. Reports marked the tree dirty for untracked files (e.g. an `AGENTS.md` that isn't
      part of the project), and then for doc edits made during the runs. They now say
      which tracked paths differ, and PROGRESS states the code diff was empty.
+- **2026-09-22 (Phase 4 review): my own fix had a hole, and my own verifier had tests that
+  couldn't fail.**
+  - ADR-035's suspect rule starts at delivery 3. Nothing stopped `max_deliveries` from
+    being lower, and at 2 the rule never triggered, so the false-DEAD bug was back. The
+    crash-isolation test only ever ran with `max_deliveries` 3.
+  - Nine verifier failure branches had never been shown failing. When they got tests, one
+    of the new tests couldn't fail either: it put a PEL entry in the stream too, so the
+    stream check did all the work. A mutant caught it.
+  - The docs quoted numbers from uncommitted reports and misread a log-line count as a
+    counter.
+  - Lessons:
+    - A fix with a threshold needs a test at the threshold's boundary with the other
+      limits.
+    - A test for a check must make that check the *only* thing that can fail.
+    - Every number in the docs gets traced to a committed file before it's written.

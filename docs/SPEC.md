@@ -256,7 +256,7 @@ Phases 0–6 are local and cost $0. Phases 7–8 cost money and require explicit
 - **Mutation checks (prove the verifier catches bugs), as automated tests:**
   - bypass the ledger's NX check → I2 must fail;
   - bypass the commit's `done` check → I2b must fail;
-  - bypass the ownership check in the retry script → I1 must fail (or I2/I2b), under the stale-worker scenario.
+  - bypass the ownership check in the retry script → the Phase 2 stale-worker and script tests must fail. The chaos verifier is *not* expected to fail here: the retry's terminal-state check, the entry's `XDEL`, first-wins commit, and the ledger each absorb a non-owner retry, so no outcome changes (defence in depth). An automated test must still show the mutant is live under the stale-worker window and what the verifier sees (DECISIONS.md ADR-037; amended 2026-09-22 per Mohammed).
 - **Long runs:** a chaos run can exceed Claude Code's ~10-minute command limit. Run it in the background (or detached), write progress to a log file, and poll it. Never let a long run get killed partway and report a partial result as a pass.
 - **Acceptance:** a local chaos run at N=100,000 passes (show the report summary), and the mutation tests pass. **STOP.**
 
