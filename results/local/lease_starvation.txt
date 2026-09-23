@@ -1,0 +1,8 @@
+# uv run python bench/lease_starvation.py   (2026-09-22, macOS laptop, Redis 8.8.3 via `make up`)
+# lease (visibility_timeout) 1000 ms, heartbeat_interval 200 ms; idle sampled every ~20 ms
+cpu_task, process pool run 1: job ran 2706 ms, max PEL idle 202 ms (lease 1000), 118 samples
+cpu_task, process pool run 2: job ran 2594 ms, max PEL idle 199 ms (lease 1000), 113 samples
+cpu_task, process pool run 3: job ran 2718 ms, max PEL idle 206 ms (lease 1000), 118 samples
+hog_on_loop (control)  run 1: job ran 2501 ms, max PEL idle 2491 ms (lease 1000), 109 samples
+hog_on_loop (control)  run 2: job ran 2502 ms, max PEL idle 2484 ms (lease 1000), 102 samples
+hog_on_loop (control)  run 3: job ran 2501 ms, max PEL idle 2491 ms (lease 1000), 109 samples

@@ -38,6 +38,8 @@ make test         # pytest (needs Redis: `make up`; fails, never skips, without 
 make up / down    # docker compose up --wait / down -v (redis only so far; toxiproxy, workers later)
 uv run ftq worker                 # run one worker (FTQ_* env config; SIGTERM drains)
 uv run ftq enqueue TYPE --payload JSON [--idempotency-key K]
+uv run ftq dlq list [--limit N]   # DLQ entries as JSON lines
+uv run ftq dlq requeue JOB_ID... | --all   # back on the stream, attempt 0, same job_id
 make chaos N=...  # chaos run + verifier → results/local/chaos_report.json   [stub until Phase 4]
 make bench ...    # local load test + charts                               [stub until Phase 6]
 make aws-plan / aws-up / aws-bench / aws-down / aws-verify-clean   # BILLABLE except plan/verify [stubs until Phase 7]

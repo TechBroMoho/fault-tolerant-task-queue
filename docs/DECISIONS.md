@@ -169,7 +169,9 @@ lease. It isn't a loss, but it's one more source of redelivery for ADR-008's siz
 
 ## ADR-007: Slow non-heartbeating jobs must stay between 1× and about 2× the lease
 
-*Status: planned (lease/reaper in Phase 2; chaos job mix in Phase 4).*
+*Status: partly implemented (Phase 2: the `slow` handler, registered with
+`heartbeat=False`; a test shows it is reclaimed mid-run and its effect still happens once).
+The duration distribution lands with the Phase 4 chaos mix.*
 
 **Context.** The chaos mix includes slow jobs that don't heartbeat, so their lease is guaranteed
 to expire (SPEC §7, Phase 4). Every reclaim by `XAUTOCLAIM` increments the delivery count. A job
@@ -212,7 +214,8 @@ against the fault counts before calling it a bug. Never "fix" it by weakening I1
 
 ## ADR-009: A late success deletes the job's DLQ entry
 
-*Status: planned (DLQ in Phase 2).*
+*Status: accepted (Phase 2: commit.lua step 1b returns LATE_SUCCESS;
+`test_late_success_replaces_dead_and_removes_dlq_entry`).*
 
 **Context.** SPEC §4 recommends that a late success (a slow owner commits after the job was
 moved to the DLQ) replaces `DEAD` with `SUCCEEDED`, because the work was actually done. But the
@@ -233,9 +236,9 @@ own test.
 
 ## ADR-010: TTLs on `done` / terminal-state keys must outlast any possible redelivery
 
-*Status: partly implemented (Phase 1: `FTQ_DONE_TTL_SECONDS`, default 7 days, `0` = never
-expire, applied to done and ledger keys; tests run with 0). The validation of the full
-relation lands in Phase 2, once lease/attempt/backoff knobs exist to validate against.*
+*Status: accepted (Phase 1: `FTQ_DONE_TTL_SECONDS`, default 7 days, `0` = never expire,
+applied to done and ledger keys; tests run with 0. Phase 2: the relation below is
+validated by `Settings`, see the Phase 2 note at the end of this entry).*
 
 **Context.** `done:{job_id}` is what makes a redelivered commit a suppressed duplicate. If it
 expires while a copy of the job can still be delivered (a paused zombie worker, a long retry
@@ -252,6 +255,15 @@ chaos verifier also reads terminal-state keys after the drain.
 **Consequences.** Memory grows with the number of distinct jobs until TTLs expire. That's
 acceptable locally (1M small keys is on the order of 100 MB) and is covered by the `maxmemory`
 cap (ADR-013).
+
+*Phase 2 note.* `Settings.job_lifetime_bound` = `max_attempts × (max_deliveries ×
+visibility_timeout + job_backoff_cap)`: every attempt can be delivered `max_deliveries`
+times, each after a full lease, then wait up to the backoff cap. A non-zero
+`done_ttl_seconds` must be at least **10×** that, or the config is rejected. Defaults:
+5 × (10 × 30 s + 300 s) = 3000 s, so the 7-day TTL passes easily. Two things this bound does
+**not** cover, documented rather than validated: time a job waits undelivered in a
+backlog, and a job that heartbeats for a very long time (both extend a job's life without
+redeliveries). DEAD records never expire: they live as long as their DLQ entry (ADR-027).
 
 ---
 
@@ -527,7 +539,8 @@ removed, 2 fail.
 
 ## ADR-022: Worker fetch loop, in-flight cap, and graceful shutdown
 
-*Status: accepted (Phase 1: `worker.py`, `cli.py`). Concurrency is tuned in Phase 3.*
+*Status: accepted (Phase 1: `worker.py`, `cli.py`). Phase 2 resolved the three "Phase 1
+limits" below (ADR-027, ADR-029, ADR-028). Concurrency is tuned in Phase 3.*
 
 **Context.** A worker must bound its in-flight work, never leave fetched jobs unattended, and
 on SIGTERM (what `docker stop` and ECS send) finish what it has without taking more.
@@ -564,3 +577,292 @@ on SIGTERM (what `docker stop` and ECS send) finish what it has without taking m
 - `cpu_task` runs on the event loop and blocks it while hashing. Phase 2 must make sure a
   CPU-bound handler can't starve the heartbeat task (or document the limit).
 
+
+---
+
+## ADR-023: Leases are PEL idle time; the reaper runs inside the fetch loop
+
+*Status: accepted (Phase 2: `reclaim.lua`, `reaper.py`, `Worker._reap`).*
+
+**Context.** A crashed, stalled, or partitioned worker leaves its entries in the PEL. Some
+other worker must notice and take them over without violating the in-flight cap.
+
+**Options.**
+1. **A separate reaper task** that claims on its own timer. It can claim while every slot is
+   busy. Claimed entries then sit unworked in this worker's PEL, age past the lease again, and
+   get reclaimed again, inflating delivery counts toward a false DEAD (ADR-008).
+2. **The reaper inside the fetch loop**: each iteration, if a pass is due, `XAUTOCLAIM` at most
+   `free` entries (the same free-slot count the `XREADGROUP` uses), start them, then read new
+   entries into the slots that are left.
+3. Redis 8.8's `XREADGROUP … CLAIM`: excluded by ADR-004 (classic commands only).
+
+**Decision.** (2).
+- The lease is the entry's idle time; `XAUTOCLAIM min-idle-time = visibility_timeout`
+  (default 30 s, like SQS's default visibility timeout). Reaper passes run every
+  `reap_interval` (5 s); if the scan cursor says more PEL is left, the next pass runs on the
+  next loop iteration.
+- `reclaim.lua` wraps `XAUTOCLAIM` so that each claimed entry's **delivery count** (from
+  `XPENDING`) comes back in the same round trip, and the `reclaimed` counter is bumped
+  atomically with the claim. The worker sends an entry whose count exceeds `max_deliveries`
+  to the DLQ unrun (ADR-027).
+- A busy worker (no free slots) doesn't reap: it couldn't run what it claimed. Workers with
+  spare capacity reap instead.
+- `XAUTOCLAIM`'s third reply element (pending ids whose stream entry is gone) is logged at
+  ERROR. Our exits always ack before deleting, so it should never happen.
+
+**Consequences.**
+- Recovery latency after a crash is at most `visibility_timeout + reap_interval` plus
+  however long it takes until some worker has a free slot. When every worker is saturated,
+  stale jobs wait like any queued job.
+- Lease length trade-off (SPEC §10): a short lease recovers crashed jobs faster but turns
+  more stalls (GC pauses, network blips) into reclaims and suppressed duplicates. Heartbeats
+  (ADR-025) decouple job duration from the lease, so the lease only has to cover a
+  heartbeat interval plus Redis latency hiccups. 30 s with 10 s heartbeats tolerates two
+  consecutive missed beats.
+
+---
+
+## ADR-024: Ownership-checked transitions: XPENDING first, then LEASE_LOST or TERMINAL
+
+*Status: accepted (Phase 2: `heartbeat.lua`, `retry.lua`, `dead.lua`, `transitions.py`).*
+
+**Context.** `XACK` and `XCLAIM` don't check who owns an entry (ADR-001). A worker that
+stalled past its lease and then resumes still holds the entry id. Without a check it could
+schedule a retry of a job another worker already committed, move it to the DLQ, or
+heartbeat the lease back from the new owner (SPEC §4).
+
+**Decision.** Every non-commit transition is one Lua script that starts with
+`XPENDING <stream> <group> <id> <id> 1` and compares the owner with the caller:
+- **Not the owner** (or no longer pending): change nothing except the `lease_lost` counter,
+  and return `LEASE_LOST`.
+- **Owner, but the job already has a terminal state** (retry and dead only): another copy of
+  the same job_id finished first. That happens with the duplicate entries a re-sent `XADD`
+  creates (ADR-006). Ack and delete this copy, count it in `duplicates_suppressed`, and
+  return `TERMINAL`. Retrying would re-run a finished job, and a DLQ move would overwrite
+  SUCCEEDED or create a second DLQ entry.
+- **Owner, non-terminal**: do the transition.
+- Commit is deliberately *not* ownership-checked: it is first-wins on the done key, so any
+  holder may commit (SPEC §4, ADR-021).
+- **Re-send after a lost reply:** the first run acked the entry, so a re-send returns
+  `LEASE_LOST` and changes nothing (ADR-006).
+- **Deviation from SPEC §4's wording:** the heartbeat has no terminal-state check. SPEC asks
+  every non-commit change to check both. But a heartbeat only moves the lease clock: it
+  can't overwrite an outcome, so there's nothing for that check to protect. Returning
+  TERMINAL would stop heartbeats on a redundant copy, making the lease lapse and adding a
+  reclaim; the copy's commit is suppressed either way.
+- **A worker that loses its lease keeps running the handler.** It stops heartbeating. Its
+  commit is first-wins, and its retry or DLQ move would be refused. We considered
+  cancelling the handler: that's unsafe for arbitrary handler code, impossible for a
+  process-pool job, and it saves only redundant work.
+
+**Consequences.** The stale-worker test runs all three ways a stale worker can resume
+(retry refused, DLQ move refused, commit suppressed) and ends with one terminal state, one
+result, and one effect each time. A unit test checks that no write precedes the `XPENDING`
+check in any of the three scripts. Mutation checks: see PROGRESS.md, Phase 2.
+
+---
+
+## ADR-025: Heartbeats: `XCLAIM … JUSTID` to self, one task per job, opt-out per handler
+
+*Status: accepted (Phase 2: `heartbeat.lua`, `Worker._heartbeat_loop`).*
+
+**Context.** A job longer than the lease must keep its lease, or it's reclaimed and run twice.
+
+**Options.** (a) `XCLAIM <me> 0 <id> JUSTID`: resets idle; (b) `XCLAIM` without `JUSTID`:
+also resets idle but **increments the delivery counter**, so each heartbeat would push the job
+toward max_deliveries; (c) a separate lease key with a TTL: more state that could disagree
+with the PEL, which is what XAUTOCLAIM actually reads.
+
+**Decision.** (a), after the ownership check (ADR-024). Verified on Redis 8.8.3: idle goes to
+~0 and the delivery count is unchanged. `test_heartbeat_resets_idle_without_bumping_delivery_count`
+asserts both.
+- Every job gets a heartbeat task running beside its handler, every `heartbeat_interval`
+  (default 10 s). The config requires `2 × heartbeat_interval ≤ visibility_timeout`, so one
+  lost beat never expires a healthy lease.
+- `register(..., heartbeat=False)` opts a handler out. The `slow` chaos handler uses it so
+  its lease is guaranteed to lapse (ADR-007).
+- A heartbeat that fails with a Redis error is logged, and the loop tries again next
+  interval. On `LEASE_LOST` it stops (ADR-024).
+
+**Consequences.**
+- The heartbeat runs on the event loop, so anything that blocks the loop starves it. That's
+  why blocking handlers go to pools (ADR-028).
+- **Limitation: a handler that hangs forever while its worker is healthy keeps its lease
+  forever.** It is never reclaimed and never DEAD: stuck, not lost (it stays in the PEL and
+  shows up in `XPENDING`). A per-handler timeout that counts as a failed attempt is future
+  work. It's simple for async handlers (`asyncio.wait_for`), but needs a kill for
+  process-pool jobs. No Phase 4 chaos job hangs forever.
+
+---
+
+## ADR-026: Retries: full-jitter backoff, a delayed sorted set, and an atomic scheduler
+
+*Status: accepted (Phase 2: `backoff.py`, `retry.lua`, `schedule.lua`, `scheduler.py`).*
+
+**Context.** A handler that raises should run again later, not immediately, and a burst of
+failures shouldn't come back as a synchronized wave.
+
+**Options.** (a) sleep in the worker, then rerun: holds a slot and the lease, and a crash
+loses the timer; (b) re-`XADD` immediately with a "not before" field: workers would spin
+re-reading jobs that aren't due; (c) a **sorted set scored by due time**, plus a mover.
+
+**Decision.** (c).
+- `retry.lua` (ownership-checked) copies the entry's own fields, bumps `attempt`, and `ZADD`s
+  the JSON-encoded field list scored by `now + delay` on Redis's clock (ADR-020). Then it
+  acks and deletes the entry. The retry is exactly the enqueued job, with the same job_id,
+  idempotency key, and `enqueued_at_ms`, so end-to-end latency includes the retries.
+- Delay: `random(0, min(cap, base × 2^attempt))`, AWS's "full jitter". It is computed in
+  Python so the formula is unit-tested with a seeded RNG. Defaults: base 1 s, cap 300 s.
+- `schedule.lua` moves up to `scheduler_batch` due members into the stream in one atomic
+  step, so every worker can run the mover concurrently without double moves. A test runs
+  ten racing schedulers over 200 retries. The mover runs every `scheduler_interval`
+  (0.5 s), so a retry fires at most that late. A full batch triggers another pass
+  immediately.
+- `max_attempts` counts handler runs (first try + retries). A retry is a fresh stream
+  entry, so the delivery count restarts at 1 for each attempt, and a job's total runs are
+  bounded by `max_attempts × max_deliveries`.
+
+**Consequences.** The delayed set is part of the queue's depth (SPEC §4 backpressure counts
+`XLEN + ZCARD delayed`). Two copies of one job failing at the same attempt produce the
+identical member, which `ZADD` collapses into one retry.
+
+---
+
+## ADR-027: The DLQ: a stream, a DEAD terminal state, four reasons, and requeue by job_id
+
+*Status: accepted (Phase 2: `dead.lua`, `requeue.lua`, `dlq.py`, `ftq dlq list|requeue`).*
+
+**Context.** SPEC §4 needs two poison paths (max attempts, max deliveries), a DLQ holding the
+job with its last error, attempts, and time, and a CLI to list and requeue.
+
+**Decision.**
+- **One DLQ-writing script, `dead.lua`** (ownership-checked), for four reasons:
+  `max_attempts` (the handler kept raising), `max_deliveries` (the entry kept being
+  redelivered, i.e. the job keeps crashing its worker), `malformed` (unparseable entry),
+  and `unknown_type` (no handler registered). The last two go straight to the DLQ:
+  retrying can't help, it only burns attempts.
+- **max_deliveries is checked by the worker** before it runs a reclaimed entry: count >
+  `max_deliveries` means DLQ, unrun. It could live inside `reclaim.lua`, but then two
+  scripts would write DLQ entries. Keeping one costs a round trip only on this rare path.
+- **The DLQ entry** is the job's original fields verbatim plus `dlq_job_id`, `dlq_reason`,
+  `dlq_error`, `dlq_attempts` (handler runs started), `dlq_deliveries`, `dlq_dead_at_ms`,
+  `dlq_worker_id`, and `dlq_source_entry_id`. A malformed entry without a job_id gets
+  `entry:<entry id>`.
+- **The terminal state DEAD** goes in the job's done hash with `dead_entry_id`. It has **no
+  TTL**: a DEAD record lives as long as its DLQ entry. DEAD never replaces SUCCEEDED
+  (ADR-024). A late success replaces DEAD and deletes the DLQ entry (ADR-009).
+- **`requeue <job_id>`** (`requeue.lua`, atomic): only if the state is DEAD, re-add the
+  job's fields with `attempt = 0`, delete the DLQ entry, clear the DEAD record. The job
+  keeps its job_id, so the ledger still suppresses effects that already happened: a
+  requeued job that charged a card before failing won't charge it again (tested).
+  `--all` pages through the DLQ with an exclusive start id, so an entry that can't be
+  requeued isn't retried forever.
+
+**Consequences.** The DLQ holds exactly the jobs whose state is DEAD, which keeps chaos
+invariant I3 simple. `max_deliveries` defaults to 10 for now; Phase 4 sizes it against the
+fault schedule (ADR-008).
+
+---
+
+## ADR-028: Blocking and CPU-bound handlers run in a thread or process pool
+
+*Status: accepted (Phase 2: `Registry.register_sync`, `Worker._run_handler`, `cpu_task`).*
+
+**Context.** Heartbeats (ADR-025), the fetch loop, and every Redis call share the worker's
+event loop. Phase 1's `cpu_task` hashed on the loop: during a long run nothing else on the
+loop ran, the heartbeat couldn't fire, the lease lapsed, and a reaper would take a healthy
+job away (a duplicate run, and a step toward a false DEAD). Measured with a 1 s lease
+(`bench/lease_starvation.py`, raw output in `results/local/lease_starvation.txt`): a 2.5 s
+loop-blocking job's PEL idle time reached **~2490 ms**, the whole run, with no heartbeat in
+between. The same kind of work as a process-pool `cpu_task` peaked at **199 to 206 ms**, one
+heartbeat interval, in 3 of 3 runs.
+
+**Options.**
+1. **Keep it on the loop and make the lease longer than the longest job.** Crash recovery
+   then takes as long as the longest job, which defeats heartbeats.
+2. **Threads for everything.** Pure-Python CPU work holds the GIL; the loop gets it back at
+   every switch interval (5 ms), so heartbeats would limp along. But CPU jobs gain no
+   parallelism, and loop latency degrades for every other job.
+3. **Heartbeats on their own OS thread with a sync Redis client.** That survives a blocked
+   loop, but it keeps a lease alive for a loop that is stuck, i.e. it hides a hung worker.
+   The lease should mean "the loop that will commit this job is alive".
+4. **A process pool for CPU-bound work and a thread pool for blocking I/O**, with async
+   handlers staying on the loop.
+
+**Decision.** (4). `registry.register_sync(type, pool="process" | "thread")` for a plain
+function `fn(job: Job) -> result`, run via `loop.run_in_executor`.
+- Sync handlers get the `Job` only: it's picklable, and the ledger (an async Redis client)
+  belongs to the loop. A job that computes and has an effect is an async handler that
+  offloads the computation itself, or two jobs.
+- **Process pool:** size `process_pool_size` (default 2), created on first use. It uses the
+  **`spawn`** start method on every OS: forking a process that runs an event loop and
+  Redis connections copies them in an undefined state, and spawn is the macOS default
+  anyway, so laptop and Linux containers behave alike. Spawn re-imports the parent's main
+  module, which is why `ftq/__main__.py` now has an `if __name__ == "__main__"` guard.
+  Children ignore SIGINT, so Ctrl-C drains the worker instead of failing the jobs.
+  Registration rejects nested functions, which can't be pickled by import path.
+- **A dead pool child** (killed, or crashed the interpreter) raises `BrokenProcessPool`. The
+  worker replaces the pool, and the jobs that were running in it count as failed attempts.
+- **Shutdown past the grace period** terminates the pool's children. Otherwise the
+  interpreter would wait for them at exit, and the grace period wouldn't bound shutdown
+  (tested). Python 3.12 has no public API for this, so we use the pool's private process
+  map; 3.14's `terminate_workers()` is the public equivalent.
+- **Thread pool:** one thread per slot (`concurrency`), so a blocking handler never waits
+  for a thread. A thread can't be killed, so an abandoned blocking handler keeps the
+  process alive until it returns, and `docker stop` escalates to SIGKILL.
+- `cpu_task` is now a process-pool handler.
+
+**Consequences.**
+- Process-pool jobs pay for pickling the job and result, plus IPC. That goes in the Phase 6
+  benchmark. CPU throughput per worker now scales with `process_pool_size`.
+- An async handler that blocks the loop is still possible (a user bug). The control test
+  documents the symptom: the lease lapses under a healthy worker.
+- Tests: a real `ftq worker` subprocess runs a `cpu_task` for over two leases while a
+  second worker's reaper is armed. The entry's PEL idle time, sampled from the test process,
+  never reaches the lease, and the job is never reclaimed. The same measurement on a
+  loop-blocking handler shows the lease lapsing. A thread-pool blocking-I/O job also keeps
+  its lease.
+
+---
+
+## ADR-029: Prune idle consumers only when they own zero pending entries
+
+*Status: accepted (Phase 2: `prune_consumers.lua`, `Reaper.prune_consumers`, the worker's
+maintenance loop).*
+
+**Context.** Consumer names are unique per process (ADR-022), so every worker restart leaves
+a consumer record in the group, and they accumulate. `XGROUP DELCONSUMER` removes one, but
+it also **discards the consumer's pending entries**. Those entries leave the PEL, no
+`XAUTOCLAIM` can ever find them, and the jobs are silently lost. A crashed worker's consumer
+is precisely an idle consumer that still owns entries.
+
+**Options.**
+1. Never prune. Safe, but records grow without bound across restarts (small, but `XINFO` gets
+   noisy, and chaos runs restart workers constantly).
+2. Prune by idle time alone. That loses the jobs of any crashed consumer whose entries
+   haven't been reclaimed yet (all workers busy, or a lease longer than the prune
+   threshold).
+3. **Prune only consumers that own no pending entries, with the check and the delete in one
+   Lua script.**
+4. Stable consumer names (e.g. the container name), so restarts reuse one record. But an
+   old container still draining and its replacement would share a name. The ownership
+   check (ADR-024) can't tell them apart, and one could heartbeat or retry the other's
+   entries.
+
+**Decision.** (3). `prune_consumers.lua` lists consumers (`XINFO CONSUMERS`). For each one
+idle ≥ `consumer_prune_idle` (default 1 h) that isn't the caller, it asks the PEL directly
+(`XPENDING <stream> <group> - + 1 <consumer>`) and calls `DELCONSUMER` only if that returns
+nothing. The script is atomic, so no read or claim can hand the consumer an entry between
+the check and the delete. Every worker runs it every `consumer_prune_interval` (60 s) and
+at startup. The idle threshold only avoids churning live consumers; the pending check is
+what makes deletion safe. On Redis 7.2+, `idle` means time since the last *attempted*
+interaction, so a live worker blocked in `XREADGROUP` stays under `block_ms`. The config
+requires the threshold to exceed `block_ms`.
+
+**Consequences.** A crashed worker's record stays until a reaper has moved all its entries
+away; then it's pruned at the next pass once its idle time passes the threshold. Tests: a
+consumer with pending work survives repeated passes with its entry, owner, and delivery
+count intact, and the entry is then reclaimed and completed. The same consumer is pruned
+by a live worker once it owns nothing, and a running worker prunes empty consumers while
+leaving a crashed one's job in the PEL. A unit test requires the PEL check to come before
+the `DELCONSUMER` call. Mutation check: see PROGRESS.md, Phase 2.
