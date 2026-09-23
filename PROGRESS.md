@@ -86,6 +86,9 @@
   commandstats, the io-threads knob, and repeats; the loadgen measurement code is
   unchanged otherwise. Each report's `meta.git` has its commit.
 
+- CI on the pushed code: [run 35854003589](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35854003589)
+  (903229c): check, docker (the image now carries `bench/`), and chaos 100K all passed.
+
 **Scaling** (saturated, completed jobs/s in the 30 s window; two sessions, ADR-042 §4):
 
 ```
