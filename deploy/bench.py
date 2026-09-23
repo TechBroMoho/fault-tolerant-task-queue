@@ -23,6 +23,7 @@ the dev Redis.
 
 import argparse
 import base64
+import contextlib
 import gzip
 import json
 import logging
@@ -367,17 +368,23 @@ class AwsBackend:
             within,
             self._poll,
         )
-        # awslogs is non-blocking: the last lines can land a few seconds after the stop.
+        # awslogs is non-blocking: the lines can land well after the stop. Exit 0 or 1
+        # means the loadgen wrote its report and the dump ran, so a report IS coming:
+        # wait for all of it. (Phase 8: an early version accepted a log that simply
+        # hadn't arrived yet, 0 lines, as "no report", and lost scaling/w02's.)
+        code = self._task(coord)["containers"][0].get("exitCode")
         coord_log: list[str] = []
 
         def report_arrived() -> bool:
             nonlocal coord_log
             coord_log = self._logs(coord)
-            return decode_report(coord_log) is not None or not any(
-                line.strip() == "REPORT-BEGIN" for line in coord_log
-            )
+            return decode_report(coord_log) is not None
 
-        _wait("the coordinator's report in CloudWatch", report_arrived, 60, self._poll)
+        if code in (0, 1):
+            with contextlib.suppress(RuntimeError):  # still missing: reported as FAILED
+                _wait("the coordinator's report in CloudWatch", report_arrived, 180, self._poll)
+        else:
+            coord_log = self._logs(coord)
         return PairResult(
             self._task(coord)["containers"][0].get("exitCode"),
             self._task(prod)["containers"][0].get("exitCode"),
@@ -571,6 +578,73 @@ def run_session(
     return outcomes
 
 
+# ---------------------------------------------------------------- recover
+
+
+def _filter_streams(backend: AwsBackend, pattern: str, since_ms: int) -> list[str]:
+    """Log streams in /ftq/loadgen with an event matching `pattern` since `since_ms`."""
+    streams: set[str] = set()
+    token = ""
+    while True:
+        args = [
+            "logs", "filter-log-events", "--log-group-name", "/ftq/loadgen",
+            "--start-time", str(since_ms), "--filter-pattern", pattern,
+        ]  # fmt: skip
+        if token:
+            args += ["--next-token", token]
+        page = json.loads(backend._aws(*args))
+        streams |= {e["logStreamName"] for e in page.get("events", [])}
+        token = page.get("nextToken", "")
+        if not token:
+            return sorted(streams)
+
+
+def recover(backend: AwsBackend, out_dir: Path, since_ms: int) -> dict[str, str]:
+    """For each point that has a snapshot but no report (the driver ran it, then failed
+    to read the report), find the coordinator's log in CloudWatch by its label, decode
+    THAT run's report, check it is that point's, and save it marked as recovered. Never
+    reruns anything: this is the same run's data, read again."""
+    outcomes: dict[str, str] = {}
+    for snap in sorted(out_dir.glob("*/*.services.json")):
+        label = snap.name.removesuffix(".services.json")
+        suite = snap.parent.name
+        out = snap.with_name(f"{label}.json")
+        if out.exists():
+            continue
+        key = f"{suite}/{label}"
+        found: list[tuple[str, dict[str, Any], list[str]]] = []
+        for stream in _filter_streams(backend, f'"producing for" "({label})"', since_ms):
+            lines = backend._logs("x/" + stream.rsplit("/", 1)[-1])
+            report = decode_report(lines)
+            if report and (report["meta"].get("suite"), report["meta"].get("label")) == (
+                suite,
+                label,
+            ):
+                found.append((stream, report, lines))
+        if len(found) != 1:
+            outcomes[key] = f"NOT RECOVERED: {len(found)} matching coordinator logs"
+            continue
+        stream, report, lines = found[0]
+        report["meta"]["recovered"] = (
+            f"read back from CloudWatch stream {stream} after the driver's log-fetch race "
+            "(ADR-048): the same run, not a rerun"
+        )
+        run_id = report["meta"].get("run_id", "")
+        producers = _filter_streams(backend, f'"{run_id}"', since_ms) if run_id else []
+        prod_lines = backend._logs("x/" + producers[0].rsplit("/", 1)[-1]) if producers else []
+        snap.with_name(f"{label}.coordinator.txt").write_text(
+            backend.scrub("\n".join(x for x in lines if not x.startswith("R:")))
+        )
+        snap.with_name(f"{label}.producer.txt").write_text(backend.scrub("\n".join(prod_lines)))
+        out.write_text(backend.scrub(json.dumps(report, indent=1)) + "\n")
+        once = report["exactly_once"]
+        outcomes[key] = (
+            f"recovered: {report['throughput']['completed_per_s']:.0f}/s, exactly-once "
+            f"{once['ok']}, hosts {report['producers']['hosts']['reported']}/2"
+        )
+    return outcomes
+
+
 # ---------------------------------------------------------------- CLI
 
 
@@ -602,7 +676,8 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     d = SessionSpec()
     p = argparse.ArgumentParser(prog="python -m deploy.bench", description=__doc__.split("\n")[0])
-    p.add_argument("cmd", choices=["plan", "run"])
+    p.add_argument("cmd", choices=["plan", "run", "recover"])
+    p.add_argument("--since-min", type=float, default=240, help="recover: look back this far")
     p.add_argument("--backend", choices=["aws", "local"], default="aws")
     p.add_argument("--out", type=Path, default=RESULTS)
     p.add_argument("--deadline-min", type=float, default=120)
@@ -624,6 +699,13 @@ def main(argv: list[str] | None = None) -> None:
     points = session_points(_spec(a))
     if a.cmd == "plan":
         cmd_plan(points, a.per_hour)
+        return
+    if a.cmd == "recover":
+        from deploy.aws import _stack_outputs as outputs
+
+        since = int((time.time() - a.since_min * 60) * 1000)
+        for key, outcome in recover(AwsBackend(outputs()), a.out, since).items():
+            print(f"  {key:<28} {outcome}")
         return
     backend: Backend
     if a.backend == "aws":

@@ -275,14 +275,19 @@ class FakeAws:
                 {"tasks": [{"lastStatus": "STOPPED", "containers": [{"exitCode": 0}]}]}
             )
         if args[:2] == ["logs", "get-log-events"]:
-            return json.dumps({"events": [], "nextForwardToken": "t"})
+            # Every task exits 0, so like a real run each stream holds a dumped report
+            # (the driver waits for one after exit 0). First page only; then the end.
+            lines = [] if "--next-token" in args else _dump_lines(_report())
+            return json.dumps({"events": [{"message": m} for m in lines],
+                               "nextForwardToken": "t"})  # fmt: skip
         raise AssertionError(f"unexpected call {cmd}")
 
 
 def test_the_pair_runs_on_two_different_loadgen_hosts() -> None:
     fake = FakeAws()
     backend = AwsBackend({"cluster": "ftq", "loadgen_task_definition": "td"}, fake, poll_s=0)
-    backend.run_pair(["coord"], ["prod"], within=5)
+    pair = backend.run_pair(["coord"], ["prod"], within=5)
+    assert decode_report(pair.coordinator_log) == _report()
     (host_a, cmd_a), (host_b, cmd_b) = fake.started
     assert host_a != host_b
     assert {host_a, host_b} <= {"arn:ci/A", "arn:ci/B", "arn:ci/C"}
@@ -315,3 +320,65 @@ def test_a_failed_flush_stops_the_session() -> None:
     backend._run = failing
     with pytest.raises(RuntimeError, match="flush exited 1"):
         backend.flush()
+
+
+def _dump_lines(report: dict[str, Any]) -> list[str]:
+    import base64
+    import gzip
+
+    data = base64.b64encode(gzip.compress(json.dumps(report).encode())).decode()
+    return ["loadgen completed", "REPORT-BEGIN", "R:" + data, "REPORT-END"]
+
+
+def test_a_log_that_has_not_arrived_yet_is_waited_for() -> None:
+    """Phase 8 scaling/w02: CloudWatch had delivered 0 lines when the driver first read
+    the coordinator's log. Exit 0 means a report is coming: wait for it."""
+    fake = FakeAws()
+    reads = iter([[], [], _dump_lines({"ok": 1})])  # empty twice, then the whole log
+    original = fake.__call__
+
+    def slow_logs(cmd: list[str]) -> str:
+        if cmd[1:3] == ["logs", "get-log-events"]:
+            if "--next-token" in cmd:
+                return json.dumps({"events": [], "nextForwardToken": "t"})
+            lines = next(reads, [])
+            return json.dumps({"events": [{"message": m} for m in lines],
+                               "nextForwardToken": "t"})  # fmt: skip
+        return original(cmd)
+
+    backend = AwsBackend({"cluster": "ftq", "loadgen_task_definition": "td"}, slow_logs, 0)
+    pair = backend.run_pair(["coord"], ["prod"], within=5)
+    assert decode_report(pair.coordinator_log) == {"ok": 1}
+
+
+def test_recover_reads_back_the_same_runs_report_and_marks_it(tmp_path: Path) -> None:
+    (tmp_path / "scaling").mkdir()
+    (tmp_path / "scaling" / "w02.services.json").write_text("{}")  # ran, but no report
+    mine = {**_report(), "meta": {"suite": "scaling", "label": "w02", "run_id": "rid"}}
+    other = {**_report(), "meta": {"suite": "headline", "label": "w02", "run_id": "x"}}
+    streams = {"loadgen/loadgen/aaa": _dump_lines(other), "loadgen/loadgen/bbb": _dump_lines(mine),
+               "loadgen/loadgen/ccc": ["producing (run rid)"]}  # fmt: skip
+    fake = FakeAws()
+    original = fake.__call__
+
+    def logs(cmd: list[str]) -> str:
+        if cmd[1:3] == ["logs", "filter-log-events"]:
+            pattern = cmd[cmd.index("--filter-pattern") + 1]
+            coordinators = ["loadgen/loadgen/aaa", "loadgen/loadgen/bbb"]
+            names = ["loadgen/loadgen/ccc"] if "rid" in pattern else coordinators
+            return json.dumps({"events": [{"logStreamName": n} for n in names]})
+        if cmd[1:3] == ["logs", "get-log-events"]:
+            name = cmd[cmd.index("--log-stream-name") + 1]
+            if "--next-token" in cmd:
+                return json.dumps({"events": [], "nextForwardToken": "t"})
+            return json.dumps({"events": [{"message": m} for m in streams[name]],
+                               "nextForwardToken": "t"})  # fmt: skip
+        return original(cmd)
+
+    backend = AwsBackend({"cluster": "ftq", "loadgen_task_definition": "td"}, logs, 0)
+    outcomes = bench.recover(backend, tmp_path, since_ms=0)
+    assert outcomes["scaling/w02"].startswith("recovered: 15000/s")
+    saved = json.loads((tmp_path / "scaling" / "w02.json").read_text())
+    assert saved["meta"]["run_id"] == "rid"  # the scaling run's, not headline's w02
+    assert "loadgen/loadgen/bbb" in saved["meta"]["recovered"]
+    assert "run rid" in (tmp_path / "scaling" / "w02.producer.txt").read_text()
