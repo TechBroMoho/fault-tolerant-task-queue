@@ -59,3 +59,53 @@ async def test_crashy_that_ran_past_max_deliveries_fails_i3(
     i3 = await _i3(r, settings, keys, job_id, crashes=MAX_DELIVERIES + 1)  # one crash too many
     assert i3["ok"] is False
     assert "ran past max_deliveries" in i3["violations"][0]
+
+
+# ---------------------------------------------------------------- I1 and I4
+
+
+async def _normal(r: aioredis.Redis, s: Settings, keys: Keys, state: str | None) -> str:
+    """One `normal` job that ended in `state` (None: no terminal state at all), with
+    its result and effect logged if it succeeded."""
+    await r.xgroup_create(keys.stream, s.group, id="0", mkstream=True)
+    job_id = "normal-1"
+    if state is not None:
+        await r.hset(keys.done(job_id), mapping={"state": state})
+    if state == "SUCCEEDED":
+        await r.xadd(keys.results, {"job_id": job_id})
+        await r.xadd(keys.effects, {"key": f"send_email:{job_id}"})
+    return job_id
+
+
+@pytest.mark.parametrize(("state", "ok"), [("SUCCEEDED", True), ("DEAD", False), (None, False)])
+async def test_i1_requires_the_terminal_state_the_kind_must_end_in(
+    r: aioredis.Redis, settings: Settings, keys: Keys, state: str | None, ok: bool
+) -> None:
+    job_id = await _normal(r, settings, keys, state)
+    report = await verify(r, keys, settings.group, {job_id: "normal"}, 8, MAX_DELIVERIES)
+    assert report["invariants"]["I1_no_loss"]["ok"] is ok
+
+
+async def test_i1_fails_on_a_late_success(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    """Every kind that may die can never succeed, so a late success means some job was
+    DEAD for a while: not allowed in a chaos run."""
+    job_id = await _normal(r, settings, keys, "SUCCEEDED")
+    await r.hset(keys.stats, "late_successes", 1)
+    report = await verify(r, keys, settings.group, {job_id: "normal"}, 8, MAX_DELIVERIES)
+    assert report["invariants"]["I1_no_loss"]["ok"] is False
+
+
+async def test_i4_fails_when_a_fault_minimum_is_not_met(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    job_id = await _normal(r, settings, keys, "SUCCEEDED")
+    for name in ("reclaimed", "duplicates_suppressed", "timeouts"):
+        await r.hset(keys.stats, name, 1)
+    enough = {"kills": 3, "pauses": 3, "network_windows": 6, "pool_resets": 1, "crash_restarts": 1}
+    for evidence, ok in ((enough, True), ({**enough, "pauses": 2}, False)):
+        report = await verify(
+            r, keys, settings.group, {job_id: "normal"}, 8, MAX_DELIVERIES, evidence
+        )
+        assert report["invariants"]["I4_faults_happened"]["ok"] is ok, evidence

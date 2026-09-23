@@ -97,6 +97,8 @@ def _args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def _git_rev() -> str:
+    """HEAD's short hash, with "-dirty(<paths>)" if tracked files differ from it, so a
+    report says exactly which code it ran."""
     try:
         rev = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -111,8 +113,9 @@ def _git_rev() -> str:
             text=True,
             cwd=REPO_ROOT,
             check=True,
-        ).stdout.strip()
-        return rev + ("-dirty" if dirty else "")
+        ).stdout.splitlines()
+        paths = ",".join(line[3:] for line in dirty)
+        return rev + (f"-dirty({paths})" if dirty else "")
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
 

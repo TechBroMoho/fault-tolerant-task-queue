@@ -203,9 +203,12 @@ async def test_retry_without_the_ownership_check_is_invisible_to_the_verifier(
     s = fast(settings, max_attempts=MAX_ATTEMPTS)
     accepted = await run_stale_retry_window(r, s, keys)
     counters = await read_counters(r, keys)
-    assert counters["reclaimed"] == 1
-    # The mutant acted: A's stale retry was scheduled and deleted B's entry. (B's next
-    # heartbeat then finds the entry gone: that is the one lease_lost.)
-    assert (counters["retried"], counters["lease_lost"]) == (1, 1)
+    # The mutant acted: A's stale retry was scheduled (the control schedules none) and
+    # deleted B's entry, so B's next heartbeat found it gone (lease_lost). Exact reclaim
+    # counts vary with timing: if A itself fetches the needless attempt 1, it stalls
+    # without heartbeats and B reclaims that entry too.
+    assert counters["retried"] == 1
+    assert counters["lease_lost"] >= 1
+    assert counters["reclaimed"] >= 1
     result = await check(r, s, keys, accepted)
     assert result["_report"]["passed"], result["_report"]["invariants"]

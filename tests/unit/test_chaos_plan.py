@@ -4,15 +4,21 @@ import random
 from collections import Counter
 
 from chaos import faults
+from chaos.verifier import Minimums
 
 
 def test_every_kind_is_planned_often_enough_for_i4_even_in_a_short_run() -> None:
     # A 100K run once drew only 2 pauses and failed I4 (PROGRESS.md, Phase 4). The
-    # opening rounds now guarantee each kind, stretching a short run's plan to fit.
+    # opening rounds now guarantee each kind, stretching a short run's plan to fit, with
+    # one to spare over I4's minimums in case a fault is skipped.
+    need = Minimums()
     for seed in range(500):
         plan = faults.plan(random.Random(seed), workers=8, lease=2.0, span=10.0)
-        counts = Counter(f.kind for f in plan)
-        assert min(counts[k] for k in faults.KINDS) >= faults.OPENING_ROUNDS, (seed, counts)
+        counts: Counter[str] = Counter(f.kind for f in plan)
+        assert counts["kill"] > need.kills, (seed, counts)
+        assert counts["pause"] > need.pauses, (seed, counts)
+        assert sum(counts[k] for k in faults.NETWORK) > need.network_windows, (seed, counts)
+        assert all(counts[k] >= 2 for k in faults.NETWORK), (seed, counts)
 
 
 def test_one_fault_per_worker_at_a_time_and_at_most_half_the_workers() -> None:
