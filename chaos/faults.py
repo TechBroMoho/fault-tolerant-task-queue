@@ -47,6 +47,11 @@ OPENING_ROUNDS = 4
 # After a fault is healed, leave its worker alone this long (a killed worker needs a
 # moment to restart) before it can be picked again.
 _SETTLE_S = 2.0
+# A kill or pause aimed at a worker that is down (a crashy job just killed it) waits for
+# the supervisor to restart it, retrying this often for up to this long. Skipping it
+# instead let a CI run execute 2 of 4 planned kills and fail I4 (PROGRESS.md, Phase 6).
+_RETRY_FOR_S = 10.0
+_RETRY_INTERVAL_S = 0.5
 
 
 @dataclass(frozen=True)
@@ -116,6 +121,8 @@ class Injector:
         self.held_down: set[str] = set()  # killed on purpose: the supervisor leaves these
         self.executed: list[dict[str, Any]] = []
         self.skipped: list[dict[str, Any]] = []
+        self.retry_for = _RETRY_FOR_S
+        self.retry_interval = _RETRY_INTERVAL_S
 
     async def run(self, faults: list[Fault], t0: float) -> None:
         await asyncio.gather(*(self._one(f, t0) for f in faults))
@@ -123,18 +130,36 @@ class Injector:
     async def _one(self, f: Fault, t0: float) -> None:
         loop = asyncio.get_running_loop()
         await asyncio.sleep(max(0.0, t0 + f.at - loop.time()))
-        started = loop.time() - t0
-        try:
-            await self._apply(f)
-        except Exception as exc:  # e.g. pausing a worker a crashy job just killed
-            self.skipped.append({**asdict(f), "reason": str(exc)[:300]})
-            log.info("fault skipped: %s worker-%d (%s)", f.kind, f.worker, exc)
-            return
+        give_up = loop.time() + self.retry_for
+        attempts = 0
+        while True:
+            attempts += 1
+            started = loop.time() - t0
+            try:
+                await self._apply(f)
+                break
+            except Exception as exc:  # e.g. killing a worker a crashy job just killed
+                # A kill or pause needs a running container. The supervisor restarts a
+                # crashed worker within about a second, so wait for it. The hold was
+                # released (_apply), so the supervisor is free to do that.
+                if f.kind in ("kill", "pause") and loop.time() < give_up:
+                    await asyncio.sleep(self.retry_interval)
+                    continue
+                self.skipped.append({**asdict(f), "attempts": attempts, "reason": str(exc)[:300]})
+                log.info("fault skipped: %s worker-%d (%s)", f.kind, f.worker, exc)
+                return
+        if attempts > 1:
+            log.info("fault: %s worker-%d applied on attempt %d", f.kind, f.worker, attempts)
         log.info("fault: %s worker-%d for %.1fs", f.kind, f.worker, f.duration)
         await asyncio.sleep(f.duration)
         await self._heal(f)
         self.executed.append(
-            {**asdict(f), "started": round(started, 3), "healed": round(loop.time() - t0, 3)}
+            {
+                **asdict(f),
+                "started": round(started, 3),
+                "healed": round(loop.time() - t0, 3),
+                "attempts": attempts,
+            }
         )
 
     async def _apply(self, f: Fault) -> None:
