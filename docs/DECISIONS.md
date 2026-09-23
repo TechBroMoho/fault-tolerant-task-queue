@@ -1669,6 +1669,9 @@ and 16 GB (`nproc`, `docker info`, both recorded in every chaos report).
   "chaos tests run on every push via GitHub Actions (100K jobs), with a nightly
   1M-job run: 0 lost jobs and 0 duplicate results". Only once the nightly 1M runs have a
   record of passing (so far: one pass on c20d0fd).
+  - **Outcome (Phase 9):** 10 of 10 1M runs passed, all dispatched by hand (the nightly
+    hasn't fired yet), 3 of them on the final code. The final bullet keeps "every code
+    change" (100K) and the 1M count apart (RESULTS.md, "Resume bullets").
 - GitHub disables scheduled workflows in a public repo after 60 days with no activity,
   so the nightly run needs re-enabling if the repo goes quiet.
 - A red `ci` badge means a real failure: no retries.
@@ -1773,6 +1776,8 @@ public) and the load generator runs as an ECS task.
     "a worker got slower per job" from "a worker got less CPU".
   - For Phase 8, container CPU should come from the ECS task-metadata stats endpoint
     (free; to be verified then). The Redis and loadgen numbers already work there.
+    **Not done:** Phase 8 sampled only Redis's CPU and the producers' own; worker CPU on
+    AWS wasn't measured (RESULTS.md, "What was not measured").
 - **Every point starts from nothing:** `docker compose down -v`, a fresh Redis (AOF
   everysec, `noeviction`, 4 GB cap: ADR-013's settings with room for about a million
   jobs' keys), and N fresh workers. The loadgen waits until all N consumers have
@@ -2142,8 +2147,9 @@ aws-*`). Nothing applied yet except the budget.*
 
 ## ADR-046: Can one 2-vCPU host offer enough load? Measure it first; the fallback layout
 
-*Status: proposed (Phase 7). Answers Mohammed's question 3. The deciding measurement runs
-in the Phase 7 session.*
+*Status: accepted (Phase 7): Mohammed chose L2' (2 loadgen hosts, 18 vCPUs). Outcome in
+Phase 8: every point had 2/2 hosts reporting and a backlog ≥ 18,508 in its window, so the
+load generator never limited throughput; Redis's main thread did (96 % at 12 workers).*
 
 **What Phase 6 measured (local, Docker Desktop on Apple Silicon; `results/local/bench/summary.json`).**
 - Loadgen CPU per accepted job: **24–54 µs** in every saturated or high-rate point
@@ -2306,8 +2312,8 @@ second, independent loadgen on the same queue would break its exactly-once check
 
 ## ADR-048: The Phase 8 driver: reset, scale, snapshot, run the pair, save
 
-*Status: accepted (Phase 8 prep: `deploy/bench.py`, `make aws-bench`,
-`aws-bench-plan`, `aws-bench-local`). Not yet run on AWS.*
+*Status: accepted, and used for all 10 Phase 8 points (three sessions; see "Outcome on
+AWS" below and ADR-049 for two changes made afterwards).*
 
 **Per point:**
 1. Scale the worker service to 0, then FLUSHALL (a one-off task on a loadgen host).
@@ -2412,3 +2418,92 @@ second, independent loadgen on the same queue would break its exactly-once check
     `recover` looks for.
   - 6 new tests; mutants caught: no retry (2 tests fail), retry every call (2), stderr
     dropped (2), snapshot written after the pair as before (1: the new test).
+
+---
+
+## ADR-049: The Phase 6–8 review: what was wrong, and the fixes
+
+*Status: accepted (after Phase 8, before Phase 9; asked for by Mohammed: correctness bugs,
+tests that don't test what they're named for, claims without a raw result file).*
+
+**Method.** Every Phase 8 number in PROGRESS was recomputed from the raw reports (all
+matched, including the headline median 19,240 and spread 1.4 %). So was every Phase 6
+number (all matched). The review read the load generator's verdict and window logic, the
+driver, `verify-clean`, and the tests of each, and planted mutants where a test's name
+promised more than its assertions.
+
+**Findings and fixes (each fix has a test that fails without it):**
+1. **`verify-clean` failed open on the Terraform state.** If `terraform state list`
+   errored for any reason (a lock, a broken init), the count was taken as 0, so the check
+   could print CLEAN without having read the state. Now only Terraform's own "No state
+   file was found!" counts as 0; any other error is NOT CLEAN. `verify-clean` had no
+   tests at all; it has 4 now (a fake AWS CLI and Terraform). The old behaviour, planted
+   as a mutant, fails 2 of them. Re-run on the real account: CLEAN.
+2. **The benchmark's exactly-once verdict was only half tested.** Its conditions are
+   drained, nothing missing, no duplicate result, empty DLQ, and all hosts reported. The
+   tests covered "not drained", "missing", and "a host didn't report". Deleting the
+   duplicate or the DLQ condition left all 19 loadgen and analysis tests green (both
+   checked). `tests/unit/test_loadgen_verdict.py` pins each condition; both mutants now
+   fail it. The verdict is also documented as a count check, not a set check (the chaos
+   verifier is the set check).
+3. **The in-flight cap wasn't in the AWS reports.** SPEC §9 wants it stated next to the
+   throughput. It was 50 (the Terraform default at each run's commit, with no override in
+   the recorded plans), but only the code says so. The driver's per-point snapshot now
+   records the worker task definition's image tag and `FTQ_*` settings (Redis address
+   left out). This can't be fixed retroactively; RESULTS.md says so.
+4. **The 1M chaos record was on older code.** All seven passing 1M runs predate the
+   connection-pool fix (ADR-044, `src/ftq/config.py`) and the injector's wait-for-restart
+   (ADR-043). PROGRESS said "the current queue code", which stopped being true at 7d4cc22.
+   Three 1M runs were dispatched on 190344c (the final queue and harness code; $0 on
+   GitHub-hosted runners). Results in RESULTS.md.
+5. **Phase 8 follow-ups (asked for):** the driver waits once, before the first point
+   that runs, until the Redis task is RUNNING and its health check (`redis-cli ping`) is
+   HEALTHY. Part 3's first attempt failed its FLUSHALL because it started 13 s after
+   apply. Tested through the states a fresh stack goes through; 5 mutants caught. The
+   AWS backpressure chart (`results/aws/backpressure.png`) draws depth against the
+   watermarks and offered / accepted / completed per second, with the window shaded.
+
+**Checked and found sound:** the window arithmetic and nearest-rank percentiles
+(`bench/analysis.py`); latency counted only for jobs enqueued in the window, and measured
+after a full drain, so slow jobs aren't left out; the multi-host handshake and its "a
+silent host is never ok" rule; read-only retries limited to an allowlist; account ids
+scrubbed from every saved file; the local config table matches `Settings` (now enforced
+by a test).
+
+**Not changed, stated instead:** the block-mode "offered" rate is what producers managed
+to submit while waiting, not their schedule (the chart draws the schedule separately);
+the AWS latencies are queueing at saturation; the nightly 1M hasn't fired yet.
+
+---
+
+## ADR-050: Past one Redis main thread: how sharding would work (design note, not built)
+
+*Status: design note only (SPEC §2 lists Redis Cluster sharding as a non-goal but
+welcomes a note). Motivated by Phase 8: one Redis main thread caps the queue at ~19K
+jobs/s on AWS.*
+
+**What's already in place.** Every key of a queue shares the hash tag `{<queue>}`
+(ADR-018), so on Redis Cluster a whole queue lives in one slot. Every Lua script touches
+one queue's keys only, so all of today's atomicity holds per shard unchanged. Different
+queues already spread across shards for free.
+
+**One hot queue across shards.** Split queue `q` into `k` sub-queues `q#0 … q#k-1`, each a
+full ftq queue with its own stream, group, delayed set, DLQ, done keys, and logs.
+- **Producers** pick a sub-queue per job: hash of the idempotency key if there is one (so
+  a duplicate enqueue lands on the same shard and is still recognised), otherwise round
+  robin. Backpressure becomes per shard, which is a slightly looser global bound
+  (k × high watermark).
+- **Workers** read from all k streams (or from a subset, to keep connections down), with
+  the in-flight cap shared across them.
+- **Unchanged:** ownership checks, first-wins commit, and the ledger. A job never moves
+  between shards; a retry goes back to its own sub-queue's delayed set.
+- **The effect ledger** is keyed by effect key, not job, so it needs its own hash tag
+  choice. Keeping it in the job's shard is enough for effects created by jobs of one
+  sub-queue; effects shared across queues would need the ledger on a shard of its own,
+  one extra round trip per effect.
+
+**Expected gain and what to measure first.** Throughput should scale with the number of
+shards until the workers or the network are the limit. Before building it: Redis 8's
+`io-threads` on a dedicated host (not measured on AWS; ADR-042) and commit batching
+(ADR-032) both cut main-thread time per job on one Redis, at less complexity.
+

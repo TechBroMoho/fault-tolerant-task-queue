@@ -2,25 +2,99 @@
 
 ## Status
 
-- **Current phase:** Phase 8, **all 10 points saved** (2026-09-23). Results, the
-  12-worker describe-services evidence, and the AWS scaling chart are committed;
-  teardown verified CLEAN at 21:00:14 UTC. Awaiting Mohammed's review (phase gate).
-  - The points came from three sessions: points 1–3 (w01, w02, w04) from part 1,
-    w08 through w12_reject from part 2, and w12_block from a separate part 3.
-    `results/aws/README.md` has the details.
-- **Headline (12 workers, 3 × 300 s):** median **19,240 jobs/s** (19,106 to 19,367),
-  exactly-once True in all three. Redis's main thread is 96% busy: it's the ceiling,
-  from 8 workers up (w08 19,194/s, w12 19,426/s).
-- **Backpressure at 1.5 × the headline (28,859/s offered):** reject refused 1,424,186
-  jobs; block made producers wait 73,325 times. Depth ≤ 199,670 in both; exactly-once
-  True in both.
-- **TODO:** re-check the spend after ~24 h. The budget's ActualSpend was still $0.00 at
-  20:32 UTC (last refreshed 14:22 UTC, before any of today's sessions).
+- **Current phase:** Phase 9 (polish and hand-off) **done** (2026-09-23), after a
+  Phase 6–8 review. Awaiting Mohammed's review at the final phase gate. Committed, not
+  pushed.
+- **Headline (AWS, 12 workers, 3 × 300 s):** median **19,240 jobs/s** (19,106 to
+  19,367), exactly-once in all three. Redis's main thread (96 %) is the ceiling from 8
+  workers up.
+- **Backpressure at 1.5 × the headline:** reject refused 1,424,186 jobs; block made
+  producers wait 73,325 times; depth ≤ 199,670; exactly-once in both.
+- **Chaos:** **10 of 10 1M-job runs passed** on GitHub Actions (3 on the final code,
+  190344c). 100K on every push.
+- **Proposed resume bullets:** `docs/RESULTS.md`, "Resume bullets".
+- **TODO (Mohammed):**
+  - push (CI runs on the new commits; the README's links and charts go live);
+  - re-check the AWS spend after ~24 h (Budgets ActualSpend $0.00 at 21:20 UTC, last
+    refreshed 14:22 UTC, before any session);
+  - see whether tomorrow's 09:23 UTC nightly 1M fires.
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
 - **AWS spend to date ≈ $1.56** (list prices, estimates): Phase 7 $0.06, Phase 8 part 1
-  $0.26, part 2 $1.13, part 3 $0.11.
+  $0.26, part 2 $1.13, part 3 $0.11. Free plan credits: $140.00 remaining (2026-09-23
+  21:20 UTC), plan ends 2027-03-19. Nothing is left running (verify-clean CLEAN,
+  re-checked in the review).
 
 ## Phase log
+
+### Phase 9: README, RESULTS.md, the chaos recording, resume bullets (2026-09-23, $0)
+
+**Built**
+- **README** rewritten to SPEC §7 Phase 9: what/why, a Mermaid architecture diagram,
+  guarantees and non-guarantees, a 3-command quickstart (`make up`, `make chaos`, `make
+  bench`), results with both AWS charts, how the chaos test works, limitations and
+  future work. The CLI usage and the configuration table stay (a new test keeps the table
+  equal to `Settings`).
+- **`docs/RESULTS.md`**: SPEC §9's evidence table (measured value, definition,
+  environment, raw file, reproduce command, date for each claim), the methodology, the
+  AWS, chaos, and local results, cost, and what was not measured. Every number links to
+  its raw file.
+- **Terminal recording:** `make chaos-record` (asciinema 2.4.0 via `uvx`, pinned, not a
+  project dependency) → `results/local/chaos_demo.cast`: 100K jobs, 8 workers, seed
+  2034644800, code 190344c, **PASSED** (8 kills, 6 pauses, 21 network faults, 1,079
+  reclaimed, 283 duplicates suppressed). `chaos/cast_text.py` writes the transcript
+  GitHub can show (`chaos_demo.txt`).
+- **`chaos/summary.py`:** RESULTS.md's chaos table, generated from the reports.
+- **DECISIONS:** ADR-046 and ADR-048 statuses brought up to date; ADR-041's open item
+  marked "not done"; ADR-049 (the review below); ADR-050 (a design note on sharding past
+  one Redis main thread).
+
+**Acceptance: fresh clone → `make setup && make check && make chaos`**, in a clone of
+d3e76c2 in the scratchpad, after `make down` (the dev Redis was empty). `make check`
+needs Redis, so the sequence was `make setup && make up && make check && make chaos`:
+
+```
+uv sync --locked            Resolved 46 packages / Installed 45 packages
+make check                  All checks passed! ... 213 passed, 43 deselected in 22.43s
+make chaos (N=10000, 8 workers, seed 494000142)
+  ==== chaos run PASSED ====  I1 I2 I2b I3 I4 W1 I5 ok; kills 4, pauses 4, network 16;
+  processed 9992 dead 8 reclaimed 174 duplicates_suppressed 20
+EXIT=0
+```
+
+### Phase 6–8 review (2026-09-23, $0)
+
+Asked for by Mohammed: a skeptical pass over Phases 6–8 for correctness bugs, tests that
+don't test what they're named for, and claims with no raw result file. Full write-up:
+ADR-049.
+
+- **Recomputed every Phase 8 and Phase 6 number in this log from the raw reports.** All
+  match (headline median 19,240, spread 1.4 %; backpressure refusals, waits, and depths;
+  the local scaling, latency, and backpressure tables).
+- **Fixed, test first:**
+  1. `verify-clean` failed open: an errored `terraform state list` counted as 0
+     resources. It now fails unless the error is "No state file was found!". It had no
+     tests; it has 4. The old code as a mutant fails 2. Re-run on the account: CLEAN.
+  2. The benchmark's exactly-once verdict: removing its duplicate-result or DLQ
+     condition left all 19 loadgen/analysis tests green (checked). New
+     `test_loadgen_verdict.py` catches both.
+  3. The in-flight cap (50) wasn't in the AWS reports (SPEC §9). The driver's snapshot
+     now records the worker task definition's image tag and `FTQ_*` settings.
+  4. The 1M chaos record predated the final code (7d4cc22 changed `src/`, 35eb8fd
+     changed the injector); this log called it "the current queue code". Three 1M runs
+     were dispatched on 190344c: **all 3 PASSED** (runs [35921059844](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35921059844), [35921067352](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35921067352), [35921074863](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35921074863); reports `results/ci/chaos_report_run3592*_N1M_w4.json`). The record is now 10 of 10
+     1M runs, 3 on the final code. One of them reached a delivery count of 10 for a
+     non-crashy job (the others 6–8), against `max_deliveries` 12: still inside ADR-008,
+     but the smallest margin yet.
+- **The two Phase 8 follow-ups:** the driver now waits for a RUNNING + HEALTHY Redis task
+  before the first point (5 mutants caught; `make aws-bench-local` 6/6 points
+  exactly-once on the new code); `results/aws/backpressure.png`.
+
+```
+$ make check-all > log 2>&1; echo "make check-all exit=$?"
+make check-all exit=0
+  94 files already formatted / All checks passed! / Success: no issues found in 84 source files
+  ======================= 256 passed in 133.10s (0:02:13) ========================
+```
 
 ### Phase 8 session, part 3: backpressure/w12_block only (2026-09-23)
 
@@ -1699,11 +1773,25 @@ pytest exit (redis up)=0
 
 ## Things that went wrong
 
+- **2026-09-23 (review): `verify-clean` could say CLEAN without reading the Terraform
+  state.** Any error from `terraform state list` counted as 0 resources. It never
+  mattered in practice (every session's state list succeeded), but it's the check that
+  guards the account, and it had no tests. Lesson: a safety check must fail when it
+  can't look.
+- **2026-09-23 (review): a claim in this log went stale without anyone editing it.**
+  "7 of 7 1M runs on the current queue code" was true when written; the next `src/`
+  commit (7d4cc22) made it false. Lesson: a claim tied to "current code" names the
+  commit, and the final claims were re-run on the final code.
+- **2026-09-23 (review): half the benchmark's exactly-once verdict was untested.** Two
+  of its five conditions could be deleted with every test still green. The Phase 6
+  mutation list had covered the conditions that were easiest to trigger end to end.
+
 - **2026-09-23 (Phase 8 part 3): the driver started before Redis was up.** I launched
   it 13 s after `terraform apply` returned; apply doesn't wait for ECS tasks, and the
   FLUSHALL got "connection refused". Cost: ~40 s of stack time, nothing measured.
   Parts 1 and 2 had got away with the same race. Lesson: wait for the redis service's
   runningCount = 1 before starting the driver (the driver itself could check this).
+  Done in the review: the driver now waits for a RUNNING + HEALTHY Redis task.
 - **2026-09-23 (Phase 8 part 2): the driver crashed twice on one intermittent AWS CLI
   error, and a crash loses the point's snapshot.** `aws ecs describe-tasks` exited 255
   twice in this session (the same call by hand: exit 0). The driver has no retry for a

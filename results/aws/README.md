@@ -18,5 +18,6 @@ c7i-flex.large. Account ids are scrubbed.
   anything. The loadgen and worker code is the same (`git diff 7510107 3d43177 -- src
   bench/loadgen.py docker pyproject.toml uv.lock` is empty).
 - **12 running workers:** `evidence/describe-services-12-workers.json`.
-- **Chart and table:** `scaling.png` and `summary.md` (`python -m bench.plot --aws`).
+- **Charts and table:** `scaling.png`, `backpressure.png` and `summary.md` (`python -m
+  bench.plot --aws`). Methodology and every claim: `docs/RESULTS.md`.
 - `phase7/`: the Phase 7 smoke test and loadgen probes.
