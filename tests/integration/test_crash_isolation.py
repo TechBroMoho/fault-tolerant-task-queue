@@ -29,21 +29,24 @@ from .helpers import entries, hash_of, start_worker_process
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio, pytest.mark.slow]
 
 CRASH_EXIT_CODE = 70
+# suspect_deliveries stays at its default (3).
 ENV = {
     "FTQ_VISIBILITY_TIMEOUT": "0.5",
     "FTQ_HEARTBEAT_INTERVAL": "0.1",
     "FTQ_REAP_INTERVAL": "0.05",
-    "FTQ_MAX_DELIVERIES": "3",
-    "FTQ_SUSPECT_DELIVERIES": "3",
 }
 # Enough for the crash chain in either design (the old one needs 4 workers).
 MAX_WORKERS = 6
 
 
+# max_deliveries 2 is below the default suspect threshold: the Phase 4 review found that
+# entries then reached the DLQ before they could ever count as suspects (ADR-035).
+@pytest.mark.parametrize("max_deliveries", [3, 2])
 @pytest.mark.parametrize("crashy_position", ["first", "last"])
 async def test_jobs_fetched_with_a_crashing_job_are_not_dead_lettered_with_it(
-    r: aioredis.Redis, settings: Settings, keys: Keys, crashy_position: str
+    r: aioredis.Redis, settings: Settings, keys: Keys, crashy_position: str, max_deliveries: int
 ) -> None:
+    env = {**ENV, "FTQ_MAX_DELIVERIES": str(max_deliveries)}
     # One batch, so the first worker fetches all five in one XREADGROUP. The innocents
     # have some latency, so they are all mid-run (awaiting) when the crashy job kills the
     # process. The crashy job's position decides whether it is the first or the last of
@@ -63,7 +66,7 @@ async def test_jobs_fetched_with_a_crashing_job_are_not_dead_lettered_with_it(
     crashes = 0
     survivor: asyncio.subprocess.Process | None = None
     for _ in range(MAX_WORKERS):
-        proc, _worker_id = await start_worker_process(settings, env=ENV)
+        proc, _worker_id = await start_worker_process(settings, env=env)
         exited = asyncio.ensure_future(proc.wait())
         deadline = asyncio.get_running_loop().time() + 20
         while not exited.done() and asyncio.get_running_loop().time() < deadline:
@@ -87,8 +90,9 @@ async def test_jobs_fetched_with_a_crashing_job_are_not_dead_lettered_with_it(
     assert final[crashy_id] == "DEAD"
     [(_id, dead)] = await entries(r, keys.dead)
     assert (dead["dlq_job_id"], dead["dlq_reason"]) == (crashy_id, "max_deliveries")
-    assert dead["dlq_deliveries"] == "4"  # killed 3 workers, dead-lettered unrun on the 4th
-    assert crashes == 3
+    # It killed max_deliveries workers and was dead-lettered unrun on the next delivery.
+    assert dead["dlq_deliveries"] == str(max_deliveries + 1)
+    assert crashes == max_deliveries
     # Each innocent's email went out exactly once.
     effects = [f["key"] for _id, f in await entries(r, keys.effects)]
     assert sorted(effects) == sorted(f"send_email:{j}" for j in innocent_ids)

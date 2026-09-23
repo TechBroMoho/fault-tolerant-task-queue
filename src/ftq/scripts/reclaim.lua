@@ -11,8 +11,9 @@
 -- ARGV[4]  scan cursor (an entry id; '0-0' starts from the beginning of the PEL)
 -- ARGV[5]  max entries to claim (the caller's free slots, so the in-flight cap holds)
 -- ARGV[6]  suspect slots: how many suspects the caller may take now (0 or 1)
--- ARGV[7]  suspect threshold: an entry whose delivery count (after this claim) is at
---          least this, and at most ARGV[8], is a suspect (ADR-035)
+-- ARGV[7]  suspect threshold (Settings.suspect_threshold, never above max_deliveries): an
+--          entry whose delivery count (after this claim) is at least this, and at most
+--          ARGV[8], is a suspect (ADR-035)
 -- ARGV[8]  max_deliveries (an entry past it goes to the DLQ unrun: never a suspect)
 --
 -- Returns {next_cursor, {{entry_id, {field, value, ...}, delivery_count}, ...}, deleted_ids}.

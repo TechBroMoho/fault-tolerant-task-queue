@@ -278,6 +278,14 @@ class Settings(BaseSettings):
         return self.max_attempts * per_attempt
 
     @property
+    def suspect_threshold(self) -> int:
+        """The delivery count from which a reclaimed entry is a suspect (ADR-035):
+        `suspect_deliveries`, but never above `max_deliveries`. Otherwise, with a low
+        max_deliveries, entries would reach the DLQ before they could ever be suspects,
+        and a crashing job's companions would follow it there again."""
+        return min(self.suspect_deliveries, self.max_deliveries)
+
+    @property
     def job_lifetime_bound(self) -> float:
         """`lifetime_bound` for the default `job_timeout`."""
         return self.lifetime_bound(self.job_timeout)

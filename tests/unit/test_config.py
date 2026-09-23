@@ -100,3 +100,11 @@ def test_low_watermark_must_be_below_high() -> None:
 def test_job_timeout_must_be_positive() -> None:
     with pytest.raises(ValidationError):
         Settings(job_timeout=0)
+
+
+def test_suspect_threshold_never_exceeds_max_deliveries() -> None:
+    """ADR-035: with max_deliveries below suspect_deliveries, entries would reach the DLQ
+    before becoming suspects, and a crashing job's companions would follow it there."""
+    assert Settings().suspect_threshold == 3
+    assert Settings(max_deliveries=2).suspect_threshold == 2
+    assert Settings(suspect_deliveries=5, max_deliveries=12).suspect_threshold == 5

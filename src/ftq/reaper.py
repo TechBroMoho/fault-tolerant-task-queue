@@ -32,7 +32,7 @@ class Claimed:
     def is_suspect(self, settings: Settings) -> bool:
         """Redelivered often enough to suspect it crashes workers, but not so often that
         it goes to the DLQ unrun (ADR-035). A worker runs one suspect at a time."""
-        return settings.suspect_deliveries <= self.deliveries <= settings.max_deliveries
+        return settings.suspect_threshold <= self.deliveries <= settings.max_deliveries
 
 
 def _pairs(flat: list[str]) -> dict[str, str]:
@@ -64,7 +64,7 @@ class Reaper:
                 self._cursor,
                 str(count),
                 str(suspect_slots),
-                str(self._settings.suspect_deliveries),
+                str(self._settings.suspect_threshold),
                 str(self._settings.max_deliveries),
             ],
         )
