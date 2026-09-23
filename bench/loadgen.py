@@ -31,6 +31,7 @@ The report goes to `--out` (or stdout); progress goes to stderr.
 import argparse
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -86,6 +87,12 @@ class LoadSpec:
     block_timeout: float = 5.0
     expect_workers: int = 0  # wait for this many consumers before starting
     drain_timeout: float = 300.0
+    # Several loadgen hosts (ADR-047): this one coordinates and measures; the other
+    # hosts - 1 run `--producer-only` with the same run_id. `rate` is the total across
+    # all hosts. run_id names the run's coordination keys, so it must be new each run.
+    hosts: int = 1
+    run_id: str = ""
+    host_timeout: float = 120.0  # wait this long for the other hosts to join / report
 
     @property
     def duration(self) -> int:
@@ -144,7 +151,7 @@ async def _produce(spec: LoadSpec, index: int, start_at: float) -> dict[str, Any
     client = Client(redis, settings)
     stream = Keys(spec.queue).stream
     payload = make_payload(spec)
-    rate = spec.rate / spec.processes
+    rate = spec.rate / (spec.processes * spec.hosts)
     tick = spec.tick_ms / 1000
     total_due = int(rate * spec.duration)
 
@@ -199,6 +206,7 @@ async def _produce(spec: LoadSpec, index: int, start_at: float) -> dict[str, Any
         await redis.aclose()
     c = client.counters
     return {
+        "host": platform.node(),
         "index": index,
         "pid": os.getpid(),
         "start_late_s": round(start_late_s, 4),
@@ -214,6 +222,107 @@ async def _produce(spec: LoadSpec, index: int, start_at: float) -> dict[str, Any
         "enqueue_call_hist_ms": analysis.histogram(call_ms, _ENQUEUE_BUCKET_MS),
         "batch_sizes": dict(batch_sizes),
     }
+
+
+# ---------------------------------------------------------------- several hosts
+# How the hosts of one run find each other (ADR-047). Redis is the only thing they share,
+# so the handshake goes through it, under keys named by the run id:
+#   spec     the coordinator's LoadSpec (SET NX: a run id can't be reused)
+#   ready    each producer-only host, once its producer processes are warm
+#   start    the start time, in Redis TIME (ms)
+#   produced each producer-only host's producer summaries, when it's done
+
+_KEY_TTL_S = 86_400
+_POLL_S = 0.05
+_START_LEAD_MS = 1000  # from publishing the start to the start itself
+
+
+def loadgen_key(queue: str, run_id: str, name: str) -> str:
+    return f"{Keys(queue).prefix}:loadgen:{run_id}:{name}"
+
+
+def to_local_epoch(start_redis_ms: int, offset_ms: float) -> float:
+    """A Redis-TIME instant on this host's clock. `offset_ms` = Redis minus this host.
+    Hosts agree on Redis's clock, not on their own, so skew between them doesn't shift
+    anyone's start (only the round trip's asymmetry does: well under a millisecond in
+    one AZ)."""
+    return (start_redis_ms - offset_ms) / 1000
+
+
+async def _offset_ms(redis: aioredis.Redis) -> float:
+    """Redis TIME minus this host's clock, taken at the midpoint of the round trip."""
+    before = time.time()
+    redis_ms = await _redis_ms(redis)
+    after = time.time()
+    return redis_ms - (before + after) / 2 * 1000
+
+
+def summary_to_json(produced: list[dict[str, Any]]) -> str:
+    return json.dumps(produced, separators=(",", ":"))
+
+
+def summary_from_json(text: str) -> list[dict[str, Any]]:
+    """Undo what JSON does to dict keys: the merge must see the same int and float
+    keys as a local producer's (a "0.4" bucket next to a 0.4 one would split it)."""
+    out: list[dict[str, Any]] = []
+    for p in json.loads(text):
+        p["per_second"] = {int(k): v for k, v in p["per_second"].items()}
+        p["enqueue_call_hist_ms"] = {float(k): v for k, v in p["enqueue_call_hist_ms"].items()}
+        p["batch_sizes"] = {int(k): v for k, v in p["batch_sizes"].items()}
+        out.append(p)
+    return out
+
+
+async def _poll(what: str, check: Any, within: float) -> Any:
+    """Await `check()` until it returns something truthy; RuntimeError after `within` s."""
+    deadline = time.monotonic() + within
+    while not (value := await check()):
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"{what} after {within:g} s")
+        await asyncio.sleep(_POLL_S)
+    return value
+
+
+async def _warm_pool(pool: ProcessPoolExecutor, n: int) -> None:
+    loop = asyncio.get_running_loop()
+    await asyncio.gather(*(loop.run_in_executor(pool, _ready) for _ in range(n)))
+
+
+async def _produce_from(
+    pool: ProcessPoolExecutor, spec: LoadSpec, start_at: float
+) -> list[asyncio.Future[dict[str, Any]]]:
+    loop = asyncio.get_running_loop()
+    return [
+        loop.run_in_executor(pool, _producer_main, spec, i, start_at) for i in range(spec.processes)
+    ]
+
+
+async def produce_only(
+    redis_url: str, queue: str, run_id: str, host_timeout: float = 600.0
+) -> list[dict[str, Any]]:
+    """A producer-only host: take the coordinator's spec, offer this host's share of its
+    rate from the published start, then hand the producer summaries back. Everything
+    except where Redis is comes from the coordinator, so the hosts can't disagree."""
+    redis = make_redis(Settings(redis_url=redis_url, queue=queue, log_level="WARNING"))
+    key = functools.partial(loadgen_key, queue, run_id)
+    try:
+        raw = await _poll("no spec published", lambda: redis.get(key("spec")), host_timeout)
+        spec = LoadSpec(**{**json.loads(raw), "redis_url": redis_url})
+        with ProcessPoolExecutor(spec.processes, mp_context=get_context("spawn")) as pool:
+            await _warm_pool(pool, spec.processes)
+            await redis.rpush(key("ready"), platform.node())
+            await redis.expire(key("ready"), _KEY_TTL_S)
+            start_ms = int(
+                await _poll("no start published", lambda: redis.get(key("start")), host_timeout)
+            )
+            start_at = to_local_epoch(start_ms, await _offset_ms(redis))
+            log.info("producing %d s from %s (run %s)", spec.duration, start_ms, run_id)
+            produced = list(await asyncio.gather(*await _produce_from(pool, spec, start_at)))
+        await redis.rpush(key("produced"), summary_to_json(produced))
+        await redis.expire(key("produced"), _KEY_TTL_S)
+        return produced
+    finally:
+        await redis.aclose()
 
 
 # ---------------------------------------------------------------- coordinator
@@ -350,23 +459,58 @@ async def run(spec: LoadSpec, meta: dict[str, Any]) -> dict[str, Any]:
         counters0: Any = await redis.hgetall(keys.stats)
         commands0: Any = await redis.info("commandstats")
 
+        key = functools.partial(loadgen_key, spec.queue, spec.run_id)
+        if spec.hosts > 1:
+            if not spec.run_id:
+                raise ValueError("several hosts need a run_id")
+            published = {k: v for k, v in asdict(spec).items() if k != "redis_url"}
+            if not await redis.set(key("spec"), json.dumps(published), nx=True, ex=_KEY_TTL_S):
+                raise RuntimeError(f"run id {spec.run_id!r} was already used")
+
         samples: list[dict[str, Any]] = []
         stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
         with ProcessPoolExecutor(spec.processes, mp_context=get_context("spawn")) as pool:
-            await asyncio.gather(
-                *(loop.run_in_executor(pool, _ready) for _ in range(spec.processes))
-            )
-            start_at = time.time() + 1.0
-            producers = [
-                loop.run_in_executor(pool, _producer_main, spec, i, start_at)
-                for i in range(spec.processes)
-            ]
+            await _warm_pool(pool, spec.processes)
+            if spec.hosts > 1:
+                # Nothing is enqueued until every host is warm and waiting: a host that
+                # never shows up stops the run here, before it has touched the queue.
+                async def all_ready() -> bool:
+                    return int(await redis.llen(key("ready"))) >= spec.hosts - 1
+
+                try:
+                    await _poll("not ready", all_ready, spec.host_timeout)
+                except RuntimeError:
+                    n = 1 + int(await redis.llen(key("ready")))
+                    raise RuntimeError(
+                        f"only {n} of {spec.hosts} loadgen hosts ready after "
+                        f"{spec.host_timeout:g} s (run {spec.run_id})"
+                    ) from None
+            start_ms = await _redis_ms(redis) + _START_LEAD_MS
+            if spec.hosts > 1:
+                await redis.set(key("start"), start_ms, ex=_KEY_TTL_S)
+            start_at = to_local_epoch(start_ms, await _offset_ms(redis))
+            producers = await _produce_from(pool, spec, start_at)
             await asyncio.sleep(max(0.0, start_at - time.time()))
             t0_ms = await _redis_ms(redis)
             sampler = asyncio.create_task(_sampler(redis, keys, samples, stop))
             log.info("producing for %d s (%s)", spec.duration, meta.get("label", ""))
             produced = list(await asyncio.gather(*producers))
+
+        hosts_reported = 1
+        if spec.hosts > 1:
+            # The other hosts finish at about the same time. One that never reports
+            # leaves its accepted count unknown, so the run can't be verified (below).
+            async def all_reported() -> bool:
+                return int(await redis.llen(key("produced"))) >= spec.hosts - 1
+
+            with contextlib.suppress(RuntimeError):
+                await _poll("not reported", all_reported, spec.host_timeout)
+            remote: Any = await redis.lrange(key("produced"), 0, -1)
+            for text in remote:
+                produced += summary_from_json(text)
+            hosts_reported += len(remote)
+            if hosts_reported < spec.hosts:
+                log.warning("only %d of %d hosts reported", hosts_reported, spec.hosts)
 
         drain_start = time.monotonic()
         drained = False
@@ -392,7 +536,7 @@ async def run(spec: LoadSpec, meta: dict[str, Any]) -> dict[str, Any]:
         spec, meta, env, consumers, window, t0_ms, samples, produced, times, per_job,
         by_worker, {k: int(counters1.get(k, 0)) - int(counters0.get(k, 0)) for k in COUNTERS},
         dlq, drained, drain_s,
-        command_costs(commands0, commands1, len(per_job)),
+        command_costs(commands0, commands1, len(per_job)), hosts_reported,
     )  # fmt: skip
 
 
@@ -413,6 +557,7 @@ def _report(
     drained: bool,
     drain_s: float,
     commands: dict[str, dict[str, float]],
+    hosts_reported: int = 1,
 ) -> dict[str, Any]:
     in_window = range(spec.warmup, spec.warmup + spec.measure)
     per_second: dict[int, list[int]] = {}
@@ -430,7 +575,9 @@ def _report(
     enqueue_hist = analysis.merge(p["enqueue_call_hist_ms"] for p in produced)
     batch_sizes = analysis.merge(p["batch_sizes"] for p in produced)
 
+    # Every host's producers are in `produced`: the check counts the whole run's jobs.
     accepted = sum(p["accepted"] for p in produced)
+    all_hosts = hosts_reported == spec.hosts
     duplicate_results = sum(n - 1 for n in per_job.values() if n > 1)
     missing = accepted - len(per_job)
     redis_main = [(s["t_ms"], s["redis_cpu_main_s"]) for s in samples]
@@ -476,9 +623,11 @@ def _report(
             "max_lag_s": max(p["max_lag_s"] for p in produced),
             "max_start_late_s": max(p["start_late_s"] for p in produced),
             "depth_waits": sum(p["depth_waits"] for p in produced),
+            "hosts": {"expected": spec.hosts, "reported": hosts_reported},
         },
         "exactly_once": {
-            "ok": drained and missing == 0 and duplicate_results == 0 and dlq == 0,
+            # A host that didn't report has an unknown accepted count: never "ok".
+            "ok": all_hosts and drained and missing == 0 and duplicate_results == 0 and dlq == 0,
             "accepted": accepted,
             "results": sum(per_job.values()),
             "distinct_jobs_with_results": len(per_job),
@@ -503,7 +652,7 @@ def _report(
     }
 
 
-def _args(argv: list[str] | None) -> tuple[LoadSpec, dict[str, Any], str]:
+def _args(argv: list[str] | None) -> tuple[LoadSpec, dict[str, Any], str, bool]:
     d = LoadSpec(redis_url="")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument(
@@ -527,6 +676,14 @@ def _args(argv: list[str] | None) -> tuple[LoadSpec, dict[str, Any], str]:
     p.add_argument("--block-timeout", type=float, default=d.block_timeout)
     p.add_argument("--expect-workers", type=int, default=d.expect_workers)
     p.add_argument("--drain-timeout", type=float, default=d.drain_timeout)
+    p.add_argument("--hosts", type=int, default=d.hosts, help="loadgen hosts in this run")
+    p.add_argument("--run-id", default=d.run_id, help="shared by every host of one run")
+    p.add_argument("--host-timeout", type=float, default=d.host_timeout)
+    p.add_argument(
+        "--producer-only",
+        action="store_true",
+        help="join run --run-id as an extra producer host; takes the coordinator's spec",
+    )
     p.add_argument("--meta", default="{}", help="JSON copied into the report (labels)")
     p.add_argument("--out", default="-", help="report path, or - for stdout")
     a = p.parse_args(argv)
@@ -537,16 +694,29 @@ def _args(argv: list[str] | None) -> tuple[LoadSpec, dict[str, Any], str]:
         payload_bytes=a.payload_bytes, max_depth=a.max_depth, backpressure=a.backpressure,
         high_watermark=a.high_watermark, low_watermark=a.low_watermark,
         block_timeout=a.block_timeout, expect_workers=a.expect_workers,
-        drain_timeout=a.drain_timeout,
+        drain_timeout=a.drain_timeout, hosts=a.hosts, run_id=a.run_id,
+        host_timeout=a.host_timeout,
     )  # fmt: skip
-    return spec, json.loads(a.meta), a.out
+    if a.producer_only and not a.run_id:
+        p.error("--producer-only needs --run-id")
+    return spec, json.loads(a.meta), a.out, a.producer_only
 
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO, stream=sys.stderr, format="%(asctime)s loadgen %(message)s"
     )
-    spec, meta, out = _args(argv)
+    spec, meta, out, producer_only = _args(argv)
+    if producer_only:
+        produced = asyncio.run(
+            produce_only(spec.redis_url, spec.queue, spec.run_id, spec.host_timeout)
+        )
+        log.info(
+            "producer-only host done: accepted %d, cpu_busy %s",
+            sum(p["accepted"] for p in produced),
+            [p["cpu_busy"] for p in produced],
+        )
+        return 0
     report = asyncio.run(run(spec, meta))
     text = json.dumps(report, indent=1) + "\n"
     if out == "-":

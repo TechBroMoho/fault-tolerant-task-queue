@@ -10,16 +10,43 @@
 - **Follow-up done:** CI #7's chaos failure (I4 `kills = 2 < 3`, a harness scheduling
   gap, fixed in ADR-043), and the 1M record: 7 of 7 passing 1M runs on the current
   queue code.
-- **Current phase:** Phase 7 (AWS): **session done, torn down, verified clean**
-  (2026-09-23, 14:36–14:57 UTC, ≈ $0.06).
-  - The smoke test passed on ECS.
-  - Loadgen measured: one 2-vCPU host is marginal (ADR-046).
-  - **Waiting on Mohammed:** choose the Phase 8 layout (16 vCPUs, or 18 with 2 loadgen
-    hosts), which needs a $0 loadgen change first if 18.
+- **Current phase:** Phase 8 prep. Phase 7 is done (session torn down and verified
+  clean, ≈ $0.06).
+  - Mohammed chose the 18-vCPU layout. The multi-host loadgen is built and tested
+    (ADR-047).
+  - **Waiting on Mohammed:** a yes to the Phase 8 session. The `make aws-bench` driver
+    (2 loadgen tasks on distinct hosts, scaling the worker service between points) is
+    still to be built, at $0.
+  - **TODO 2026-09-24:** re-check Cost Explorer for the actual Phase 7 cost (Mohammed
+    asked; about 1–2 API calls, $0.01 each).
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
 - **AWS:** only the budget and an empty ECR repo remain (both $0 idle). Spend to date ≈ $0.06 (estimate; Cost Explorer lags ~24 h, re-check).
 
 ## Phase log
+
+### Phase 8 prep: several loadgen hosts (2026-09-23, $0)
+
+- Mohammed chose layout L2' (18 vCPUs, 2 loadgen hosts) and approved the extra 16K/s run
+  after the fact.
+- **`bench/loadgen.py`:** `--hosts N --run-id R` (the coordinator) and `--producer-only
+  --run-id R` (ADR-047).
+  - The handshake goes through Redis; the start time is in Redis `TIME`.
+  - The exactly-once check counts every host. A host that never reports means the run
+    is not ok.
+- **Tests:** 3 integration + 2 unit, written first. 4 mutants, each caught by exactly
+  1 test.
+- **CLI check (local, two processes + a worker):** 2 of 2 hosts, 15,980 accepted,
+  exactly-once True.
+
+```
+$ make check-all > log 2>&1; echo "make check-all exit=$?"
+make check-all exit=0
+======================= 219 passed in 229.67s (0:03:49) ========================
+```
+
+- The suite took 229 s, against 122 s earlier today. The new loadgen tests add ~18 s,
+  and no single test is slower than 8 s (`--durations`). The rest is machine variance
+  (load average 3.0); nothing else in the suite runs the changed code.
 
 ### Phase 7 session: deploy, smoke, loadgen measurement, teardown (2026-09-23)
 

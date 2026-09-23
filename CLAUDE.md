@@ -51,6 +51,8 @@ gh workflow run chaos-scale.yml -f jobs=N [-f workers=W]   # chaos on a GitHub r
 make bench [BENCH_ARGS=...]   # scaling + latency + backpressure + charts -> results/local/bench/ (~25 min; background)
 uv run python -m bench.run {concurrency|scaling|latency|backpressure|iothreads|point} --help   # one suite (local Docker)
 uv run python -m bench.loadgen --help   # the load generator alone: needs only FTQ_REDIS_URL + running workers (Phase 8 reuses it)
+uv run python -m bench.loadgen --hosts 2 --run-id R ...   # coordinator of a 2-host run (ADR-047); on the other host:
+uv run python -m bench.loadgen --producer-only --run-id R   # takes the coordinator's spec, offers its share
 uv run python -m bench.plot             # charts + summary.md from the saved reports
 TF_VAR_alert_email=... make aws-base   # budget alarm + ECR repo (idle $0; applied once)
 make aws-image                    # build linux/amd64, push to ECR as the git short SHA

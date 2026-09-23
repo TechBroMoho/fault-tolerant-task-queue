@@ -6,12 +6,13 @@ tests check that the report can't claim more than happened: a run that didn't dr
 isn't "exactly once", and a refused job is counted as refused, not as accepted.
 """
 
+import asyncio
 from typing import Any
 
 import pytest
 import redis.asyncio as aioredis
 
-from bench.loadgen import LoadSpec, run
+from bench.loadgen import LoadSpec, loadgen_key, produce_only, run
 from ftq.config import Settings
 from ftq.handlers import registry
 from ftq.keys import Keys
@@ -96,3 +97,59 @@ async def test_a_run_that_did_not_drain_is_not_exactly_once_and_refusals_count(
     assert not once["ok"]
     assert once["missing"] == 100
     assert await r.xlen(Keys(settings.queue).stream) == 100
+
+
+# ---------------------------------------------------------------- several loadgen hosts
+# Phase 8 drives the queue from 2 loadgen hosts (ADR-046). One coordinator measures; the
+# other hosts only produce. The exactly-once check must count every host's accepted jobs,
+# and a run it can't fully account for must never pass.
+
+
+async def test_two_hosts_offer_one_rate_and_the_check_counts_both(
+    r: aioredis.Redis, settings: Settings
+) -> None:
+    spec = _spec(settings, rate=1000, hosts=2, run_id="two-hosts", expect_workers=1)
+    async with running_worker(r, settings, registry):
+        # The second host gets only the URL, the queue, and the run id: everything else
+        # (rate, processes, window) comes from the coordinator's published spec.
+        remote = asyncio.create_task(
+            produce_only(settings.redis_url, settings.queue, "two-hosts", host_timeout=30)
+        )
+        report = await run(spec, {"label": "test"})
+        await remote
+
+    p = report["producers"]
+    assert p["hosts"] == {"expected": 2, "reported": 2}
+    assert len(p["cpu_busy"]) == 4  # 2 processes on each host
+    once = report["exactly_once"]
+    assert once["ok"], once
+    # 1000/s in total, split across both hosts: 4 s -> ~4000, from both hosts' counts.
+    assert 3980 <= once["accepted"] <= 4000
+    assert once["results"] == once["distinct_jobs_with_results"] == once["accepted"]
+    assert report["throughput"]["offered_per_s"] == pytest.approx(1000, rel=0.02)
+    assert p["max_start_late_s"] < 0.5  # both hosts started together
+
+
+async def test_a_host_that_never_joins_stops_the_run_before_it_enqueues(
+    r: aioredis.Redis, settings: Settings
+) -> None:
+    spec = _spec(settings, rate=1000, hosts=2, run_id="no-show", host_timeout=1)
+    with pytest.raises(RuntimeError, match="1 of 2 loadgen hosts"):
+        await run(spec, {})
+    assert await r.xlen(Keys(settings.queue).stream) == 0
+
+
+async def test_a_host_that_joins_but_never_reports_fails_the_check(
+    r: aioredis.Redis, settings: Settings
+) -> None:
+    spec = _spec(settings, rate=500, hosts=2, run_id="crashed", host_timeout=2)
+    # A host that registered and then died: ready, but no summary will ever come.
+    await r.rpush(loadgen_key(settings.queue, "crashed", "ready"), "ghost-host")
+    async with running_worker(r, settings, registry):
+        report = await run(spec, {})
+    assert report["producers"]["hosts"] == {"expected": 2, "reported": 1}
+    once = report["exactly_once"]
+    # This host's own jobs all completed exactly once, but the other host's accepted
+    # count is unknown, so "nothing missing" can't be claimed.
+    assert once["missing"] == 0
+    assert not once["ok"]

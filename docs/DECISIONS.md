@@ -2228,3 +2228,76 @@ c7i-flex.
   the accepted count summed across hosts for the exactly-once check.
 - The alternative, L1 at 16 vCPUs ($0.7556/h), keeps one loadgen host and relies on
   `depth_min` and producer `cpu_busy` to flag any loadgen-bound point.
+
+---
+
+## ADR-047: Several loadgen hosts: one coordinator, producer-only hosts, one check
+
+*Status: accepted (Phase 8 prep: `bench/loadgen.py`, `--hosts/--run-id/--producer-only`).
+Implements the fallback that ADR-046 recommended and Mohammed chose (18 vCPUs, 2 loadgen
+hosts).*
+
+**Context.** One 2-vCPU loadgen host is marginal against Redis's ceiling (ADR-046). The
+loadgen was a single coordinator whose own producers were the only ones it counted. A
+second, independent loadgen on the same queue would break its exactly-once check:
+"accepted" would miss the other host's jobs, and `missing` would go negative.
+
+**Options.**
+1. Two independent loadgens, with the reports merged by hand. Each report would fail its
+   own check, and the merge would be a step outside the committed code (SPEC §3.1).
+2. Count accepted from the queue's counters instead of the producers. That can't tell
+   this run's jobs from anything else enqueued meanwhile, and it's exactly the kind of
+   shortcut the check exists to rule out.
+3. **One coordinator, and producer-only hosts that hand their summaries back through
+   Redis.** Chosen.
+
+**Decision.**
+- **Handshake** under `ftq:{queue}:loadgen:<run_id>:*`, with a 1-day TTL. Redis is the
+  only thing the hosts share.
+  1. The coordinator publishes its spec with `SET NX`, so a run id can't be reused and
+     stale summaries can't be counted.
+  2. Each producer-only host takes that spec (only the Redis URL is its own, so hosts
+     can't disagree on rate, processes, or window), warms its producer processes, and
+     registers in `ready`.
+  3. **Nothing is enqueued until every host is ready.** A host that never joins stops
+     the run within `host_timeout`, before the queue is touched.
+  4. The coordinator publishes a start time **in Redis `TIME`**. Each host converts it
+     with its own measured offset to Redis (the midpoint of a `TIME` round trip). Clock
+     skew between hosts doesn't move anyone's start.
+  5. Each host pushes its producer summaries to `produced` when it's done. The
+     coordinator merges them with its own and runs the usual analysis.
+- **`rate` is the total across hosts:** each producer offers `rate / (processes ×
+  hosts)`.
+- **The exactly-once check counts every host's accepted jobs.** A host that joined but
+  never reported leaves its accepted count unknown, so the run is **never "ok"**, even
+  if every job that is known about completed once. `producers.hosts` records
+  `{expected, reported}`.
+- JSON turns the summaries' int and float dict keys into strings.
+  `summary_from_json` restores them, so histogram buckets merge instead of splitting
+  (or crashing the sorted merge).
+
+**Evidence.**
+- Tests written before the code:
+  - 3 integration tests: two hosts offer one rate and the check counts both; a host
+    that never joins stops the run before it enqueues; a host that joins but never
+    reports fails the check.
+  - 2 unit tests: the JSON round trip, and the clock-offset conversion.
+  - They failed at import on the old loadgen. The API didn't exist, so "failing first"
+    here only proves they run against the new code.
+- The mutants carry the weight. Each makes exactly 1 test fail:
+  - an unreported host still counted "ok";
+  - JSON keys not restored;
+  - the rate not split by hosts;
+  - remote summaries not merged.
+- CLI, locally: a coordinator (`--hosts 2 --run-id R --rate 2000`), one
+  `--producer-only --run-id R`, and one worker. Result: `hosts {expected 2, reported 2}`,
+  15,980 accepted (7,990 from the producer-only host), 2,000/s offered, exactly-once
+  True.
+
+**Consequences.**
+- Phase 8's driver must start the producer-only task on one loadgen host and the
+  coordinator on the **other**. Separate `run-task` calls don't guarantee distinct
+  instances, so it pins the coordinator with `ec2InstanceId !=` the first task's host.
+  That's still to be built (`make aws-bench`).
+- The coordinator also runs the 1 s sampler and the analysis. Its host carries slightly
+  more than half the work; `cpu_busy` per producer shows whether it matters.
