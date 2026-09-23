@@ -1,0 +1,89 @@
+# CI on every push and pull request (SPEC §7 Phase 5, ADR-039).
+#
+# - check:  `make check-all` (fmt-check, lint, mypy --strict, every test) against the
+#           Compose Redis, the same pinned image and config as local runs.
+# - docker: the worker image builds.
+# - chaos:  the chaos run + verifier, report and worker logs uploaded as an artifact.
+#
+# No automatic retries anywhere: a flaky failure on Linux is evidence, not noise.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch makes the older run moot.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.11.16"
+          python-version: "3.12"
+          enable-cache: true
+      - run: make setup
+      # The Compose Redis, not a `services:` container: a service container can't take
+      # redis-server arguments, and the suite asserts maxmemory-policy noeviction (ADR-013).
+      - run: make up
+      - name: make check-all (timed)
+        # --durations shows where the time goes; it changes no test and no outcome.
+        env:
+          PYTEST_ADDOPTS: "--durations=20"
+        run: |
+          start=$(date +%s)
+          make check-all
+          echo "make check-all wall time: $(( $(date +%s) - start )) s" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Runner facts
+        if: always()
+        run: |
+          nproc; free -m; docker version --format '{{.Server.Version}}'
+          docker compose exec -T redis redis-cli info server | grep redis_version
+
+  docker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: docker build -f docker/Dockerfile -t ftq-worker:ci .
+      - run: docker run --rm ftq-worker:ci --help
+
+  chaos:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CHAOS_JOBS: "100000"
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.11.16"
+          python-version: "3.12"
+          enable-cache: true
+      - run: make setup
+      - name: Chaos run (N=${{ env.CHAOS_JOBS }}, 8 workers, random seed)
+        run: |
+          start=$(date +%s)
+          uv run python -m chaos.run --jobs "$CHAOS_JOBS" --workers 8 \
+            --out results/ci/chaos_report.json --run-dir "$PWD/chaos/runs/ci"
+          echo "chaos N=$CHAOS_JOBS wall time: $(( $(date +%s) - start )) s" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload the chaos report and worker logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: chaos-report-${{ github.run_id }}
+          path: |
+            results/ci/chaos_report.json
+            chaos/runs/ci/
+          if-no-files-found: warn
+          retention-days: 30
