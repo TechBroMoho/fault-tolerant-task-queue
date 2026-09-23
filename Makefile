@@ -3,10 +3,11 @@
 
 UV ?= uv
 COMPOSE ?= docker compose
+WORKERS ?= 0
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup fmt fmt-check lint typecheck test check up down chaos bench \
+.PHONY: help setup fmt fmt-check lint typecheck test test-all check check-all up down chaos bench \
         aws-plan aws-up aws-bench aws-down aws-verify-clean
 
 help: ## List targets
@@ -30,18 +31,27 @@ lint: ## Lint with ruff
 typecheck: ## mypy --strict (config in pyproject.toml)
 	$(UV) run mypy
 
-test: ## Run pytest; integration tests need Redis (`make up`) and fail, not skip, without it
+test: ## Fast tests (not `slow`); integration tests need Redis (`make up`) and fail, not skip, without it
+	$(UV) run pytest -m "not slow"
+
+test-all: ## Every test, including the `slow` subprocess/process-pool ones (what CI runs)
 	$(UV) run pytest
 
-check: fmt-check lint typecheck test ## Everything CI runs: fmt-check + lint + typecheck + tests
+check: fmt-check lint typecheck test ## Dev loop: fmt-check + lint + typecheck + fast tests
+
+check-all: fmt-check lint typecheck test-all ## What CI runs: fmt-check + lint + typecheck + every test
 
 # ---------------------------------------------------------------- local stack
 
-up: ## Start the local stack and wait until healthy (Phase 0: Redis only)
+up: ## Start Redis, plus WORKERS=N worker containers (default 0), and wait until healthy
+ifeq ($(WORKERS),0)
 	$(COMPOSE) up -d --wait redis
+else
+	$(COMPOSE) --profile workers up -d --wait --build --scale worker=$(WORKERS) redis worker
+endif
 
-down: ## Stop the local stack and delete its data volume (dev data is disposable)
-	$(COMPOSE) down -v
+down: ## Stop the local stack (workers too) and delete its data volume (dev data is disposable)
+	$(COMPOSE) --profile workers down -v
 
 # ---------------------------------------------------------------- later phases (stubs)
 # Stubs exit non-zero so nothing can mistake "not built yet" for "passed".

@@ -1,5 +1,6 @@
-# Local topology. Phase 0: Redis only. Toxiproxy and workers arrive in Phases 3–4
-# (the per-worker proxy topology is designed in Phase 4; see DECISIONS.md ADR-011).
+# Local topology: Redis plus N identical worker processes (`make up WORKERS=4`).
+# The chaos topology with one Toxiproxy proxy per worker is generated in Phase 4
+# (DECISIONS.md ADR-011).
 name: ftq
 
 services:
@@ -28,3 +29,24 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: ftq-worker:local
+    # Not started by a plain `make up` (tests only need Redis); `make up WORKERS=N`
+    # enables the profile and scales it.
+    profiles: ["workers"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      FTQ_REDIS_URL: redis://redis:6379/0
+      FTQ_QUEUE: ${FTQ_QUEUE:-default}
+      FTQ_CONCURRENCY: ${FTQ_CONCURRENCY:-10}
+      FTQ_LOG_LEVEL: ${FTQ_LOG_LEVEL:-INFO}
+    # docker stop sends SIGTERM, waits this long, then SIGKILL. Longer than the worker's
+    # own grace period, so a drain is never cut short by Docker.
+    stop_grace_period: 40s
+    restart: unless-stopped
