@@ -274,6 +274,18 @@ def _count(label: str, n: int, failures: list[str]) -> None:
         failures.append(label)
 
 
+def state_resource_count(returncode: int, stdout: str, stderr: str) -> int | None:
+    """Resources `terraform state list` printed, 0 if no state file exists yet (nothing
+    was ever applied here), or None if the state couldn't be read. An unreadable state
+    must fail the check: it used to count as 0, so a locked or broken state said CLEAN
+    without being looked at."""
+    if returncode == 0:
+        return len(stdout.split())
+    if "No state file was found" in stderr:
+        return 0
+    return None
+
+
 def cmd_verify_clean() -> None:
     """Region-wide: nothing that bills by the hour or by the GB may be left. Checks the
     whole region, not just tagged resources, so a resource that missed its tag is found
@@ -312,8 +324,12 @@ def cmd_verify_clean() -> None:
         capture_output=True,
         text=True,
     )
-    in_state = len(state.stdout.split()) if state.returncode == 0 else 0
-    _count("resources in the stack's Terraform state", in_state, failures)
+    in_state = state_resource_count(state.returncode, state.stdout, state.stderr)
+    if in_state is None:
+        print(f"  [FAIL] the stack's Terraform state could not be read: {state.stderr.strip()}")
+        failures.append("Terraform state unreadable")
+    else:
+        _count("resources in the stack's Terraform state", in_state, failures)
     if failures:
         raise SystemExit(f"NOT CLEAN: {', '.join(failures)}")
     print("CLEAN: nothing billable left in " + REGION)
