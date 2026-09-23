@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from ftq.config import Settings
+from ftq.config import Settings, make_redis
 
 
 def test_env_vars_use_ftq_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -108,3 +108,18 @@ def test_suspect_threshold_never_exceeds_max_deliveries() -> None:
     assert Settings().suspect_threshold == 3
     assert Settings(max_deliveries=2).suspect_threshold == 2
     assert Settings(suspect_deliveries=5, max_deliveries=12).suspect_threshold == 5
+
+
+@pytest.mark.parametrize(
+    ("concurrency", "pool"),
+    [(1, 100), (10, 100), (49, 100), (50, 102), (100, 202), (500, 1002)],
+)
+def test_redis_pool_covers_two_connections_per_job_plus_the_loops(
+    concurrency: int, pool: int
+) -> None:
+    """ADR-044: 2 per in-flight job (handler or transition, plus heartbeat) + the fetch
+    and maintenance loops, never below redis-py's default of 100."""
+    s = Settings(concurrency=concurrency)
+    assert s.redis_max_connections == pool
+    # make_redis builds the client without connecting, so this is still pure logic.
+    assert make_redis(s).connection_pool.max_connections == pool

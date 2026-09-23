@@ -18,6 +18,25 @@
 
 ## Phase log
 
+### Phase 7 prep: the worker's connection pool (2026-09-23)
+
+**Fixed the latent pool limit from Phase 6 (ADR-044), test first.**
+- `Settings.redis_max_connections = max(100, 2 × concurrency + 2)`, which `make_redis`
+  now passes. That's 2 connections per in-flight job (handler or transition, plus
+  heartbeat), plus the fetch and maintenance loops. The pool still raises when
+  exhausted; it doesn't block.
+- New `tests/integration/test_connection_pool.py`: concurrency 100, all 100 jobs
+  mid-ledger-call during a 1 s `CLIENT PAUSE ALL`.
+  - Old code: failed 3 of 3 (992–1,092 `Too many connections` warnings each).
+  - New code: passed 30 of 30.
+- A unit test pins the formula.
+
+```
+$ make check-all > log 2>&1; echo "make check-all exit=$?"
+make check-all exit=0
+======================= 210 passed in 121.58s (0:02:01) ========================
+```
+
 ### Phase 6 follow-up: CI #7's chaos failure and the 1M record (2026-09-23)
 
 **CI #7 ([run 35854442425](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35854442425), 662300e, docs-only) failed in `chaos`,
@@ -276,10 +295,8 @@ loadgen: offered/accepted window includes the warmup   -> CAUGHT
   saturated run with ≥ 4 workers did ≥ 11,160 jobs/s, but the headline is Phase 8's.
 
 **Open issues**
-- **The worker's Redis connection pool isn't sized for its concurrency.**
-  `MaxConnectionsError` (redis-py's default is 100 connections) appeared at
-  concurrency 100. No job was affected, but it's latent. It's flagged as a separate task
-  (test first, then size the pool or use a blocking pool).
+- ~~**The worker's Redis connection pool isn't sized for its concurrency.**~~ Fixed
+  2026-09-23 (ADR-044): see "Phase 7 prep" above.
 - The session-to-session drift on this laptop is unexplained (ADR-042 §4).
 - Phase 8 needs an ECS driver for the loadgen and task-level CPU from the ECS metadata
   stats endpoint (to be verified), plus ≥ 4 producer processes.
@@ -1353,6 +1370,8 @@ pytest exit (redis up)=0
     inside a benchmark phase (ADR-042, open issues).
   - Found only because the driver saves every worker's log and the report counts the
     lines.
+  - Fixed on 2026-09-23 (ADR-044). A test that pauses Redis with 100 jobs in flight
+    failed 3 of 3 on the old code and passed 30 of 30 on the fix.
 - **2026-09-23 (Phase 6): a committed measurement script had been broken since Phase 3.**
   `bench/lease_starvation.py` called `start_worker_process(..., **ENV)`. Phase 3
   (fdf7387) changed the helper to take `env=`, so the script raised `TypeError`. Nothing

@@ -1941,7 +1941,8 @@ knobs matter.
   - No job was affected in any run (0 retries, reclaims, lease losses, or DLQ moves).
     But a commit or heartbeat that hits it under load could cost an attempt or a lease.
   - Flagged as its own task (reproduce with a test, then size the pool or use a
-    blocking pool) for Mohammed to schedule.
+    blocking pool) for Mohammed to schedule. **Resolved in ADR-044** (pool sized from
+    concurrency).
 
 ---
 
@@ -1987,3 +1988,69 @@ ADR-036.*
 - Two local 100K runs on the fix (including CI's failing seed) passed with 0 skips,
   without needing a retry. So a live retry hasn't been observed yet; the next CI runs
   will show `attempts` > 1 if it happens.
+
+---
+
+## ADR-044: The worker's Redis pool is sized from its concurrency
+
+*Status: accepted (Phase 7 prep: `config.py`, `Settings.redis_max_connections`,
+`make_redis`). Resolves the open issue in ADR-042.*
+
+**Context.**
+- redis-py 8.1's asyncio `ConnectionPool` defaults to `max_connections = 100` and raises
+  `MaxConnectionsError` (a `ConnectionError`) as soon as all of them are in use. It
+  doesn't wait. `make_redis` never set a limit.
+- Both Phase 6 benchmark runs at `FTQ_CONCURRENCY=100` logged `maintenance pass failed:
+  network:MaxConnectionsError`. No job was affected there, but the same error on a
+  heartbeat risks a lease, and on a handler's ledger call or a commit it costs an
+  attempt or a redelivery. The error is a `ConnectionError`, so the worker treats it as
+  "Redis unreachable".
+- What one worker can have waiting on Redis at the same moment:
+  - each in-flight job: at most 2, its handler's call (a ledger `apply`) or, after the
+    handler, its transition (commit / retry / DLQ move), plus its heartbeat. The
+    heartbeat is cancelled and awaited before the transition starts (`_process`).
+    A timed-out run that keeps going (an orphan) holds a slot like a job, so
+    in-flight + orphans ≤ `concurrency`, and an orphan's job task has already stopped
+    its heartbeat;
+  - the fetch loop: 1 (a blocking `XREADGROUP`, or a reaper pass; never both);
+  - the maintenance loop: 1 (scheduler, then consumer pruning, in sequence).
+  - Thread- and process-pool handlers get the `Job`, not the client, so they use none.
+
+**Options.**
+1. **Size the pool: `2 × concurrency + 2`**, keeping the raising pool.
+2. `BlockingConnectionPool`: wait for a free connection. It hides a wrong bound, and a
+   heartbeat queued behind other calls silently eats into its lease.
+3. No practical limit (e.g. 2³¹). Nothing then catches a handler that fans out Redis
+   calls without bound.
+
+**Decision: option 1.** `Settings.redis_max_connections = max(100, 2 × concurrency + 2)`,
+passed by `make_redis`. The floor of 100 is redis-py's own default: producers, the CLI,
+the loadgen and the chaos harness all use `make_redis` and ran on it, so no client gets a
+smaller pool than before. The change only matters from concurrency 50 up (50 → 102,
+100 → 202). Connections are opened lazily, so a larger limit costs nothing until it's
+used.
+
+**Evidence.**
+- `tests/integration/test_connection_pool.py`: a worker at concurrency 100 with 100
+  jobs whose handlers are all waiting on a ledger call while Redis is held with
+  `CLIENT PAUSE ALL` for 1 s, so each job's ledger call and heartbeat, and the
+  maintenance loop, need a connection at once.
+  - **Old code: failed 3 of 3**, with 992–1,092 warnings each (`heartbeat failed (Too
+    many connections)`, `fetch failed`, `could not schedule retry
+    (network:MaxConnectionsError)`), and the pool stopped at 100 connections.
+  - **New code: passed 30 of 30** in a row: 0 warnings, 0 retries, 100 processed, 100
+    effects.
+  - It also asserts the pool really went past 100 connections, so it can't pass
+    vacuously. The peak it reaches is 199–201 (nominal 2N + 1). A beat that lands just
+    before the pause frees its connection first. My first version asserted ≥ 2N and
+    failed about 1 run in 6 at 199 with zero warnings. That was the test's arithmetic,
+    not the pool, so the check is now "> 100". Nothing committed was relaxed.
+- A unit test pins the formula and that `make_redis` applies it.
+
+**Consequences.**
+- **A handler that issues concurrent Redis calls** (e.g. `asyncio.gather` over several
+  `ledger.apply`) can still exhaust the pool. It gets `MaxConnectionsError`, a failed
+  attempt, and a WARNING, which is loud rather than silent. The built-in handlers make
+  one call at a time. If a real handler needs fan-out, the bound must grow with it.
+- Redis's `maxclients` (default 10,000) is far above any Phase 8 fleet: 12 workers at
+  concurrency 50 is at most 12 × 102 = 1,224 connections.

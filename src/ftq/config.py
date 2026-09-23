@@ -21,6 +21,14 @@ _QUEUE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 # done_ttl_seconds must be at least this many times Settings.job_lifetime_bound (ADR-010).
 _TTL_MARGIN = 10
 
+# Redis connections a worker can hold at once besides its jobs' (ADR-044): the fetch loop
+# (a blocking XREADGROUP or a reaper pass, one at a time) and the maintenance loop (the
+# retry scheduler, then consumer pruning, one at a time).
+_WORKER_LOOP_CONNECTIONS = 2
+# redis-py's own default pool size. Producers, the CLI and the harnesses ran on it and
+# never needed more, so no client gets a smaller pool than before.
+_MIN_POOL_CONNECTIONS = 100
+
 
 class Settings(BaseSettings):
     """Configuration for producers and workers. Field docs double as the README table."""
@@ -286,6 +294,21 @@ class Settings(BaseSettings):
         return min(self.suspect_deliveries, self.max_deliveries)
 
     @property
+    def redis_max_connections(self) -> int:
+        """The client's connection pool size (ADR-044): enough for everything a worker
+        can have waiting on Redis at the same moment.
+
+        Each in-flight job holds at most two connections at once: its handler's (a
+        ledger call) or, once the handler is done, its transition's (commit, retry, or
+        DLQ move), plus its heartbeat's. The heartbeat is stopped before the transition
+        starts. A timed-out run that keeps going counts against `concurrency` like a job.
+        The pool raises MaxConnectionsError rather than waiting when it's exhausted, so
+        this must be an upper bound: a heartbeat that failed would risk its lease.
+        """
+        per_jobs = 2 * self.concurrency
+        return max(_MIN_POOL_CONNECTIONS, per_jobs + _WORKER_LOOP_CONNECTIONS)
+
+    @property
     def job_lifetime_bound(self) -> float:
         """`lifetime_bound` for the default `job_timeout`."""
         return self.lifetime_bound(self.job_timeout)
@@ -308,6 +331,11 @@ def make_redis(settings: Settings) -> aioredis.Redis:
     Retries are safe because every write we send is idempotent on re-send (ADR-006):
     enqueue dedups by idempotency key or, without one, by job_id at commit time; the
     commit and ledger scripts are first-wins.
+
+    The pool is sized for a worker at this `concurrency` (ADR-044). It stays a raising
+    pool, not redis-py's BlockingConnectionPool: running out means the bound is wrong
+    (for instance a handler issuing concurrent Redis calls), and an error says so where
+    a wait would silently delay heartbeats.
     """
     retry = Retry(
         ExponentialWithJitterBackoff(
@@ -322,4 +350,5 @@ def make_redis(settings: Settings) -> aioredis.Redis:
         socket_connect_timeout=settings.socket_connect_timeout,
         health_check_interval=settings.health_check_interval,
         retry=retry,
+        max_connections=settings.redis_max_connections,
     )
