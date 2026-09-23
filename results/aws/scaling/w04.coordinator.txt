@@ -1,0 +1,5 @@
+2026-09-23 15:54:31,781 loadgen producing for 205 s (w04)
+2026-09-23 15:57:58,432 loadgen drained=True in 1.4 s; reading the results log
+2026-09-23 15:59:45,650 loadgen completed 13375/s (offered 13364/s) | e2e p50 1575 p99 1821 ms | redis main 0.746 | exactly-once True
+REPORT-BEGIN
+REPORT-END

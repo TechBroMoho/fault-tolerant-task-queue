@@ -1,0 +1,43 @@
+{
+ "taken_at_utc": "2026-09-23T15:54:25+00:00",
+ "services": [
+  {
+   "serviceName": "worker",
+   "desiredCount": 4,
+   "runningCount": 4,
+   "pendingCount": 0
+  },
+  {
+   "serviceName": "redis",
+   "desiredCount": 1,
+   "runningCount": 1,
+   "pendingCount": 0
+  }
+ ],
+ "worker_tasks": [
+  {
+   "task": "32af118c748a433797ccae696f8ca96c",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-035b96ba33b5b050b",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "706a33b5200f429992feeb4fecb860ae",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-0d4c32b46d39a0d28",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "9b95f1a3a925470f98949f8a330f1437",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-0dca7c619ad8fc423",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "9d85744e500f4bbda89d8f4a79e5b454",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-0227350d8228651ea",
+   "instance_type": "c7i-flex.large"
+  }
+ ]
+}

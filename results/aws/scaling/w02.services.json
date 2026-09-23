@@ -1,0 +1,31 @@
+{
+ "taken_at_utc": "2026-09-23T15:48:58+00:00",
+ "services": [
+  {
+   "serviceName": "worker",
+   "desiredCount": 2,
+   "runningCount": 2,
+   "pendingCount": 0
+  },
+  {
+   "serviceName": "redis",
+   "desiredCount": 1,
+   "runningCount": 1,
+   "pendingCount": 0
+  }
+ ],
+ "worker_tasks": [
+  {
+   "task": "0c39b08e744d4c7da66d1b11dd56fde5",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-0227350d8228651ea",
+   "instance_type": "c7i-flex.large"
+  },
+  {
+   "task": "e42c5526024d41c6bec50c8a43340464",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-001675d74dd5b4684",
+   "instance_type": "c7i-flex.large"
+  }
+ ]
+}

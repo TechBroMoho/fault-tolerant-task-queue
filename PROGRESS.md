@@ -10,14 +10,57 @@
 - **Follow-up done:** CI #7's chaos failure (I4 `kills = 2 < 3`, a harness scheduling
   gap, fixed in ADR-043), and the 1M record: 7 of 7 passing 1M runs on the current
   queue code.
-- **Current phase:** Phase 8 prep is done. **Waiting on Mohammed's yes** to the Phase 8
-  session: 18 vCPUs, ~68 min, ≈ $0.96, hard stop 2 h / $1.70.
-  - The driver is built and tested locally (ADR-048).
-  - **TODO next session start:** re-check Cost Explorer for the actual Phase 7 cost.
+- **Current phase:** Phase 8, **paused mid-session at Mohammed's request** (2026-09-23).
+  - Torn down and verified CLEAN at 16:01:32 UTC.
+  - 3 of 10 points done: scaling w01, w02, w04.
+  - **Resume:** `git checkout wip/driver-report-race`, fix the one test noted below,
+    merge, then run a new session. The driver skips saved points.
+  - **TODO next session start:** re-check Cost Explorer (Phase 7 ≈ $0.06, Phase 8
+    part 1 ≈ $0.26 at list prices).
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
 - **AWS:** only the budget and an empty ECR repo remain (both $0 idle). Spend to date ≈ $0.06 (estimate; Cost Explorer lags ~24 h, re-check).
 
 ## Phase log
+
+### Phase 8 session, part 1 (2026-09-23, paused)
+
+Approved by Mohammed (18 vCPUs, hard stop 2 h).
+- **Timeline (UTC):**
+  - Pushed 5a43a0c and d853d21; image `ftq:d853d21`.
+  - Applied 15:43:13, 24 resources; all 9 hosts registered by 15:43:32.
+  - Driver started 15:43:50.
+  - **Stopped at 15:59:54 when Mohammed asked to pause**, right after w04 and before
+    w08 started any loadgen task.
+  - `make aws-down`: 24 destroyed. verify-clean CLEAN at 16:01:32.
+  - About 18 min up, **≈ $0.26** (list prices).
+- **Results** (`results/aws/scaling/`: report, `.services.json` snapshot, both hosts'
+  logs):
+
+  ```
+  point  workers  completed/s  exactly-once  hosts  depth min  note
+  w01    1        3,564        True          2/2    19,849
+  w02    2        7,314        True          2/2    -          RECOVERED from CloudWatch (below)
+  w04    4        13,375       True          2/2    19,273
+  ```
+
+  - First-time ECS calls worked: `list-container-instances --filter` and `start-task`
+    on named instances. The two tasks ran on distinct hosts.
+- **w02 was FAILED by the driver: "no report", coordinator exit 0.** The driver read the
+  coordinator's CloudWatch log before any of it had arrived (0 lines). My "report
+  arrived" check wrongly accepted an empty log as "no report printed".
+  - The same run's report was read back from its CloudWatch stream with the new
+    `python -m deploy.bench recover`: label, suite, and run id checked.
+    `meta.recovered` names the stream.
+  - Nothing was rerun.
+- **Uncommitted fix, on the local branch `wip/driver-report-race` (not merged):**
+  - `run_pair` waits up to 180 s for the whole report whenever the coordinator exits 0
+    or 1.
+  - The `recover` command, plus 2 unit tests. The new race test catches the old logic.
+  - **Open:** `test_the_pair_runs_on_two_different_loadgen_hosts` now fails. Its fake
+    `aws` never returns a log, so the fixed driver waits for a report that never comes.
+    The fake needs to return a dumped report.
+  - Also 1 E501 in `tests/unit/test_deploy_bench.py`.
+- **Still to run:** scaling w08 and w12, headline × 3, backpressure × 2.
 
 ### Phase 8 prep: the benchmark driver (2026-09-23, $0)
 

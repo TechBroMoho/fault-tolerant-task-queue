@@ -1,0 +1,25 @@
+{
+ "taken_at_utc": "2026-09-23T15:44:18+00:00",
+ "services": [
+  {
+   "serviceName": "worker",
+   "desiredCount": 1,
+   "runningCount": 1,
+   "pendingCount": 0
+  },
+  {
+   "serviceName": "redis",
+   "desiredCount": 1,
+   "runningCount": 1,
+   "pendingCount": 0
+  }
+ ],
+ "worker_tasks": [
+  {
+   "task": "9d623c00d22546d2b6926ae31dd50202",
+   "last_status": "RUNNING",
+   "ec2_instance_id": "i-0227350d8228651ea",
+   "instance_type": "c7i-flex.large"
+  }
+ ]
+}
