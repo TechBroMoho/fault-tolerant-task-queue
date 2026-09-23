@@ -39,6 +39,7 @@ from .helpers import (
     running_worker,
     start_worker_process,
     wait_for,
+    watching_lease,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -373,7 +374,12 @@ async def test_waiting_for_a_pool_child_does_not_count_toward_the_timeout(
             assert json.loads(done["result"])["attempt"] == 0
     c = await read_counters(r, keys)
     assert (c["timeouts"], c["retried"], c["processed"]) == (0, 0, 3)
-    assert all(len(_runs(tmp_path / f"runs-{i}")) == 1 for i in range(3))  # none restarted
+    runs = [len(_runs(tmp_path / f"runs-{i}")) for i in range(3)]
+    # A rerun here has so far always come with a reclaim, not a pool reset: a lease lapsed
+    # although heartbeats were running (PROGRESS.md, Phase 4 review: cause not found yet).
+    # The counters in the message say which, if it happens again.
+    diagnosis = {k: c[k] for k in ("reclaimed", "lease_lost", "heartbeats")}
+    assert runs == [1, 1, 1], f"runs={runs} {diagnosis}"  # none restarted
 
 
 @pytest.mark.slow
@@ -400,3 +406,33 @@ async def test_built_in_hang_handlers_time_out_then_succeed(
     assert (counters["timeouts"], counters["retried"], counters["processed"]) == (3, 3, 3)
     assert [f["key"] for _id, f in await entries(r, keys.effects)] == [f"hang:{ids['hang']}"]
     await _assert_drained(r, keys, s.group)
+
+
+@pytest.mark.slow
+async def test_a_job_waiting_for_a_pool_child_keeps_its_lease(
+    r: aioredis.Redis, settings: Settings, keys: Keys, tmp_path: Path
+) -> None:
+    """Hypothesis checked in the Phase 4 review: if heartbeats only started once a job
+    got a pool child, a job queued behind a long one would lose its lease while healthy
+    and be reclaimed. One child, a 0.5 s lease: job 1 spins 2.5 s (five leases) while
+    job 2 waits for the permit. Redis's idle time for BOTH entries must stay under the
+    lease the whole time, and nothing may be reclaimed or run twice."""
+    s = fast(settings, process_pool_size=1)
+    client = Client(r, s)
+    long_job = await client.enqueue(
+        "spin_in_process", {"runs": str(tmp_path / "runs-long"), "seconds": 2.5}
+    )
+    waiting_job = await client.enqueue(
+        "spin_in_process", {"runs": str(tmp_path / "runs-waiting"), "seconds": 0.1}
+    )
+    async with (
+        watching_lease(r, keys.stream, s.group) as watch,
+        running_worker(r, s, blocking_handlers.registry),
+    ):
+        for job_id in (long_job, waiting_job):
+            await _wait_state(r, keys, job_id, "SUCCEEDED", within=20)
+    assert watch.samples > 50  # the sampler really watched the whole wait
+    assert watch.max_idle_ms < 500, f"a lease lapsed: idle reached {watch.max_idle_ms} ms"
+    c = await read_counters(r, keys)
+    assert (c["reclaimed"], c["processed"]) == (0, 2)
+    assert [len(_runs(tmp_path / f"runs-{n}")) for n in ("long", "waiting")] == [1, 1]

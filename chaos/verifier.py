@@ -235,6 +235,18 @@ async def verify(
             if seen.get(name, 0) < minimum:
                 i4.fail(f"{name} = {seen.get(name, 0)} < {minimum}")
         invariants["I4_faults_happened"] = i4.as_dict()
+        # W1 (beyond SPEC): the workers themselves stayed healthy. The supervisor restarts
+        # any worker that exits, so without this a worker bug (a crash with a traceback,
+        # an ERROR log line) would be papered over. Only crashy jobs may end a worker.
+        # The Phase 4 startup bug (ADR-038) was exactly such a crash.
+        unexpected = evidence.get("unexpected_exits", 0)
+        errors = evidence.get("error_log_lines", 0)
+        w1 = Check(True, {"unexpected_exits": unexpected, "error_log_lines": errors})
+        if unexpected:
+            w1.fail(f"{unexpected} worker exit(s) not caused by a crashy job")
+        if errors:
+            w1.fail(f"{errors} ERROR line(s) in the worker logs")
+        invariants["W1_workers_healthy"] = w1.as_dict()
     invariants["I5_drained"] = i5.as_dict()
 
     raw_histogram: Any = await redis.hgetall(keys.reclaims)

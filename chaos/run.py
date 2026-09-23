@@ -211,6 +211,10 @@ class Run:
                 **{k: v for k, v in injector.counts().items() if not k.startswith("by_")},
                 "pool_resets": logs["pool_resets"],
                 "crash_restarts": supervisor.restarts.get(70, 0),
+                "unexpected_exits": sum(n for code, n in supervisor.restarts.items() if code != 70),
+                # Workers log JSON only; a non-JSON line is a traceback or a crash message.
+                "error_log_lines": logs["by_level"].get("ERROR", 0)
+                + logs["by_level"].get("non-json", 0),
             }
             result = await verify(
                 redis,
