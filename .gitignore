@@ -46,3 +46,6 @@ tmp/
 
 # Chaos run directories (generated compose file, worker logs, accepted-job lists)
 chaos/runs/
+
+# Benchmark driver scratch (generated compose file, loadgen and worker logs)
+bench/runs/

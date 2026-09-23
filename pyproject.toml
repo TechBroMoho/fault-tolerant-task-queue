@@ -23,6 +23,7 @@ ftq = "ftq.cli:app"
 [dependency-groups]
 dev = [
     "httpx>=0.28,<0.29",
+    "matplotlib>=3.10,<4",
     "mypy>=2.3,<3",
     "pytest>=9.1,<10",
     "pytest-asyncio>=1.4,<2",
@@ -41,7 +42,7 @@ target-version = "py312"
 src = ["src", "tests"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["ftq", "chaos"]
+known-first-party = ["ftq", "chaos", "bench"]
 
 [tool.ruff.lint]
 select = [
@@ -59,7 +60,7 @@ select = [
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests", "chaos"]
+files = ["src", "tests", "chaos", "bench"]
 
 # ---------------------------------------------------------------- pytest
 [tool.pytest.ini_options]

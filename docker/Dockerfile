@@ -22,6 +22,10 @@ RUN uv sync --locked --no-dev --no-editable
 FROM python:3.12.13-slim-bookworm
 RUN useradd --system --uid 10001 --no-create-home ftq
 COPY --from=build /opt/venv /opt/venv
+# The benchmark harness rides along (a few KB): Phase 8 runs the same load generator as
+# an ECS task from this image (`python -m bench.loadgen`, run from /opt/ftq). It imports
+# only ftq and the stdlib; the charts (matplotlib) run on the host.
+COPY bench /opt/ftq/bench
 ENV PATH=/opt/venv/bin:$PATH PYTHONUNBUFFERED=1
 USER ftq
 # SIGTERM (docker stop / ECS) drains in-flight jobs within FTQ_SHUTDOWN_GRACE.

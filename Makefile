@@ -6,6 +6,7 @@ COMPOSE ?= docker compose
 WORKERS ?= 0
 N ?= 10000
 CHAOS_WORKERS ?= 8
+BENCH_ARGS ?=
 
 .DEFAULT_GOAL := help
 
@@ -55,14 +56,16 @@ endif
 down: ## Stop the local stack (workers too) and delete its data volume (dev data is disposable)
 	$(COMPOSE) --profile workers down -v
 
-# ---------------------------------------------------------------- later phases (stubs)
-# Stubs exit non-zero so nothing can mistake "not built yet" for "passed".
+# ---------------------------------------------------------------- chaos and benchmarks
 
 chaos: ## Chaos run + verifier: make chaos N=100000 [CHAOS_WORKERS=8] [SEED=s] -> results/local/chaos_report.json
 	$(UV) run python -m chaos.run --jobs $(N) --workers $(CHAOS_WORKERS) $(if $(SEED),--seed $(SEED),)
 
-bench: ## Local load test + charts (Phase 6)
-	@echo "make bench: not implemented yet (Phase 6)" >&2; exit 1
+bench: ## Local benchmark: scaling, latency, backpressure + charts -> results/local/bench/ (~25 min; run in background)
+	$(UV) run python -m bench.run scaling $(BENCH_ARGS)
+	$(UV) run python -m bench.run latency --skip-build $(BENCH_ARGS)
+	$(UV) run python -m bench.run backpressure --skip-build $(BENCH_ARGS)
+	$(UV) run python -m bench.plot
 
 # ---------------------------------------------------------------- AWS (BILLABLE except plan/verify)
 

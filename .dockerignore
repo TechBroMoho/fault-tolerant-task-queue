@@ -6,7 +6,7 @@
 .ruff_cache
 results
 chaos
-bench
+bench/runs
 tests
 deploy
 docs
