@@ -3,14 +3,133 @@
 ## Status
 
 - **Current phase:** Phase 2 (reliability: leases + reaper, heartbeats, retries with backoff,
-  delayed scheduler, DLQ + CLI, blocking handlers in pools, safe consumer pruning): **complete**,
-  at the gate awaiting review.
+  delayed scheduler, DLQ + CLI, blocking handlers in pools, safe consumer pruning): **complete
+  and reviewed** (post-gate skeptical review, see "Phase 2 review" below).
 - **Next:** Phase 3 (multiple worker processes, batching/pipelining measured before and after,
-  backpressure with hysteresis, `ftq stats`, JSON logs). Starts on Mohammed's go-ahead.
+  backpressure with hysteresis, `ftq stats`, JSON logs, **plus a per-job handler timeout**,
+  per Mohammed). Starts on Mohammed's go-ahead.
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
 - **AWS:** nothing created. Spend to date: $0.
 
 ## Phase log
+
+### Phase 2 review (2026-09-22)
+
+A skeptical post-gate review of the Phase 2 work, asked for by Mohammed. The goal: find
+correctness bugs, races between the retry/reclaim/commit paths, tests that can't fail,
+and doc claims with no test behind them. Every finding below was confirmed by a failing
+test or a surviving mutation before it was fixed.
+
+**Bugs fixed**
+- **`dlq requeue --all` never terminated while workers ran** (real bug). It paged forward
+  until the DLQ was empty. A requeued poison job dies again within milliseconds and lands
+  at the end of the DLQ, so the sweep chased it forever. A new test (20 poison jobs, a live
+  worker, page size 1) timed out at 10 s before the fix. Now the sweep snapshots the DLQ's
+  last id first and stops there (ADR-027).
+- **The heartbeat margin was wrong** (config bug). The validator allowed
+  `heartbeat_interval = lease / 2`, and ADR-025 said one lost beat "never" expires a lease.
+  Beats land every `interval + RTT`, so after one lost beat the idle time reaches
+  `2 × (interval + RTT)`, which is past the lease at exactly `/2`. Now it requires
+  `≤ lease / 3`. The defaults (10 s / 30 s) already satisfied it.
+- **A heartbeat in flight could land after the commit or retry** (a race, harmless to
+  state). The task was cancelled but not awaited. The ownership check made a late beat a
+  no-op `LEASE_LOST`, but it logged a false "lost the lease" warning and inflated the
+  counter. It is now cancelled and awaited before any transition.
+- **Only connection errors were handled around transitions.** A `ResponseError` from
+  commit, retry, or DLQ moves escaped the job task ("Task exception was never retrieved").
+  Now every `RedisError` is logged and the entry is left in the PEL.
+- `lease_lost` is documented as an upper bound on real lease losses: a retry or DLQ move
+  re-sent after a lost reply is refused and counted too.
+
+**Races between retry, reclaim, and commit: checked, found safe.** Each case below was
+reasoned through against the scripts, and each now has a test. Two of the tests are new:
+the review first said all of them were "covered", but two were not.
+- Stale commit after the reclaimer **committed**: suppressed (`test_stale_worker[committing]`).
+- Stale retry or DLQ move after a reclaim: `LEASE_LOST`, nothing changes
+  (`test_stale_worker[raising_*]` and the script-level stale tests).
+- Stale commit after the reclaimer **scheduled a retry**: a's commit is the first-wins
+  success; the retry then runs as a suppressed duplicate, and a failing copy is dropped
+  (`TERMINAL`) rather than retried or dead-lettered
+  (`test_stale_commit_after_the_reclaimer_scheduled_a_retry`, new).
+- Stale commit after a **DLQ move**: a late success, which replaces DEAD and deletes the DLQ
+  entry (`test_late_success_replaces_dead_and_removes_dlq_entry`).
+- Stale commit after a DLQ move **and a requeue**: requeue cleared DEAD, so it's a plain
+  first success, and the requeued copy is suppressed; one result
+  (`test_stale_commit_after_the_job_was_dead_lettered_and_requeued`, new).
+- Two copies of one job_id, one finished: the other's retry or DLQ move returns
+  `TERMINAL` (`test_retry_of_a_job_that_already_succeeded_drops_the_copy`,
+  `test_dead_never_replaces_succeeded`).
+- A reaper claim racing the owner's commit: both are atomic scripts; whichever runs second
+  sees the other's result (commit is first-wins; a claim of an acked entry finds nothing).
+  This one is argued from atomicity, not tested as a race.
+- A consumer deleted while blocked in `XREADGROUP`: impossible while the threshold exceeds
+  `block_ms`, which the config enforces (`test_live_idle_workers_never_prune_each_other`).
+
+**Tests that couldn't fail, now fixed** (see "Things that went wrong"): the Ctrl-C test
+(it signalled before the pool child existed) and the idle-prune test (`inactive` is -1
+until a consumer's first successful read). A test step that proved nothing (a thread-pool
+job offered as evidence of process-pool replacement) was removed. The scheduler race
+test is now bounded, so a regression fails in 10 s instead of hanging until pytest's 60 s
+timeout. The malformed/unknown-type test now asserts "straight to the DLQ" (0 attempts,
+1 delivery).
+
+**Claims that had no test, now tested** (10 new tests in the review, counting the two race tests above; 113 total):
+- Pool children ignore SIGINT: Ctrl-C drains a mid-job process-pool task.
+- A dead pool child fails one attempt and the pool is replaced.
+- The scheduler drains a backlog without sleeping between full batches.
+- The worker's retry due time stays within the backoff bound.
+- The reaper's cursor continues through a long PEL (`more` flag).
+- Pending ids whose data was deleted are logged at ERROR.
+- Two live idle workers never prune each other (Redis `idle` vs `inactive` semantics).
+- `requeue --all` is bounded and skips orphan entries.
+
+**A doc claim that was false.** "Spawn re-runs `__main__.py` in every child without a
+guard": removing the guard broke nothing, and CPython's spawn skips package `__main__`
+modules. It is corrected in ADR-028 and the code comment.
+
+**Still untested (documented as such).** Heartbeat retry after a Redis error, fetch/reap
+pauses on connection errors, and the "lost reply → re-send" behaviour of each script all
+need network fault injection (Toxiproxy, Phase 4). Also untested: the worker-level use of
+the reaper's `more` flag (the flag itself is tested) and the maintenance loop surviving
+errors.
+
+**Evidence**
+
+```
+$ make check > check.log 2>&1; echo "make check exit=$?"
+make check exit=0
+  49 files already formatted / All checks passed! / Success: no issues found in 43 source files
+  ============================= 113 passed in 42.56s =============================
+
+$ for i in 1 2 3 4 5; do uv run pytest -q ...; done      # flakiness check
+exit 0 x5; 33.83–47.33 s   (runs 1–2 predate the two race tests: 111; runs 3–5: 113)
+```
+
+The suite is still under SPEC Phase 2's 60 s, but the slowest run (47 s) leaves less
+margin. Phase 3 should keep the subprocess tests marked `slow` and watch the total.
+
+Mutation round 2, against the new tests and the corrected claims. Same method as Phase 2:
+scripted, one bug at a time, each file restored byte for byte (sha256-verified):
+
+```
+requeue_all unbounded (no end id)            -> CAUGHT (requeue_all_is_bounded...)
+pool children not terminated past grace      -> CAUGHT (sigterm_past_grace_terminates_process_pool_job)
+broken process pool not replaced             -> CAUGHT (a_dead_pool_child_fails_one_attempt...)
+scheduler sleeps after every batch           -> CAUGHT (scheduler_drains_a_backlog...)
+reaper cursor not kept between passes        -> CAUGHT (reaper_cursor_continues...)
+retry delay sent in us instead of ms         -> CAUGHT (worker_schedules_retry_within_the_backoff_bound)
+deleted pending ids not logged               -> CAUGHT (reclaim_reports_pending_entries...)
+pool children don't ignore SIGINT            -> MISSED, test rewritten -> CAUGHT (child's KeyboardInterrupt)
+prune uses 'inactive' instead of 'idle'      -> MISSED, test rewritten -> CAUGHT
+__main__ guard removed                       -> MISSED: the claim was false (see above), not the test
+requeue.lua leaves the DEAD record           -> CAUGHT (stale_commit_after_..._dead_lettered_and_requeued)
+retry.lua terminal-state check bypassed      -> CAUGHT (stale_commit_after_the_reclaimer_scheduled_a_retry)
+```
+
+Mohammed's decisions: the four "decisions worth review" are accepted (ADR-024: no terminal
+check on heartbeats, and a handler keeps running after it loses its lease; ADR-028: the
+spawn start method, and the private `_processes` map). The hung handler gets a per-job
+timeout in Phase 3 (ADR-025).
 
 ### Phase 2: Reliability (2026-09-22)
 
@@ -36,8 +155,7 @@
 - **Requirement 1: blocking/CPU-bound handlers can't starve heartbeats** (ADR-028):
   `register_sync(type, pool="thread" | "process")`. The process pool uses `spawn`, its
   children ignore SIGINT, a broken pool is replaced, and children are terminated when the
-  grace period runs out. `cpu_task` now runs in the process pool. `ftq/__main__.py` got the
-  `if __name__ == "__main__"` guard that spawn needs.
+  grace period runs out. `cpu_task` now runs in the process pool.
 - **Requirement 2: consumer cleanup never deletes a consumer with pending entries**
   (ADR-029): `prune_consumers.lua` deletes an idle consumer only if `XPENDING` filtered by
   that consumer is empty, checked and deleted atomically. It runs from the maintenance
@@ -120,7 +238,8 @@ consumer-filtered), `XINFO CONSUMERS`, and `cjson` all work inside Lua.
 
 **Open issues**
 - A handler that hangs forever on a healthy worker keeps its lease forever (heartbeats keep
-  it alive): stuck in the PEL, not lost. No per-job timeout yet (ADR-025); decide by Phase 4.
+  it alive): stuck in the PEL, not lost (ADR-025). **Decided (Mohammed): a per-job timeout
+  in Phase 3**, details in the Phase 3 prompt.
 - `max_deliveries` default 10 and `max_attempts` 5 are provisional. Phase 4 sizes
   `max_deliveries` against the fault schedule (ADR-008).
 - Process-pool jobs pay pickling + IPC per job; unmeasured until Phase 6. An abandoned
@@ -322,8 +441,17 @@ pytest exit (redis up)=0
   asserts that sequence end to end.
   Also caught in review before committing: a "watch across many prune passes" loop that
   took ~3 ms and so spanned no passes; its checks are now spaced one interval apart.
-- **2026-09-22 (Phase 2): spawn would have re-run the CLI.** `python -m ftq` makes
-  `ftq/__main__.py` the main module, and the process pool's `spawn` start method re-imports
-  it in every child. Without an `if __name__ == "__main__"` guard, each pool child would have
-  started its own `ftq worker`. Caught while designing the pool (ADR-028), before any test ran;
-  the process-pool subprocess tests exercise the fixed path.
+- **2026-09-22 (Phase 2 review): a documented fix for a bug that didn't exist.** Phase 2
+  added an `if __name__ == "__main__"` guard to `ftq/__main__.py`, and ADR-028 plus this log
+  said that without it every spawned pool child would re-run the CLI. Nothing tested that.
+  The review's mutation check removed the guard and every test still passed. CPython's
+  `multiprocessing.spawn._fixup_main_from_name` deliberately skips `*.__main__` modules.
+  The guard stays as hygiene; the claim was corrected in ADR-028. Lesson: a design-time
+  "this would break" belongs in the docs only once a test shows it breaking.
+- **2026-09-22 (Phase 2 review): two tests that couldn't fail.** Mutation checks showed
+  (1) the Ctrl-C test passed even with the pool's SIGINT-ignoring initializer removed,
+  because it signalled before the lazily created pool child existed; and (2) the
+  "live idle workers aren't pruned" test passed even when pruning keyed on the wrong XINFO
+  field, because `inactive` is -1 for a consumer that never had a successful read. Both
+  were rewritten until the planted bug made them fail: the job now writes a marker from
+  inside the child before the signal, and each consumer gets one successful read first.

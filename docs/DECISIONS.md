@@ -611,14 +611,15 @@ other worker must notice and take them over without violating the in-flight cap.
   ERROR. Our exits always ack before deleting, so it should never happen.
 
 **Consequences.**
-- Recovery latency after a crash is at most `visibility_timeout + reap_interval` plus
+- Recovery latency after a crash is at most `visibility_timeout + reap_interval +
+  block_ms` (a due reaper pass waits for the current blocking read to return), plus
   however long it takes until some worker has a free slot. When every worker is saturated,
   stale jobs wait like any queued job.
 - Lease length trade-off (SPEC §10): a short lease recovers crashed jobs faster but turns
   more stalls (GC pauses, network blips) into reclaims and suppressed duplicates. Heartbeats
   (ADR-025) decouple job duration from the lease, so the lease only has to cover a
-  heartbeat interval plus Redis latency hiccups. 30 s with 10 s heartbeats tolerates two
-  consecutive missed beats.
+  heartbeat interval plus Redis latency hiccups. 30 s with 10 s heartbeats tolerates one
+  lost beat with a full interval to spare (ADR-025 explains why lease/2 would not).
 
 ---
 
@@ -655,6 +656,9 @@ heartbeat the lease back from the new owner (SPEC §4).
   cancelling the handler: that's unsafe for arbitrary handler code, impossible for a
   process-pool job, and it saves only redundant work.
 
+*Phase 2 review (Mohammed): both deviations above, no terminal check on heartbeats and
+letting a handler finish after its lease is lost, are accepted.*
+
 **Consequences.** The stale-worker test runs all three ways a stale worker can resume
 (retry refused, DLQ move refused, commit suppressed) and ends with one terminal state, one
 result, and one effect each time. A unit test checks that no write precedes the `XPENDING`
@@ -677,8 +681,15 @@ with the PEL, which is what XAUTOCLAIM actually reads.
 ~0 and the delivery count is unchanged. `test_heartbeat_resets_idle_without_bumping_delivery_count`
 asserts both.
 - Every job gets a heartbeat task running beside its handler, every `heartbeat_interval`
-  (default 10 s). The config requires `2 × heartbeat_interval ≤ visibility_timeout`, so one
-  lost beat never expires a healthy lease.
+  (default 10 s). The config requires `3 × heartbeat_interval ≤ visibility_timeout`. Beats
+  land every `interval + one round trip`, so after one lost beat the idle time reaches
+  `2 × (interval + RTT)` before the next beat lands. At `interval = lease / 2` that is
+  already past the lease. (Phase 2 shipped with the `/2` rule and the claim "one lost beat
+  never expires a lease"; the review found the arithmetic wrong and tightened it to `/3`.)
+- The heartbeat task is cancelled **and awaited** before the job's commit, retry, or DLQ
+  move, so no beat in flight on the client side lands after the transition. One that
+  still reached Redis late would be harmless, since the ownership check turns it into
+  `LEASE_LOST`.
 - `register(..., heartbeat=False)` opts a handler out. The `slow` chaos handler uses it so
   its lease is guaranteed to lapse (ADR-007).
 - A heartbeat that fails with a Redis error is logged, and the loop tries again next
@@ -692,6 +703,9 @@ asserts both.
   shows up in `XPENDING`). A per-handler timeout that counts as a failed attempt is future
   work. It's simple for async handlers (`asyncio.wait_for`), but needs a kill for
   process-pool jobs. No Phase 4 chaos job hangs forever.
+  *Phase 2 review (Mohammed): add a per-job timeout in Phase 3; details to follow.*
+- Not yet tested: that a heartbeat failing with a Redis error is retried at the next
+  interval. It needs network fault injection (Toxiproxy, Phase 4).
 
 ---
 
@@ -755,8 +769,11 @@ job with its last error, attempts, and time, and a CLI to list and requeue.
   job's fields with `attempt = 0`, delete the DLQ entry, clear the DEAD record. The job
   keeps its job_id, so the ledger still suppresses effects that already happened: a
   requeued job that charged a card before failing won't charge it again (tested).
-  `--all` pages through the DLQ with an exclusive start id, so an entry that can't be
-  requeued isn't retried forever.
+  `--all` requeues what was in the DLQ **when it started**: it reads the last DLQ id
+  first and stops there. It pages with an exclusive start id, so an entry that can't be
+  requeued isn't read twice. (The Phase 2 review found the first version unbounded: with
+  workers running, requeued poison jobs died again at the end of the DLQ and the sweep
+  chased them forever. A test reproduces that with 20 jobs and now passes.)
 
 **Consequences.** The DLQ holds exactly the jobs whose state is DEAD, which keeps chaos
 invariant I3 simple. `max_deliveries` defaults to 10 for now; Phase 4 sizes it against the
@@ -797,12 +814,17 @@ function `fn(job: Job) -> result`, run via `loop.run_in_executor`.
 - **Process pool:** size `process_pool_size` (default 2), created on first use. It uses the
   **`spawn`** start method on every OS: forking a process that runs an event loop and
   Redis connections copies them in an undefined state, and spawn is the macOS default
-  anyway, so laptop and Linux containers behave alike. Spawn re-imports the parent's main
-  module, which is why `ftq/__main__.py` now has an `if __name__ == "__main__"` guard.
-  Children ignore SIGINT, so Ctrl-C drains the worker instead of failing the jobs.
+  anyway, so laptop and Linux containers behave alike. (Phase 2 also claimed spawn would
+  re-run `ftq/__main__.py` in every child without an `if __name__ == "__main__"` guard. The
+  review's mutation checks disproved that: CPython's spawn deliberately skips a package's
+  `__main__` module. The guard stays as hygiene.) Children ignore SIGINT, so Ctrl-C
+  drains the worker instead of failing the jobs. Without that, the child's
+  KeyboardInterrupt comes back into the worker as a BaseException that escapes the
+  handler-failure path (tested, with the signal sent while the child is provably mid-job).
   Registration rejects nested functions, which can't be pickled by import path.
 - **A dead pool child** (killed, or crashed the interpreter) raises `BrokenProcessPool`. The
   worker replaces the pool, and the jobs that were running in it count as failed attempts.
+  A test kills a child mid-job; the retry succeeds in the replacement pool.
 - **Shutdown past the grace period** terminates the pool's children. Otherwise the
   interpreter would wait for them at exit, and the grace period wouldn't bound shutdown
   (tested). Python 3.12 has no public API for this, so we use the pool's private process
@@ -811,6 +833,9 @@ function `fn(job: Job) -> result`, run via `loop.run_in_executor`.
   for a thread. A thread can't be killed, so an abandoned blocking handler keeps the
   process alive until it returns, and `docker stop` escalates to SIGKILL.
 - `cpu_task` is now a process-pool handler.
+
+*Phase 2 review (Mohammed): the spawn start method and the private `_processes` map are
+accepted.*
 
 **Consequences.**
 - Process-pool jobs pay for pickling the job and result, plus IPC. That goes in the Phase 6
@@ -856,8 +881,10 @@ nothing. The script is atomic, so no read or claim can hand the consumer an entr
 the check and the delete. Every worker runs it every `consumer_prune_interval` (60 s) and
 at startup. The idle threshold only avoids churning live consumers; the pending check is
 what makes deletion safe. On Redis 7.2+, `idle` means time since the last *attempted*
-interaction, so a live worker blocked in `XREADGROUP` stays under `block_ms`. The config
-requires the threshold to exceed `block_ms`.
+interaction, so a live worker blocked in `XREADGROUP` stays under `block_ms`. (`inactive`,
+time since the last *successful* read, would be wrong: it grows on every idle worker.) The
+config requires the threshold to exceed `block_ms`. A test runs two live idle workers
+whose `inactive` passes the threshold while `idle` stays below it, and neither is pruned.
 
 **Consequences.** A crashed worker's record stays until a reaper has moved all its entries
 away; then it's pruned at the next pass once its idle time passes the threshold. Tests: a
