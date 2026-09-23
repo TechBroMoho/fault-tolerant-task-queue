@@ -144,6 +144,7 @@ async def test_malformed_and_unknown_jobs_go_straight_to_dlq(
     await _assert_drained(r, keys, s.group)
 
 
+@pytest.mark.slow  # > 1 s: runs in `make test-all` and CI
 async def test_long_job_with_heartbeats_is_not_reclaimed(
     r: aioredis.Redis, settings: Settings, keys: Keys
 ) -> None:
@@ -172,6 +173,7 @@ async def test_long_job_with_heartbeats_is_not_reclaimed(
     assert counters["duplicates_suppressed"] == 0
 
 
+@pytest.mark.slow  # > 1 s: runs in `make test-all` and CI
 async def test_long_job_without_heartbeats_is_reclaimed_but_its_effect_happens_once(
     r: aioredis.Redis, settings: Settings, keys: Keys
 ) -> None:
@@ -251,6 +253,7 @@ async def test_stale_worker(
     await _assert_drained(r, keys, s.group)
 
 
+@pytest.mark.slow  # > 1 s: runs in `make test-all` and CI
 async def test_heartbeats_stop_after_the_lease_is_lost(
     r: aioredis.Redis, settings: Settings, keys: Keys
 ) -> None:

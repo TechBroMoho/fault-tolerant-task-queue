@@ -1,6 +1,7 @@
 """Shared helpers for integration tests (kept out of conftest so tests can import them)."""
 
 import asyncio
+import json
 import os
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -204,8 +205,7 @@ async def start_worker_process(
         start_new_session=new_session,
     )
     line = await read_until(proc, ": started (")
-    worker_id = line.split("worker ", 1)[1].split(": started", 1)[0]
-    return proc, worker_id
+    return proc, str(json.loads(line)["worker_id"])  # JSON logs by default (logs.py)
 
 
 async def read_until(proc: asyncio.subprocess.Process, marker: str, within: float = 10) -> str:

@@ -3,12 +3,15 @@
 from importlib.resources import files
 
 import pytest
+import redis.asyncio as aioredis
 
+from ftq.config import Settings
 from ftq.handlers import registry as builtin
 from ftq.keys import Keys
 from ftq.lua import script_source
 from ftq.models import Job
 from ftq.registry import AsyncSpec, JobContext, Registry, SyncSpec
+from ftq.worker import Worker
 
 
 def test_duplicate_registration_rejected() -> None:
@@ -45,6 +48,39 @@ def test_sync_registration_and_process_pool_picklability_check() -> None:
     registry.register_sync("thread-ok", pool="thread")(nested)  # threads don't pickle
 
 
+def test_timeout_is_per_type_and_must_be_positive() -> None:
+    registry = Registry()
+
+    async def handler(ctx: JobContext) -> None:
+        return None
+
+    registry.register("a", timeout=2.5)(handler)
+    registry.register_sync("t", pool="thread", timeout=1.0)(_module_level_sync)
+    registry.register("default")(handler)
+    assert registry.get("a") == AsyncSpec(fn=handler, heartbeat=True, timeout=2.5)
+    assert registry.get("t") == SyncSpec(_module_level_sync, "thread", True, 1.0)
+    default = registry.get("default")
+    assert default is not None and default.timeout is None  # = Settings.job_timeout
+    for bad in (0, -1.0):
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            registry.register("bad", timeout=bad)
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            registry.register_sync("bad", pool="process", timeout=bad)
+
+
+def test_worker_rejects_a_type_timeout_its_ttl_cannot_cover() -> None:
+    """ADR-010 + ADR-030: a longer per-type timeout lengthens that type's deliveries,
+    so the done/ledger TTL must cover it too, not just the default timeout."""
+    settings = Settings(done_ttl_seconds=200_000)  # covers the 300 s default (needs 180 000)
+    registry = Registry()
+    registry.register_sync("slow_report", pool="process", timeout=3000.0)(_module_level_sync)
+    with pytest.raises(ValueError, match="ADR-010"):
+        Worker(aioredis.Redis(), settings, registry)
+    ok = Registry()
+    ok.register_sync("quick", pool="process", timeout=10.0)(_module_level_sync)
+    Worker(aioredis.Redis(), settings, ok)  # a shorter one is fine
+
+
 def test_builtin_handlers() -> None:
     assert builtin.types() == ["cpu_task", "crashy", "flaky", "poison", "send_email", "slow"]
     # cpu_task must not run on the event loop, or it starves heartbeats (ADR-028).
@@ -64,6 +100,7 @@ def test_keys_share_one_hash_tag() -> None:
         k.results,
         k.effects,
         k.stats,
+        k.full,
         k.done("j"),
         k.idem("i"),
         k.ledger("l"),

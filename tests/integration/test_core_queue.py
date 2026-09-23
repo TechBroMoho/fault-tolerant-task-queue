@@ -81,6 +81,7 @@ async def test_idempotent_enqueue_returns_original_id(
     assert stored[0][1]["idempotency_key"] == "order-42"
 
 
+@pytest.mark.slow  # > 1 s: runs in `make test-all` and CI
 async def test_idempotency_key_expires_after_ttl(r: aioredis.Redis, settings: Settings) -> None:
     short = settings.model_copy(update={"idempotency_ttl_seconds": 1})
     keys = Keys(short.queue)

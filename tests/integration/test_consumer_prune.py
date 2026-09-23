@@ -137,6 +137,7 @@ async def test_running_worker_prunes_only_empty_idle_consumers(
     assert not await r.exists(keys.done(job_id))  # not run yet: its lease hasn't expired
 
 
+@pytest.mark.slow  # > 1 s: runs in `make test-all` and CI
 async def test_live_idle_workers_never_prune_each_other(
     r: aioredis.Redis, settings: Settings, keys: Keys
 ) -> None:

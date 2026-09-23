@@ -69,17 +69,34 @@ def test_done_ttl_must_outlast_redelivery_bound() -> None:
         visibility_timeout=10.0,
         heartbeat_interval=2.0,
         job_backoff_cap=20.0,
+        job_timeout=5.0,
         done_ttl_seconds=0,  # 0 = never expire, always allowed
     )
-    # 2 attempts x (3 deliveries x 10 s lease + 20 s backoff) = 100 s.
-    assert s.job_lifetime_bound == 100.0
+    # Each delivery lasts at most timeout + lease (a run times out, or its worker dies
+    # and the lease expires, ADR-030): 2 attempts x (3 x (5 + 10) s + 20 s backoff) = 130 s.
+    assert s.job_lifetime_bound == 130.0
     base = s.model_dump()
     with pytest.raises(ValidationError, match="ADR-010"):
-        Settings.model_validate({**base, "done_ttl_seconds": 999})  # < 10 x 100 s
-    Settings.model_validate({**base, "done_ttl_seconds": 1000})
+        Settings.model_validate({**base, "done_ttl_seconds": 1299})  # < 10 x 130 s
+    Settings.model_validate({**base, "done_ttl_seconds": 1300})
+    # A longer timeout lengthens every delivery, so the same TTL stops being enough.
+    with pytest.raises(ValidationError, match="ADR-010"):
+        Settings.model_validate({**base, "done_ttl_seconds": 1300, "job_timeout": 6.0})
 
 
 def test_defaults_are_consistent() -> None:
     s = Settings()
     assert s.done_ttl_seconds >= 10 * s.job_lifetime_bound
     assert 3 * s.heartbeat_interval <= s.visibility_timeout
+
+
+def test_low_watermark_must_be_below_high() -> None:
+    # With no gap there is no hysteresis: the queue would flip on every enqueue (ADR-031).
+    with pytest.raises(ValidationError, match="low_watermark"):
+        Settings(high_watermark=10, low_watermark=10)
+    Settings(high_watermark=10, low_watermark=9)
+
+
+def test_job_timeout_must_be_positive() -> None:
+    with pytest.raises(ValidationError):
+        Settings(job_timeout=0)

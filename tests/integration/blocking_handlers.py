@@ -59,3 +59,57 @@ def spin_after_marking(job: Job) -> dict[str, Any]:
 
 
 registry.register_sync("spin_after_marking", pool="process")(spin_after_marking)
+
+
+# ---------------------------------------------------------------- per-job timeouts (ADR-030)
+
+
+def _record_run(job: Job) -> None:
+    """Append this child's pid to payload["runs"]: one line per run of the job, so a test
+    can see a run was restarted and which process ran it."""
+    with open(job.payload["runs"], "a") as f:
+        f.write(f"{os.getpid()}\n")
+
+
+def hang_first_attempt_in_process(job: Job) -> dict[str, Any]:
+    """Attempt 0 hangs (the timeout must kill its child); later attempts succeed."""
+    _record_run(job)
+    if job.attempt == 0:
+        time.sleep(3600)
+    return {"attempt": job.attempt, "pid": os.getpid()}
+
+
+registry.register_sync("hang_first_attempt_in_process", pool="process", timeout=1.5)(
+    hang_first_attempt_in_process
+)
+
+
+def spin_in_process(job: Job) -> dict[str, Any]:
+    """Burns CPU for payload["seconds"]; an innocent bystander in a pool that gets reset."""
+    _record_run(job)
+    deadline = time.monotonic() + float(job.payload["seconds"])
+    digest = b"x"
+    while time.monotonic() < deadline:
+        digest = hashlib.sha256(digest).digest()
+    return {"attempt": job.attempt, "pid": os.getpid()}
+
+
+registry.register_sync("spin_in_process", pool="process", timeout=30.0)(spin_in_process)
+
+
+def hang_forever_in_thread(job: Job) -> None:
+    """A blocking call that never returns, e.g. an SDK with no timeout of its own."""
+    time.sleep(3600)
+
+
+registry.register_sync("hang_forever_in_thread", pool="thread", timeout=0.5)(hang_forever_in_thread)
+
+
+def spin_briefly_in_process(job: Job) -> dict[str, Any]:
+    """~payload["seconds"] of CPU, under a timeout only a little longer than that."""
+    return spin_in_process(job)
+
+
+registry.register_sync("spin_briefly_in_process", pool="process", timeout=1.5)(
+    spin_briefly_in_process
+)
