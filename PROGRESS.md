@@ -10,13 +10,43 @@
 - **Follow-up done:** CI #7's chaos failure (I4 `kills = 2 < 3`, a harness scheduling
   gap, fixed in ADR-043), and the 1M record: 7 of 7 passing 1M runs on the current
   queue code.
-- **Next:** Phase 7 (AWS deployment, BILLABLE). Starts with $0 read-only pre-flight on
-  Mohammed's go-ahead. Nothing billable is created without an itemized estimate and an
-  explicit "yes".
+- **Phase 7 pre-flight (read-only, $0) done 2026-09-23.** **Blocker:** the EC2 vCPU
+  quota is 5, so at most two 2-vCPU instances can run; the plan needs ~16.
+  Waiting on Mohammed to choose a sizing option (quota increase or not). Nothing billable
+  is created without an itemized estimate and an explicit "yes".
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
 - **AWS:** nothing created. Spend to date: $0.
 
 ## Phase log
+
+### Phase 7 pre-flight: read-only AWS checks (2026-09-23, $0)
+
+Profile `ftq`, region `us-west-2`, AWS CLI 2.37.0. Only read-only calls, plus
+`run-instances --dry-run` (creates nothing). No Cost Explorer calls ($0.01 each).
+- **Identity:** `arn:aws:iam::<acct>:user/ftq-admin`, an IAM user, not root
+  (`AdministratorAccess` attached).
+- **Free plan** (`aws freetier get-account-plan-state`): type FREE, status ACTIVE,
+  **remaining credits $100.00**, **expires 2027-03-19** 02:30 UTC.
+- **Instance types** (`describe-instance-types --filters free-tier-eligible=true`):
+  c7i-flex.large (2 vCPU / 4 GiB), m7i-flex.large (2 / 8), t3.micro, t3.small,
+  t4g.micro, t4g.small, t8i.micro, t8i.small. All are 2 vCPU.
+  - Whether the Free plan *blocks* other types is **not verified**. `run-instances
+    --dry-run` said "would have succeeded" for c7i.2xlarge, and also for 3×
+    c7i-flex.large (6 vCPU, over the quota). So dry-run checks only IAM, not quotas or
+    plan limits, and proves nothing here.
+- **vCPU quota** L-1216C47A (Running On-Demand Standard): **5.0** (AWS default 5.0,
+  adjustable). No quota requests in the history. Fargate's vCPU quota is 6.0 (unused;
+  staying on EC2, per SPEC).
+- **Account is empty:** 0 instances, EIPs, NAT gateways, ECS clusters, ECR repos,
+  budgets. The default VPC has default subnets in us-west-2a–d.
+- **ECS-optimized AMI** (SSM `/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended`):
+  al2023-ami-ecs-hvm-2023.0.20260918, 30 GB gp3 root.
+- **Prices** (Pricing API, on-demand, us-west-2): c7i-flex.large $0.08479/h,
+  m7i-flex.large $0.09576/h, t3.small $0.0208/h, gp3 $0.08/GB-month, public IPv4
+  $0.005/h, CloudWatch Logs ingestion $0.50/GB, ECR storage $0.10/GB-month.
+
+**Consequence:** the SPEC's 16-vCPU fleet (12 workers + Redis + loadgen) doesn't fit in
+5 vCPUs. Options and estimates were given to Mohammed in chat; the choice is his.
 
 ### Phase 7 prep: the worker's connection pool (2026-09-23)
 
