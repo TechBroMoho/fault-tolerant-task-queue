@@ -15,13 +15,16 @@ Reads every `<suite>/*.json` that bench/run.py wrote and produces, next to them:
   second, in reject and block mode;
 - `summary.json` / `summary.md`: every number the charts show, per point.
 
-Nothing is computed here that isn't in the reports: this only selects and draws.
+Nothing is measured here: this selects numbers from the reports and draws them. The
+one derived column, Redis µs per job, is the report's main-thread CPU divided by its
+completed jobs/s.
 """
 
 import argparse
 import json
 import statistics
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,8 +35,8 @@ import matplotlib.pyplot as plt  # (after the backend is chosen)
 
 DEFAULT = Path(__file__).resolve().parents[1] / "results" / "local" / "bench"
 
-# Reference categorical palette, fixed order (blue, orange, aqua, yellow), and ink.
-BLUE, ORANGE, AQUA, YELLOW = "#2a78d6", "#eb6834", "#1baf7a", "#eda100"
+# Reference categorical palette, fixed order (blue, orange, aqua, yellow, magenta), and ink.
+BLUE, ORANGE, AQUA, YELLOW, MAGENTA = "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"
 INK, INK_2, MUTED, GRID, SURFACE = "#0b0b0b", "#52514e", "#8a8983", "#e4e3de", "#fcfcfb"
 SUBTITLE = "Local run: MacBook (Apple M4), Docker Desktop VM with 10 CPUs. Not the AWS headline."
 
@@ -68,9 +71,13 @@ def load(results: Path, suite: str) -> list[dict[str, Any]]:
 
 
 def _finish(fig: Any, title: str, out: Path) -> None:
-    fig.suptitle(title, x=0.01, ha="left", fontsize=13, fontweight="bold", color=INK)
-    fig.text(0.01, 0.935, SUBTITLE, ha="left", fontsize=8.5, color=INK_2)
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    # Title and subtitle in fixed points from the top, so they never collide.
+    h = fig.get_figheight() * 72
+    fig.text(
+        0.01, 1 - 10 / h, title, ha="left", va="top", fontsize=13, fontweight="bold", color=INK
+    )
+    fig.text(0.01, 1 - 30 / h, SUBTITLE, ha="left", va="top", fontsize=8.5, color=INK_2)
+    fig.tight_layout(rect=(0, 0, 1, 1 - 48 / h))
     fig.savefig(out, dpi=150)
     plt.close(fig)
     print(f"wrote {out}")
@@ -82,6 +89,10 @@ def _row(r: dict[str, Any]) -> dict[str, Any]:
     return {
         "label": r["meta"]["label"],
         "workers": r["meta"]["workers"],
+        "date_utc": r["meta"]["date_utc"],
+        "loadgen_processes": r["spec"]["processes"],
+        "saturated_mode": r["spec"]["max_depth"] > 0,
+        "redis_io_threads": r["meta"].get("redis_io_threads", 1),
         "concurrency": r["meta"]["worker_concurrency"],
         "offered_per_s": t["offered_per_s"],
         "accepted_per_s": t["accepted_per_s"],
@@ -93,6 +104,11 @@ def _row(r: dict[str, Any]) -> dict[str, Any]:
         "enqueue_call_p99_ms": r["enqueue_call_ms"].get("p99"),
         "enqueue_batch_p50": r["enqueue_batch_jobs"].get("p50"),
         "redis_main_thread": r["redis"]["main_thread_busy"],
+        "redis_us_per_job": (
+            round(r["redis"]["main_thread_busy"] / t["completed_per_s"] * 1e6, 1)
+            if r["redis"]["main_thread_busy"] and t["completed_per_s"]
+            else None
+        ),
         "redis_container": cpu["redis_container"],
         "worker_mean": cpu["worker_mean"],
         "worker_max": cpu["worker_max"],
@@ -124,50 +140,75 @@ def _median(rows: list[dict[str, Any]], key: str) -> float:
     return statistics.median(values)
 
 
+def sessions(rows: list[dict[str, Any]], gap_min: float = 10) -> list[list[dict[str, Any]]]:
+    """Split runs into sessions: a new session starts after a gap of `gap_min` minutes
+    with no run. Throughput on this laptop shifted between sessions (ADR-042), so the
+    chart shows each session instead of one median across both."""
+    ordered = sorted(rows, key=lambda r: r["date_utc"])
+    out: list[list[dict[str, Any]]] = []
+    last: datetime | None = None
+    for r in ordered:
+        t = datetime.fromisoformat(r["date_utc"])
+        if last is None or (t - last).total_seconds() > gap_min * 60:
+            out.append([])
+        out[-1].append(r)
+        last = t
+    return out
+
+
+def _span(runs: list[dict[str, Any]]) -> str:
+    first, last = runs[0]["date_utc"][11:16], runs[-1]["date_utc"][11:16]
+    return f"{first}-{last} UTC"
+
+
 def plot_scaling(rows: list[dict[str, Any]], out: Path) -> None:
-    groups = _by_workers(rows)
-    ws = list(groups)
-    med = [_median(g, "completed_per_s") for g in groups.values()]
-    lo = [
-        m - min(r["completed_per_s"] for r in g) for m, g in zip(med, groups.values(), strict=True)
-    ]
-    hi = [
-        max(r["completed_per_s"] for r in g) - m for m, g in zip(med, groups.values(), strict=True)
-    ]
-    fig, ax = plt.subplots(figsize=(7.5, 4.6))
-    ax.plot(
-        ws, [med[0] * w for w in ws], color=MUTED, lw=1.2, ls="--", label="1 worker x N (linear)"
-    )
-    ax.errorbar(
-        ws,
-        med,
-        yerr=[lo, hi],
-        color=BLUE,
-        marker="o",
-        ms=7,
-        capsize=4,
-        mec=SURFACE,
-        mew=2,
-        label="measured, median of repeats (bars: min-max)",
-    )
-    for w, m in zip(ws, med, strict=True):
-        ax.annotate(
-            f"{m / 1000:.1f}K",
-            (w, m),
-            textcoords="offset points",
-            xytext=(0, 10),
-            ha="center",
-            color=INK,
-            fontsize=9,
-        )
-    ax.set_xticks(ws)
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    top = 0.0
+    for runs, color in zip(sessions(rows), (BLUE, ORANGE, AQUA, YELLOW), strict=False):
+        groups = _by_workers(runs)
+        ws = list(groups)
+        med = [_median(g, "completed_per_s") for g in groups.values()]
+        n = min(len(g) for g in groups.values())
+        for w, g in groups.items():
+            ys = [r["completed_per_s"] for r in g]
+            ax.scatter([w] * len(ys), ys, s=16, color=color, alpha=0.45, linewidths=0)
+            top = max(top, *ys)
+        ax.plot(ws, med, color=color, marker="o", ms=7, mec=SURFACE, mew=2,
+                label=f"{_span(runs)}: median of {n} runs (dots: each run)")  # fmt: skip
+        for w, m in zip(ws, med, strict=True):
+            ax.annotate(f"{m / 1000:.1f}K", (w, m), textcoords="offset points", xytext=(9, -4),
+                        ha="left", color=INK, fontsize=8.5)  # fmt: skip
+    ax.set_xticks(sorted({r["workers"] for r in rows}))
     ax.set_xlabel("worker containers (one process each)")
     ax.set_ylabel("completed jobs/s (steady-state window)")
-    ax.set_ylim(0, max(max(med) * 1.35, med[0] * 2.5))
-    ax.legend(loc="upper left")
-    n = len(next(iter(groups.values())))
-    ax.set_title(f"send_email, 100 B payload, {n} repeats per point", fontweight="normal")
-    _finish(fig, "Completed jobs/s vs worker count", out)
+    ax.set_ylim(0, top * 1.2)
+    ax.legend(loc="lower right")
+    ax.set_title("send_email, 100 B payload, concurrency 50, saturated", fontweight="normal")
+    _finish(fig, "Completed jobs/s vs worker count, by session", out)
+
+
+def plot_redis_cost(runs: list[dict[str, Any]], out: Path) -> None:
+    """Redis main-thread µs per completed job for every saturated run, in time order.
+    The commands per job are the same in every run (redis_commands in the reports), so
+    a change here is Redis's thread running the same work faster or slower."""
+    fig, ax = plt.subplots(figsize=(8, 4.6))
+    t0 = min(datetime.fromisoformat(r["date_utc"]) for r in runs)
+    colors = dict(zip((1, 2, 4, 8, 12), (BLUE, ORANGE, AQUA, YELLOW, MAGENTA), strict=True))
+    for w, color in colors.items():
+        for io, marker in [(1, "o"), (4, "s")]:
+            pts = [r for r in runs if r["workers"] == w and r["redis_io_threads"] == io]
+            if not pts:
+                continue
+            xs = [(datetime.fromisoformat(r["date_utc"]) - t0).total_seconds() / 60 for r in pts]
+            label = f"{w} worker{'s' if w > 1 else ''}" + (", io-threads 4" if io > 1 else "")
+            ax.scatter(xs, [r["redis_us_per_job"] for r in pts], s=44, color=color, marker=marker,
+                       label=label, edgecolors=SURFACE, linewidths=1.5)  # fmt: skip
+    ax.set_ylim(0, max(r["redis_us_per_job"] or 0 for r in runs) * 1.2)
+    ax.set_xlabel(f"minutes since {t0:%H:%M} UTC")
+    ax.set_ylabel("Redis main-thread µs per completed job")
+    ax.legend(loc="lower left", ncols=3, fontsize=8)
+    ax.set_title("Every saturated run; same commands per job in each", fontweight="normal")
+    _finish(fig, "Redis's time per job drifted over the session", out)
 
 
 def plot_bottleneck(rows: list[dict[str, Any]], out: Path) -> None:
@@ -223,27 +264,28 @@ def plot_bottleneck(rows: list[dict[str, Any]], out: Path) -> None:
 
 
 def plot_concurrency(rows: list[dict[str, Any]], out: Path) -> None:
-    rows = sorted(rows, key=lambda r: r["concurrency"])
-    cs = [r["concurrency"] for r in rows]
-    fig, ax = plt.subplots(figsize=(7, 4.2))
-    ys = [r["completed_per_s"] for r in rows]
-    ax.plot(cs, ys, color=BLUE, marker="o", ms=7, mec=SURFACE, mew=2)
-    for c, y, r in zip(cs, ys, rows, strict=True):
-        ax.annotate(
-            f"{y / 1000:.2f}K\n(CPU {r['worker_max']:.2f})",
-            (c, y),
-            textcoords="offset points",
-            xytext=(0, 10),
-            ha="center",
-            fontsize=8.5,
-        )
+    groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        groups[r["concurrency"]].append(r)
+    cs = sorted(groups)
+    med = [_median(groups[c], "completed_per_s") for c in cs]
+    lo = [m - min(r["completed_per_s"] for r in groups[c]) for m, c in zip(med, cs, strict=True)]
+    hi = [max(r["completed_per_s"] for r in groups[c]) - m for m, c in zip(med, cs, strict=True)]
+    fig, ax = plt.subplots(figsize=(7, 4.4))
+    ax.errorbar(cs, med, yerr=[lo, hi], color=BLUE, marker="o", ms=7, capsize=4, mec=SURFACE,
+                mew=2, label="median of repeats (bars: min-max)")  # fmt: skip
+    for c, m in zip(cs, med, strict=True):
+        ax.annotate(f"{m / 1000:.2f}K", (c, m), textcoords="offset points", xytext=(9, -12),
+                    ha="left", fontsize=8.5)  # fmt: skip
     ax.set_xscale("log")
     ax.set_xticks(cs, [str(c) for c in cs])
     ax.minorticks_off()
-    ax.set_ylim(0, max(ys) * 1.35)
+    ax.set_ylim(0, max(m + h for m, h in zip(med, hi, strict=True)) * 1.25)
     ax.set_xlabel("FTQ_CONCURRENCY (jobs in flight per worker)")
     ax.set_ylabel("completed jobs/s")
-    ax.set_title("One worker container, saturated", fontweight="normal")
+    ax.legend(loc="lower right")
+    n = len(groups[cs[0]])
+    ax.set_title(f"One worker container, saturated, {n} repeats", fontweight="normal")
     _finish(fig, "One worker's throughput vs its in-flight cap", out)
 
 
@@ -268,11 +310,12 @@ def plot_latency(rows: list[dict[str, Any]], out: Path) -> None:
         )
     ax.set_yscale("log")
     ax.set_xlabel("throughput, completed jobs/s (= offered: below capacity)")
-    ax.set_ylabel("enqueue -> commit latency, ms (log; Redis TIME, 1 ms resolution)")
-    ax.set_xlim(0, max(xs) * 1.2)
-    ax.legend(loc="upper left")
+    ax.set_ylabel("enqueue -> commit, ms (log scale)")
+    ax.set_xlim(0, max(xs) * 1.25)
+    ax.legend(loc="upper center", ncols=3)
     w = rows[0]["workers"]
-    ax.set_title(f"{w} workers, open-loop offered load below capacity", fontweight="normal")
+    ax.set_title(f"{w} workers, open-loop offered load; Redis TIME, 1 ms resolution",
+                 fontweight="normal")  # fmt: skip
     _finish(fig, "End-to-end latency vs load", out)
 
 
@@ -293,7 +336,7 @@ def plot_backpressure(reports: list[dict[str, Any]], out: Path) -> None:
         a_depth.set_ylim(0, r["spec"]["high_watermark"] * 1.3)
         a_depth.set_xlabel("seconds since the load started")
         a_depth.set_ylabel("depth (stream + delayed)")
-        a_depth.set_title(f"{mode} mode: depth stays under the high watermark")
+        a_depth.set_title(f"{mode} mode: queue depth vs the watermarks")
 
         per_s = r["timeline"]["producer_per_s"]
         secs = sorted(int(s) for s in per_s)
@@ -313,9 +356,11 @@ def plot_backpressure(reports: list[dict[str, Any]], out: Path) -> None:
             else f"blocked {p['blocked']:,} jobs, {p['blocked_seconds']:.0f} s waiting; "
             f"rejected {p['rejected']:,}"
         )
-        a_rate.set_title(f"{mode} mode: intake throttled to capacity ({extra})", fontsize=9.5)
+        a_rate.set_title(f"{mode} mode: offered, accepted, completed", fontsize=10)
+        a_rate.text(0.0, -0.22, extra, transform=a_rate.transAxes, fontsize=8.5, color=INK_2)
         a_rate.legend(loc="lower right", ncols=3)
-    _finish(fig, "Backpressure: offered load 1.5x capacity", out)
+    offered = reports[0]["spec"]["rate"]
+    _finish(fig, f"Backpressure: {offered / 1000:.0f}K jobs/s offered, open loop", out)
 
 
 def _table(rows: list[dict[str, Any]], cols: list[str]) -> str:
@@ -344,10 +389,14 @@ def main() -> None:
         "e2e_p50_ms",
         "e2e_p99_ms",
         "redis_main_thread",
+        "redis_us_per_job",
+        "redis_io_threads",
+        "loadgen_processes",
         "worker_max",
         "loadgen",
         "vm_busy_cpus",
         "depth_min",
+        "depth_max",
         "rejected",
         "blocked",
         "exactly_once",
@@ -374,6 +423,15 @@ def main() -> None:
             results / "backpressure.png",
         )
         md += ["## backpressure\n", _table(summary["backpressure"], cols), ""]
+    # Diagnostic suites: tables, plus the per-job Redis cost chart (ADR-042).
+    for suite in ("method", "iothreads"):
+        reports = load(results, suite)
+        if reports:
+            summary[suite] = [_row(r) for r in reports]
+            md += [f"## {suite}\n", _table(summary[suite], cols), ""]
+    saturated = [r for rows in summary.values() for r in rows if r["saturated_mode"]]
+    if saturated:
+        plot_redis_cost(saturated, results / "redis_cost.png")
     (results / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
     (results / "summary.md").write_text("\n".join(md) + "\n")
     print(f"wrote {results / 'summary.md'}")
