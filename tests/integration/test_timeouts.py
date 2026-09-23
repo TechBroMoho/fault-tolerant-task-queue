@@ -354,6 +354,33 @@ async def test_a_pool_reset_restarts_bystanders_without_costing_them_an_attempt(
 
 
 @pytest.mark.slow
+async def test_a_restarted_bystander_gets_a_fresh_timeout(
+    r: aioredis.Redis, settings: Settings, keys: Keys, tmp_path: Path
+) -> None:
+    """The restart after a pool reset is a new run, so its timeout starts over. Found
+    by CI's first chaos run (ADR-039): a restarted bystander kept its first run's
+    deadline, timed out in the new pool, lost an attempt, and its own timeout reset the
+    pool again. Here the reset lands ~1.5 s into the bystander's 2 s run: with the old
+    deadline it has ~1.5 s left for a 2 s rerun; with a fresh one, 3 s."""
+    hung_runs, bystander_runs = tmp_path / "hung", tmp_path / "bystander"
+    s = fast(settings, process_pool_size=2)
+    client = Client(r, s)
+    bystander = await client.enqueue(
+        "spin_in_process_3s_timeout", {"runs": str(bystander_runs), "seconds": 2.0}
+    )
+    hung = await client.enqueue("hang_first_attempt_in_process", {"runs": str(hung_runs)})
+    async with running_worker(r, s, blocking_handlers.registry):
+        by_done = await _wait_state(r, keys, bystander, "SUCCEEDED", within=30)
+        await _wait_state(r, keys, hung, "SUCCEEDED", within=30)
+    c = await read_counters(r, keys)
+    # Only the hung job timed out; the bystander ran twice, both times as attempt 0.
+    assert json.loads(by_done["result"])["attempt"] == 0, c
+    assert len(_runs(bystander_runs)) == 2
+    assert (c["timeouts"], c["retried"], c["processed"]) == (1, 1, 2)
+    await _assert_drained(r, keys, s.group)
+
+
+@pytest.mark.slow
 async def test_waiting_for_a_pool_child_does_not_count_toward_the_timeout(
     r: aioredis.Redis, settings: Settings, keys: Keys, tmp_path: Path
 ) -> None:

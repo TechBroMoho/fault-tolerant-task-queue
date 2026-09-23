@@ -95,6 +95,9 @@ def spin_in_process(job: Job) -> dict[str, Any]:
 
 
 registry.register_sync("spin_in_process", pool="process", timeout=30.0)(spin_in_process)
+# The same bystander under a timeout it only meets if a pool reset restarts its clock:
+# 2 s of work, 3 s timeout, with the reset landing ~1.5 s into its first run (ADR-039).
+registry.register_sync("spin_in_process_3s_timeout", pool="process", timeout=3.0)(spin_in_process)
 
 
 def hang_forever_in_thread(job: Job) -> None:

@@ -432,15 +432,23 @@ class Worker:
         # counts the run itself. (Otherwise, with concurrency > process_pool_size, a job
         # could time out while queued, and the reset would kill jobs that did run.)
         slot = self._process_slots if run_kind(spec) == "process" else contextlib.nullcontext()
+        loop = asyncio.get_running_loop()
         async with slot:
             run = self._start(spec, job)
             try:
-                done, _ = await asyncio.wait({run.future}, timeout=timeout)
+                # The deadline is measured from the run's latest start: a pool reset
+                # restarts a bystander as a new run, with a full timeout (ADR-039).
+                # Waking at the old deadline, we find it moved and keep waiting.
+                while not run.future.done():
+                    remaining = run.started + timeout - loop.time()
+                    if remaining <= 0:
+                        break
+                    await asyncio.wait({run.future}, timeout=remaining)
             except asyncio.CancelledError:
                 # The worker is abandoning this job (shutdown past the grace period).
                 self._stop_run(run, job, abandoning=True)
                 raise
-            if not done:
+            if not run.future.done():
                 self._stop_run(run, job, abandoning=False)
                 raise HandlerTimeout(f"run exceeded its {timeout:g}s timeout ({run.kind} handler)")
         return json.dumps(run.future.result(), separators=(",", ":"))
@@ -464,6 +472,7 @@ class Worker:
         loop = asyncio.get_running_loop()
         while True:
             pool = run.pool = self._processes()
+            run.started = loop.time()  # a restart is a new run: its timeout starts over
             try:
                 return await loop.run_in_executor(pool, spec.fn, job)
             except BrokenProcessPool:
@@ -669,3 +678,5 @@ class _Run:
     thread: concurrent.futures.Future[Any] | None = None
     # process: the pool the run is in now; it changes when a pool reset restarts it.
     pool: ProcessPoolExecutor | None = None
+    # Loop time the run (last) started; its timeout counts from here (ADR-039).
+    started: float = field(default_factory=lambda: asyncio.get_running_loop().time())
