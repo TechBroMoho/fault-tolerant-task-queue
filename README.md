@@ -1,14 +1,21 @@
 # ftq: Fault-Tolerant Task Queue
 
+[![ci](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/workflows/ci.yml)
+
 A from-scratch, Celery-style distributed task queue on Redis Streams: at-least-once delivery,
 effectively-once side effects via idempotency keys, leases with heartbeats, retries with backoff,
 a dead-letter queue, backpressure, and a chaos-testing harness that kills workers and cuts
 connections mid-job, then verifies no job was lost or duplicated.
 
-> **Status:** early development (Phase 4: the chaos harness and its verifier). See
-> [PROGRESS.md](PROGRESS.md). No performance numbers are claimed yet; the local chaos
-> results are in PROGRESS.md with their raw reports in `results/local/`. Every number that
-> appears here later will link to a raw result file and the command that reproduces it.
+> **Status:** early development (Phase 5: CI). See [PROGRESS.md](PROGRESS.md). No
+> performance numbers are claimed yet; the chaos results are in PROGRESS.md with their raw
+> reports in `results/local/` and `results/ci/`. Every number that appears here later will
+> link to a raw result file and the command that reproduces it.
+>
+> **CI** (GitHub Actions): every push runs `make check-all`, a Docker build, and a
+> 100K-job chaos run with one worker per vCPU. A 1M-job chaos run runs nightly and on
+> demand (`gh workflow run chaos-scale.yml -f jobs=N`); 1M takes ~35 min on the runner
+> (DECISIONS.md ADR-040).
 
 ## Development
 

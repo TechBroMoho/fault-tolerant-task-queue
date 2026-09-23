@@ -1,9 +1,12 @@
-# Large chaos runs (SPEC §7 Phase 5 scale decision, ADR-040), started by hand with any N.
-# Used to measure how long N=1,000,000 takes on a GitHub-hosted runner.
+# The N=1,000,000 chaos run (SPEC §7 Phase 5 scale decision, ADR-040): nightly, and by
+# hand with any N / worker count. Not per push: 1M took 34 min 48 s on this runner
+# (run 35838910547), and the SPEC's per-push bar is ~12 min. Per push, ci.yml runs 100K.
 
 name: chaos-scale
 
 on:
+  schedule:
+    - cron: "23 9 * * *"  # daily 09:23 UTC; off the hour, when scheduled runs pile up
   workflow_dispatch:
     inputs:
       jobs:
@@ -22,11 +25,13 @@ permissions:
 jobs:
   chaos:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    # ~2.5x the measured 1M step (35 min), so a slow night isn't cut off mid-verify.
+    timeout-minutes: 90
     env:
-      CHAOS_JOBS: ${{ inputs.jobs }}
-      DRAIN_TIMEOUT: ${{ inputs.drain_timeout }}
-      CHAOS_WORKERS: ${{ inputs.workers }}
+      # A scheduled run has no inputs: the same defaults as a manual one.
+      CHAOS_JOBS: ${{ inputs.jobs || '1000000' }}
+      DRAIN_TIMEOUT: ${{ inputs.drain_timeout || '3600' }}
+      CHAOS_WORKERS: ${{ inputs.workers || 'nproc' }}
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: astral-sh/setup-uv@v10.2.0

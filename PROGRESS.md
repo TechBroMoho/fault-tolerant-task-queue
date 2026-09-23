@@ -2,16 +2,150 @@
 
 ## Status
 
-- **Current phase:** Phase 4 (the chaos harness: per-worker Toxiproxy, kills, pauses and
-  network faults, a supervisor, verifier I1–I5 + W1, mutation tests, and 3 × N=100,000
-  local runs) plus its post-gate review: **complete**, awaiting Mohammed's review.
-- **Next:** Phase 5 (GitHub Actions CI; it calls `make check-all`, confirmed by Mohammed;
-  measure N=1M on a hosted runner to choose per-push vs nightly). Starts on Mohammed's
-  go-ahead.
+- **Current phase:** Phase 5 (GitHub Actions CI: `make check-all`, Docker build, and a
+  100K chaos run on every push; 1M chaos nightly and on demand): **complete**, awaiting
+  Mohammed's review. CI found a real bug, the pool-reset cascade (ADR-039), fixed.
+- **Next:** Phase 6 (local benchmark harness). Starts on Mohammed's go-ahead.
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
 - **AWS:** nothing created. Spend to date: $0.
 
 ## Phase log
+
+### Phase 5: CI on GitHub Actions (2026-09-23)
+
+**Built**
+- **`.github/workflows/ci.yml`**, on every push and PR (ADR-040):
+  - `check`: `make setup`, `make up` (the Compose Redis: a `services:` container can't
+    set `noeviction`, and the suite checks it), `make check-all`, timed, with
+    `--durations=20`.
+  - `docker`: builds the worker image and runs it.
+  - `chaos`: N=100,000 with **one worker per vCPU** (4). The report and worker logs are
+    uploaded whether it passes or not.
+  - No retries anywhere.
+- **`.github/workflows/chaos-scale.yml`**: N=1,000,000 **nightly** (09:23 UTC) and on
+  `workflow_dispatch`, which takes N, workers, and the drain timeout.
+- Actions was already enabled (`gh api …/actions/permissions`: `enabled: true`,
+  `allowed_actions: all`) and had no workflows before this phase. Actions are pinned to
+  release tags (checkout v7.0.1, setup-uv v10.2.0, upload-artifact v7.0.1), uv
+  0.11.16, and Python 3.12.13.
+- README: CI badge.
+- **Fixed, found by CI** (details under "Things that went wrong"):
+  - **The pool-reset cascade (ADR-039).** The per-job timeout now measures handler
+    execution only. Each (re)started run gets a full timeout, and a new pool is warmed
+    (imports done, every child answering) before any run's clock starts.
+  - A CLI test that compared Rich-styled output (ANSI escapes under `GITHUB_ACTIONS`).
+  - Harness: a `--run-dir` outside the repo crashed after the run and lost the report.
+- **The chaos report now records** Redis memory, pool start-up times (count, mean,
+  max), and timeouts of runs that can't hang (evidence, not invariants; I1–I5, W1, and
+  I4's minimums are unchanged).
+- New tests, 182 → 186 (all in `test_timeouts.py`; the handlers are in
+  `slow_start_handlers.py`, whose module takes 2 s to import in a pool child):
+  - a restarted bystander gets a fresh timeout;
+  - pool start-up doesn't count toward the timeout;
+  - after a reset, no clock starts until the new pool is ready;
+  - no clock starts until every child is ready (children ready at 2 s and 4 s).
+  Each failed on the code before its fix: 3/3, 3/3, 3/3, and CAUGHT as a mutant
+  (below).
+
+**Acceptance: green CI on GitHub.**
+- **Run [35838899855](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35838899855)**
+  (c20d0fd): check, docker, and chaos all passed.
+  - `make check-all`: 186 passed in 109.9 s (pytest), 118 s wall.
+  - Chaos 100K, 4 workers: **PASSED**. 99,974 SUCCEEDED and 26 DEAD (exactly the
+    expected ones), 0 timeouts of runs that can't hang, 192 pool resets, 1,009
+    reclaims, 330 duplicates suppressed; 242 s. Report:
+    `results/ci/chaos_report_run35838899855_N100K_w4.json`.
+- **1M run [35838910547](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35838910547)**
+  (c20d0fd, 4 workers): **PASSED**, all of I1–I5 and W1.
+  - 1,000,000 accepted: 999,740 SUCCEEDED and 260 DEAD (200 poison, 30 hang_forever,
+    30 crashy).
+  - I2: every effect key once, 2,928 effects suppressed. I2b: one result per SUCCEEDED
+    job, 2,792 duplicates suppressed.
+  - Faults: 33 kills, 33 pauses, 96 network windows, and 360 crash restarts. 9,183
+    reclaims, 3,718 timeouts, 1,839 pool resets, 0 timeouts of runs that can't hang.
+    Highest delivery of a non-crashy job: 8 (limit 12).
+  - Redis peak 514 MiB of the 3 GiB cap.
+  - **Chaos step: 34 min 48 s** (harness: 2,070 s total, fault phase 1,766 s, drain
+    227 s). Report: `results/ci/chaos_report_run35838910547_N1M_w4.json`.
+- **8 workers on the runner, after the fix: run [35838915586](https://github.com/TechBroMoho/fault-tolerant-task-queue/actions/runs/35838915586)**
+  (100K): **PASSED**, the same oversubscribed setup that had failed 3 of 3. 0
+  timeouts of runs that can't hang, 185 pool resets, and pool start-up 6.4 s mean /
+  13.5 s max: three times the 2 s hang timeout, with no cascade. Report:
+  `results/ci/chaos_report_run35838915586_N100K_w8.json`.
+- Local 100K, 8 workers, on the same code: **PASSED**, W1 clean, 0 timeouts of runs that
+  can't hang, pool start-up 0.70 s mean / 6.42 s max
+  (`results/local/chaos_report_phase5_warm_pool.json`; its `run.git` shows the working
+  tree before the c20d0fd commit, whose `src/` it matches).
+
+**Scale decision (SPEC §7): 100K on every push, 1M nightly + on demand.** 1M took 34 min
+48 s on the runner, about 3× the ~12 min per-push bar. The resume bullet's "on every
+code change … 1M+ tasks" is therefore **not** true as written. What is true: 100K jobs on
+every push, and 1M nightly, which has passed once so far (ADR-040 has proposed
+wording).
+
+**Timing: `make check-all` on the runner.** Wall time tracks pytest's own: 87 s wall /
+83.1 s pytest (182 tests, run 35827596244), 118 s / 109.9 s (186 tests, run
+35838899855). The local wall-time gap (Phase 4 open issue) didn't appear on Linux. Job
+timeouts were set from these: check 15 min, docker 10, chaos 20, 1M 90.
+
+**The known flaky test in CI.**
+`test_waiting_for_a_pool_child_does_not_count_toward_the_timeout` passed in all 4 CI
+`check` runs (the first run's one failure was the ANSI test). There was no failure, so
+there are no counters to record. It is still unexplained locally.
+
+**Every CI run of this phase**, none dropped:
+
+```
+run          workflow     code     N / workers  result
+35827248457  ci           f0b22b3  100K / 8     check FAIL (ANSI test); chaos FAIL I1/I3 (6 false DEAD, cascade)
+35827263800  chaos-scale  f0b22b3  1M / 8       FAIL I1/I3 (375 DEAD vs 260 expected); 1,724 s
+35827596244  ci           73fa623  100K / 8     check PASS (182, 83.1 s); chaos FAIL I1/I3 (22 false DEAD)
+35828108573  ci           901d763  100K / 8     check PASS; chaos FAIL I1/I3 (35 false DEAD): fresh-timeout fix alone
+35828117698  chaos-scale  901d763  1M / 8       FAIL I1/I3 (436 DEAD vs 260); 2,056 s
+35838899855  ci           c20d0fd  100K / 4     ALL PASS (acceptance run)
+35838915586  chaos-scale  c20d0fd  100K / 8     PASS (cascade gone even oversubscribed)
+35838910547  chaos-scale  c20d0fd  1M / 4       PASS; 34 min 48 s
+```
+
+The failed runs' reports are in `results/ci/chaos_failures/`. In the three failed 100K
+runs on the old code, timeouts of runs that can't hang were 219, 329, and 337 (counted
+from the artifacts' logs), against 0 in every run since.
+
+**Mutation checks** (scripted, one at a time, each file restored and sha256-verified):
+
+```
+worker: restart keeps the first run's deadline      -> CAUGHT (fresh_timeout + reset test)
+worker: clock starts before the pool is ready       -> CAUGHT (3 failed)
+worker: initializer skips the handler imports       -> CAUGHT (3 failed)
+worker: warm-up ends after one round                -> CAUGHT (every_child)
+worker: clock not stopped while waiting for a pool  -> CAUGHT
+worker: warm-up tasks don't hold their child        -> MISSED, equivalent (the hold only paces the
+                                                       rounds; the loop still waits for every child)
+(Barrier design, replaced) no barrier               -> MISSED, then the staggered test -> CAUGHT
+```
+
+**Decisions for Mohammed's review**
+- ADR-039: the timeout measures handler execution only (as asked). The Barrier version
+  was dropped for semaphore-leak warnings, which W1 caught.
+- ADR-040: one chaos worker per vCPU in CI; Redis through `make up` rather than a
+  service container (a SPEC deviation); 1M nightly.
+- The resume bullet's wording (ADR-040, Consequences).
+
+**Open issues**
+- The nightly 1M has one pass so far; the bullet shouldn't lean on it until there's a
+  record.
+- The flaky Phase 3 test: still unexplained, and no CI failure yet.
+- Carried from Phase 4: results/effects logs never trimmed (ADR-021); the retry-ownership
+  check has no verifier-level evidence (ADR-037).
+
+**Evidence (local)**
+
+```
+$ make check-all > log 2>&1; echo "make check-all exit=$?"
+make check-all exit=0
+  69 files already formatted / All checks passed! / Success: no issues found in 62 source files
+  ======================= 186 passed in 107.25s (0:01:47) ========================
+```
 
 ### Phase 4 review (2026-09-22)
 
@@ -895,6 +1029,37 @@ pytest exit (redis up)=0
 | (none yet) | | | $0 |
 
 ## Things that went wrong
+
+- **2026-09-23 (Phase 5): the pool-reset cascade.** CI's first chaos runs on a 4-vCPU
+  runner failed I1/I3: healthy `hang_process` jobs ended DEAD (6, 22, and 35 false DEADs
+  per 100K; ~115 and ~176 extra at 1M). The mechanism:
+  1. A timeout resets the process pool (ADR-030).
+  2. The runs in the new pool pay the pool's start-up on their own clocks (a new `spawn`
+     interpreter, then the handler imports). With 8 saturated workers on 4 vCPUs that
+     took 2 s or more, against a 2 s hang timeout.
+  3. So they time out too, each one costing a healthy job an attempt, and each resets
+     the pool again. Back to 2.
+  The worker logs showed it: 219–337 timeouts per run of runs that can't hang (0
+  locally), and 464–555 pool resets (~200 locally). A restarted bystander also kept its
+  first run's deadline and sometimes timed out 15 ms after restarting. That fix
+  (901d763) was real but not enough: the next run failed worse. The fix that worked
+  (ADR-039): runs don't start their clocks until the pool is warm, and each run gets a
+  full timeout. On the same oversubscribed setup it passed, with pool start-up measured
+  at 6.4 s mean. ADR-030 had *measured* this start-up cost (~0.3 s locally) and accepted
+  it. Lessons: a fixed cost on the timeout clock is a coupling that only shows under load
+  (a laptop with headroom never showed it); and a failure that resets shared state (the
+  pool) turns one timeout into many.
+- **2026-09-23 (Phase 5): my first warm-up leaked-semaphore warnings, and W1 caught it.**
+  A multiprocessing Barrier per pool passed every test, but the first local chaos run
+  failed W1 on 8 non-JSON lines ("ResourceTracker called reentrantly … might leak").
+  Replaced by warm-up rounds that allocate nothing; the rerun was clean.
+- **2026-09-23 (Phase 5): a test that only passed without a CI env.** Rich forces styling
+  when `GITHUB_ACTIONS=true`, which split `--all` into two styled spans, and
+  `test_dlq_requeue_cli_argument_handling` failed on the runner. Reproduced locally with
+  the variable set, and fixed by comparing text without escapes (assertion unchanged).
+- **2026-09-23 (Phase 5): a chaos harness crash that lost a report.** `--run-dir` outside
+  the repo raised `ValueError` *after* the run, in `relative_to`. Found by the first
+  local smoke run; the path is now kept absolute.
 
 - **2026-09-22: `import ftq` failed, caused by iCloud.** The repo started in `~/Desktop`, which
   iCloud syncs. iCloud set the macOS hidden flag on `.venv`, and CPython 3.12.13 skips hidden

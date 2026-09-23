@@ -47,6 +47,7 @@ uv run ftq dlq requeue JOB_ID... | --all   # back on the stream, attempt 0, same
 uv run python bench/pipelining.py # enqueue batching + worker drain measurement -> results/local/
 make chaos N=100000 [CHAOS_WORKERS=8] [SEED=s]  # chaos run + verifier -> results/local/chaos_report.json (~2 min; run in background)
 uv run python -m chaos.run --help                # same, all knobs (--rate, --out, --keep, --skip-build ...)
+gh workflow run chaos-scale.yml -f jobs=N [-f workers=W]   # chaos on a GitHub runner (1M nightly; ~35 min)
 make bench ...    # local load test + charts                               [stub until Phase 6]
 make aws-plan / aws-up / aws-bench / aws-down / aws-verify-clean   # BILLABLE except plan/verify [stubs until Phase 7]
 ```

@@ -24,7 +24,8 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Measured: the job takes 2-2.5 min (check-all 87-118 s wall; ADR-040).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: astral-sh/setup-uv@v10.2.0
@@ -52,7 +53,7 @@ jobs:
 
   docker:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10  # measured 11-21 s
     steps:
       - uses: actions/checkout@v7.0.1
       - run: docker build -f docker/Dockerfile -t ftq-worker:ci .
@@ -60,7 +61,8 @@ jobs:
 
   chaos:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Measured at N=100K with 4 workers: 4 min 12 s for the job (ADR-040).
+    timeout-minutes: 20
     env:
       CHAOS_JOBS: "100000"
     steps:

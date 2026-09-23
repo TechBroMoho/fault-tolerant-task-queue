@@ -1041,6 +1041,10 @@ permits (an `asyncio.Semaphore`), and the timeout covers only the run. It still 
 starting a fresh child after a reset (~0.3 s with spawn). Tested: three 1 s jobs with a
 1.5 s timeout share one child, and none times out.
 
+*Phase 5: superseded in part by ADR-039.* That start-up cost is what cascaded on CI's
+4-vCPU runner. The clock now starts only once the pool is warm, and restarts with each
+run.
+
 *Phase 4 review:* a job waiting for a pool permit keeps its lease. Its heartbeat task
 starts in `Worker._process` before `_run_handler` takes the permit. This is tested:
 `test_a_job_waiting_for_a_pool_child_keeps_its_lease` shows Redis idle staying under a
@@ -1411,6 +1415,10 @@ command, every executed and skipped fault, restarts by exit code, log-line count
 (including ERROR samples), and per-container CPU. Worker logs and the accepted-job list
 go to `chaos/runs/<time>/` (gitignored).
 
+*Phase 5:* CI runs one worker per vCPU (4 on GitHub's runner), not 8 (ADR-040). The
+report also records Redis memory, pool start-up times, and timeouts of runs that can't
+hang (ADR-039).
+
 ---
 
 ## ADR-037: Verifier mutation checks, and why the retry-ownership mutant can't fail them
@@ -1487,3 +1495,181 @@ of a restart storm. Tested both ways: a worker pointed at a port with no listene
 waiting, and completes a job once a TCP forwarder to Redis starts on that port; and a
 stop request before any connection returns without an error. Both tests fail on the old
 code.
+
+---
+
+## ADR-039: The per-job timeout measures handler execution only
+
+*Status: accepted (Phase 5, per Mohammed: `Worker._run_handler`, `_run_in_process`,
+`_ready_processes`, `_warm_up`, `_init_pool_child`; tests in `test_timeouts.py` with
+`slow_start_handlers.py`).*
+
+**Context.** CI's first chaos runs, on a GitHub-hosted runner (4 vCPUs, 16 GB) with the
+8 workers sized for a 10-CPU laptop, failed I1/I3. Healthy `hang_process` jobs ended DEAD
+after `max_attempts` timeouts, although that handler returns at once on every attempt
+from 2 on. Counted from the worker logs, 219, 329, and 337 timeouts per 100K run hit
+runs that can't hang (locally: 0). There were two causes, both in how ADR-030 ran the
+clock for process-pool jobs.
+
+1. **A restarted bystander kept its first run's deadline.** The timeout was one
+   `asyncio.wait` on the run's future. The restart after a pool reset happens inside
+   that future, so the new run inherited whatever was left of the old budget, sometimes
+   15 ms.
+2. **Pool start-up was on the job's clock.** After a reset, a job's run first waits for
+   the new pool: `spawn` starts a fresh interpreter, which then imports the handler's
+   module. ADR-030 measured that at ~0.3 s locally and accepted it. With 8 saturated
+   workers on 4 vCPUs it plus the run exceeded the 2 s hang timeout.
+
+Together they made the **pool-reset cascade**. A timeout resets the pool; every run in
+the new pool pays start-up on its clock and times out; each of those timeouts resets the
+pool again. Every link costs a healthy job an attempt. Pool resets per 100K run: 464–555
+on the runner, against ~200 (one per planned hang) locally.
+
+**Options.**
+1. Raise the hang timeout (2 s). Hides the mechanism, and any short timeout brings it
+   back on a slower machine. Rejected (Mohammed: don't).
+2. Time the run from inside the child (the child reports when the handler starts).
+   Exact, but it needs a channel from every child per job, on the hot path.
+3. **Warm each new pool before any run's clock starts.** Chosen, per Mohammed.
+
+**Decision.**
+- **The clock is per run.** `_Run.started` is set when a run starts in a ready pool. A
+  restart after a reset starts a new run with a full timeout. The waiting loop wakes at a
+  deadline, sees whether it moved, and keeps waiting if it did.
+- **No clock while the pool starts.** A new pool (first use, after a reset, after a
+  break) is warmed once, and every run needing it waits for that (`asyncio.shield` on one
+  shared future). Its `started` is `None` meanwhile, and the waiting loop waits on the
+  run or on the clock starting, with no deadline.
+- **Warm means every child is ready.** The pool initializer imports every registered
+  process handler's module (plus the SIGINT setting it already did). Warm-up then runs
+  rounds of `process_pool_size` tiny tasks (each holds its child 50 ms and returns its
+  pid) until every child has answered. A spawn-context pool starts one child per task
+  while none is idle, so round one starts them all. A child still starting can't take a
+  task, so all pids back means all children ready.
+- **A pool that never gets ready** (120 s) raises `BrokenProcessPool`, which the job
+  treats like a pool that broke mid-job: a failed attempt.
+- `process pool ready: N child(ren) in Xs` is logged at INFO, and the chaos report now
+  has `pool_starts` (count, mean, max) and `timeouts_of_runs_that_cannot_hang`. Both are
+  evidence, not invariants.
+
+**Rejected on the way: a multiprocessing Barrier in the initializer.** It did the same
+in one round, and the tests passed. But the first local chaos run failed W1, with 8 non-JSON
+lines: "ResourceTracker called reentrantly … The semaphore object … might leak", once
+per few pools. Each Barrier allocates named POSIX semaphores, and chaos resets a pool
+every few seconds. The pid rounds allocate nothing. The next run was clean.
+
+**Evidence.**
+- Three new tests fail on the old code and pass on the new one, 3/3 each. They use a
+  handler module that takes 2 s to import in a pool child (deterministic start-up).
+  - `test_pool_start_up_does_not_count_toward_the_timeout`: an instant handler under a
+    1 s timeout. On the old code, every attempt timed out and reset the pool, and the job
+    went DEAD after 5 attempts: the cascade in miniature.
+  - `test_after_a_pool_reset_no_clock_starts_until_the_new_pool_is_ready`: hanger plus
+    bystander. Only the hanger may time out.
+  - `test_no_clock_starts_until_every_child_of_the_pool_is_ready`: children ready at 2 s
+    and 4 s, two jobs.
+  - Plus `test_a_restarted_bystander_gets_a_fresh_timeout` for cause 1 (fails 3/3 on
+    the code before it).
+- Mutation checks: clock started before the pool is ready, initializer skips the
+  imports, warm-up ends after one round, clock not stopped for the pool, and restart
+  keeps the old deadline: all CAUGHT. The Barrier variant's "no barrier" mutant was
+  MISSED at first; the staggered-children test was written for it.
+  "Warm-up tasks don't hold their child" is MISSED **by design**: the hold only paces the
+  rounds, and without it they spin until the last child answers, with the same outcome.
+- Chaos: PROGRESS.md, Phase 5 (the runner before and after, and the local run).
+
+**Consequences.**
+- A timeout now means what its name says: the handler ran too long. Start-up, queueing
+  for a child (ADR-030), and a colleague's hang are never charged to a job.
+- A bystander's total time in one attempt can exceed its timeout: one full run per
+  reset it lives through, plus start-ups. Each reset costs another job an attempt, so
+  the total is bounded by other jobs' attempts. Its lease is safe: heartbeats run the
+  whole time (Phase 4 review).
+- One warm-up per pool: `process_pool_size` × 50 ms of child time, plus a few ms per
+  extra round while a child starts. Pool resets are rare outside chaos.
+- A starved machine still makes handlers themselves slower. If a *run* exceeds its
+  timeout, that is a real timeout. CI's worker count is sized separately (ADR-040).
+
+---
+
+## ADR-040: CI on GitHub Actions: what runs where, sized to the runner
+
+*Status: accepted (Phase 5: `.github/workflows/ci.yml`, `chaos-scale.yml`).*
+
+**Context.** SPEC §7 Phase 5: CI on push/PR (lint, types, tests, Docker build), a chaos
+job on every push, and a measured decision on N=1,000,000 (per push if ≤ ~12 min,
+otherwise nightly). Mohammed: CI calls `make check-all` (ADR-034); no automatic retries.
+The runner is GitHub's standard Linux runner for a public repo, `ubuntu-24.04`: 4 vCPUs
+and 16 GB (`nproc`, `docker info`, both recorded in every chaos report).
+
+**Decisions.**
+- **`ci.yml`, on every push and PR, three jobs.**
+  - `check`: `make setup`, `make up`, `make check-all`.
+  - `docker`: builds the worker image and runs `ftq --help` in it.
+  - `chaos`: N=100,000 with one worker per vCPU; the report and worker logs are
+    uploaded whether it passes or not.
+  - No `continue-on-error`, no reruns: a red run stays red, and its artifact is the
+    evidence.
+- **Redis via `make up`, not a `services:` container** (SPEC said "Redis service
+  container"). A service container can't pass arguments to `redis-server`, and the
+  suite asserts `maxmemory-policy noeviction` (ADR-013). `make up` is the same pinned
+  image and config as every local run.
+- **Python 3.12.13 pinned in `setup-uv`.** Without it the first run used the runner's
+  system 3.12.3; local runs and the Docker image are 3.12.13.
+- **The CLI tests compare text without ANSI escapes.** Rich forces styling under
+  `GITHUB_ACTIONS=true` and styled `--all` as two spans, which failed
+  `test_dlq_requeue_cli_argument_handling` in the first run (reproduced locally with
+  that variable). The assertion is unchanged; the helper strips the escapes.
+- **Timing, measured before setting timeouts** (Mohammed asked, because local wall
+  times had been far longer than pytest's own). On the runner, wall time tracks pytest:
+  - 182 tests: 83.1 s pytest, 87 s wall (run 35827596244);
+  - 186 tests: 109.9 s pytest, 118 s wall (run 35838899855).
+  The difference is ruff and mypy (~7 s). The local gap (PROGRESS.md, Phase 4) never
+  appeared here. Job timeouts are ~5–7× the measured jobs: check 15 min (2–2.5 min),
+  docker 10 min (11–21 s), chaos 20 min (4 min 12 s), 1M 90 min (35 min).
+
+**Chaos worker count: one per vCPU (`--workers "$(nproc)"`, 4 on this runner).**
+- The harness's 8 workers (ADR-036) were sized to a 10-CPU laptop, where the committed
+  100K runs used 3.1–4.8 CPUs in all. On 4 vCPUs the same 8 workers starved everything:
+  - throughput ~650 jobs/s against the 2,000/s enqueue;
+  - after ADR-039, pool start-up averaged 6.4 s (max 13.5 s) with 8 workers, against
+    2.2 s (max 9.96 s) with 4;
+  - and before ADR-039, the pool-reset cascade (3 of 3 runs failed I1/I3).
+- The leases (2 s), hang timeouts (2 s), and `max_deliveries` / `max_attempts`
+  (ADR-008) were sized for a machine with headroom. The chaos run tests faults, not
+  sustained CPU starvation, and a machine where every process waits for a CPU turns
+  healthy runs into lease and timeout failures that say nothing about the queue.
+- With 4 workers the containers used ~3.2 CPUs in total (workers 53–78 % each, Redis
+  18 %, Toxiproxy 25 %), roughly the laptop's ratio.
+- **Nothing the run checks was loosened.** Invariants I1–I5, W1, the I4 minimums, the
+  timeouts, leases, and attempt limits are unchanged. The fault plan still schedules
+  every kind ≥ 4 times with 4 workers: checked over 200 seeds, for a 100K span and a
+  1M-like span.
+- **Not a way around ADR-039.** The oversubscribed setup still runs on demand
+  (`chaos-scale`, `workers=8`), and after ADR-039 it passes: run 35838915586, 0
+  timeouts of runs that can't hang.
+- Rejected: raise the hang timeout (hides the cascade; Mohammed: don't); larger runners
+  (billed); fewer jobs per push (doesn't address starvation).
+
+**The 1M decision: 100K per push, 1M nightly and on demand.**
+- Measured on c20d0fd, 4 workers (run 35838910547): **PASSED**, 1,000,000 accepted.
+  The chaos step took **34 min 48 s** (harness total 2,070 s: fault phase 1,766 s, drain
+  227 s). The fault phase is long because the runner completes ~600 jobs/s: the producer
+  blocks on backpressure, so enqueue takes as long as processing.
+- That's ~3× the SPEC's ~12 min bar. So `ci.yml` runs 100K on every push (4 min), and
+  `chaos-scale.yml` runs 1M daily at 09:23 UTC and on `workflow_dispatch`.
+- The two earlier 1M runs (8 workers, before ADR-039) took 1,724 s and 2,056 s and
+  failed I1/I3, the same cascade. Their reports are in `results/ci/chaos_failures/`.
+- Redis at 1M: peak 514 MiB (`used_memory_peak` 539,197,496 B) against the 3 GiB cap.
+  That's measured, and it replaces the ADR-010 estimate for this workload.
+
+**Consequences.**
+- **The resume bullet must say what's true.** Crash tests run on every push at 100K
+  jobs; the 1M-job run is nightly. Proposed wording, for Mohammed:
+  "chaos tests run on every push via GitHub Actions (100K jobs), with a nightly
+  1M-job run: 0 lost jobs and 0 duplicate results". Only once the nightly 1M runs have a
+  record of passing (so far: one pass on c20d0fd).
+- GitHub disables scheduled workflows in a public repo after 60 days with no activity,
+  so the nightly run needs re-enabling if the repo goes quiet.
+- A red `ci` badge means a real failure: no retries.
+
