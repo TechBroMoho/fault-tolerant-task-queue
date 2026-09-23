@@ -194,9 +194,15 @@ async def test_i5_fails_on_anything_left_in_the_stream_pel_or_delayed_set(
     if left_behind == "delayed":
         await r.zadd(keys.delayed, {"job": 1})
     else:
-        await r.xadd(keys.stream, {"job_id": "x"})
+        entry = await r.xadd(keys.stream, {"job_id": "x"})
         if left_behind == "pel":
+            # Pending but with its stream data gone, so ONLY the PEL check can see it.
+            # (With the entry still in the stream, the stream-length check would fail
+            # first, and a verifier that ignored the PEL would still pass this test:
+            # the Phase 4 review's mutation round showed exactly that.)
             await r.xreadgroup(settings.group, "c", {keys.stream: ">"}, count=1)
+            await r.xdel(keys.stream, entry)
+            assert await r.xlen(keys.stream) == 0
     inv = await _verify(r, settings, keys, {job_id: "normal"})
     assert inv["I5_drained"]["ok"] is False
 
