@@ -1,4 +1,4 @@
-# CI on every push and pull request (SPEC §7 Phase 5, ADR-039).
+# CI on every push and pull request (SPEC §7 Phase 5, ADR-040).
 #
 # - check:  `make check-all` (fmt-check, lint, mypy --strict, every test) against the
 #           Compose Redis, the same pinned image and config as local runs.
@@ -71,10 +71,13 @@ jobs:
           python-version: "3.12.13"  # the local + Docker image patch release
           enable-cache: true
       - run: make setup
-      - name: Chaos run (N=${{ env.CHAOS_JOBS }}, 8 workers, random seed)
+      # One worker per vCPU (ADR-040): the local runs' 8 workers on 10 CPUs had headroom;
+      # 8 on this 4-vCPU runner starved every process, which is not the setup the
+      # timeouts and leases were sized for.
+      - name: Chaos run (N=${{ env.CHAOS_JOBS }}, one worker per vCPU, random seed)
         run: |
           start=$(date +%s)
-          uv run python -m chaos.run --jobs "$CHAOS_JOBS" --workers 8 \
+          uv run python -m chaos.run --jobs "$CHAOS_JOBS" --workers "$(nproc)" \
             --out results/ci/chaos_report.json --run-dir "$PWD/chaos/runs/ci"
           echo "chaos N=$CHAOS_JOBS wall time: $(( $(date +%s) - start )) s" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Upload the chaos report and worker logs

@@ -24,6 +24,7 @@ slot until it returns.
 import asyncio
 import concurrent.futures
 import contextlib
+import importlib
 import json
 import logging
 import multiprocessing
@@ -32,6 +33,7 @@ import random
 import secrets
 import signal
 import socket
+import time
 import weakref
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -64,6 +66,14 @@ _MAX_ERROR_CHARS = 2000
 # A Redis round trip failed even after the client's retries: the transition may or may
 # not have happened. The entry stays in the PEL either way, and the reaper sorts it out.
 _REDIS_DOWN = (RedisConnectionError, RedisTimeoutError)
+# How long a new process pool's children may take to start and import the handlers
+# before the pool counts as broken (ADR-039). Generous on purpose: it only catches a
+# start-up that will never finish, and no job's timeout runs while a pool starts.
+_POOL_START_TIMEOUT_S = 120.0
+# How long each warm-up task holds its child. Only a rate limit: while one child is
+# still starting, the ready ones answer each warm-up round in ~this long rather than in
+# microseconds, so the rounds don't spin (ADR-039). Correctness comes from the loop.
+_WARM_UP_HOLD_S = 0.05
 
 
 def default_worker_id() -> str:
@@ -77,6 +87,24 @@ def _ignore_sigint() -> None:
     mid-job (that would turn a graceful stop into a failed attempt).
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def _init_pool_child(modules: tuple[str, ...]) -> None:
+    """Process-pool initializer: everything a child does before it can run a job.
+
+    Import every process handler's module now. A job would otherwise import it on first
+    use, on its own clock (ADR-039).
+    """
+    _ignore_sigint()
+    for module in modules:
+        importlib.import_module(module)
+
+
+def _pool_child_ready() -> int:
+    """A warm-up task. Only a child that got through the initializer can run it, so its
+    pid says that child is ready. The pause only paces the rounds (_WARM_UP_HOLD_S)."""
+    time.sleep(_WARM_UP_HOLD_S)
+    return os.getpid()
 
 
 def _error_text(exc: BaseException) -> str:
@@ -128,6 +156,18 @@ class Worker:
         self._next_reap = 0.0  # loop time of the next reaper pass; 0 = at startup
         self._thread_pool: ThreadPoolExecutor | None = None
         self._process_pool: ProcessPoolExecutor | None = None
+        # Done once every child of the current pool is started and ready (ADR-039).
+        self._pool_ready: asyncio.Future[None] | None = None
+        # What a pool child imports before it's ready: the process handlers' modules.
+        self._process_modules = tuple(
+            sorted(
+                {
+                    spec.fn.__module__
+                    for spec in registry.specs().values()
+                    if isinstance(spec, SyncSpec) and spec.pool == "process"
+                }
+            )
+        )
         # Pools this worker killed on purpose (a timeout). Jobs that were running in one
         # and fail with BrokenProcessPool are resubmitted, not failed (ADR-030).
         self._reset_pools: weakref.WeakSet[ProcessPoolExecutor] = weakref.WeakSet()
@@ -436,10 +476,20 @@ class Worker:
         async with slot:
             run = self._start(spec, job)
             try:
-                # The deadline is measured from the run's latest start: a pool reset
-                # restarts a bystander as a new run, with a full timeout (ADR-039).
-                # Waking at the old deadline, we find it moved and keep waiting.
+                # The timeout measures the handler's run, nothing else (ADR-039). The
+                # clock is stopped while a process-pool run waits for a new pool to be
+                # ready, and restarts from zero with each run: a pool reset restarts a
+                # bystander as a new run. Waking at an old deadline, we find it moved.
                 while not run.future.done():
+                    if run.started is None:
+                        clock = asyncio.ensure_future(run.clock_running.wait())
+                        try:
+                            await asyncio.wait(
+                                {run.future, clock}, return_when=asyncio.FIRST_COMPLETED
+                            )
+                        finally:
+                            clock.cancel()
+                        continue
                     remaining = run.started + timeout - loop.time()
                     if remaining <= 0:
                         break
@@ -465,14 +515,16 @@ class Worker:
             run.future = asyncio.wrap_future(thread)
             return run
         run = _Run("process")
+        run.stop_clock()  # until its pool is ready
         run.future = asyncio.ensure_future(self._run_in_process(spec, job, run))
         return run
 
     async def _run_in_process(self, spec: SyncSpec, job: Job, run: "_Run") -> Any:
         loop = asyncio.get_running_loop()
         while True:
-            pool = run.pool = self._processes()
-            run.started = loop.time()  # a restart is a new run: its timeout starts over
+            run.stop_clock()
+            pool = run.pool = await self._ready_processes()
+            run.start_clock()  # a restart is a new run: its timeout starts over
             try:
                 return await loop.run_in_executor(pool, spec.fn, job)
             except BrokenProcessPool:
@@ -636,18 +688,60 @@ class Worker:
             )
         return self._thread_pool
 
-    def _processes(self) -> ProcessPoolExecutor:
-        """The process pool, created on first use (and again after a reset or a break)."""
+    async def _ready_processes(self) -> ProcessPoolExecutor:
+        """The process pool, once all its children are started and ready (ADR-039).
+
+        Created on first use, and again after a reset or a break. A child's start-up
+        (a new interpreter, then the handler imports) is the pool's cost, not a job's,
+        and on a starved machine it can outlast a short timeout. Counted on the jobs'
+        clocks, it made every run after a reset time out and reset the pool again.
+        If the pool fails to start, this raises BrokenProcessPool, like a pool that
+        breaks mid-job.
+        """
         if self._process_pool is None:
             # "spawn" on every OS: forking a process that runs an event loop and Redis
             # connections copies them in an undefined state, and spawn is also what macOS
             # uses, so local runs and Linux containers behave alike.
-            self._process_pool = ProcessPoolExecutor(
-                max_workers=self._settings.process_pool_size,
-                mp_context=multiprocessing.get_context("spawn"),
-                initializer=_ignore_sigint,
+            ctx = multiprocessing.get_context("spawn")
+            size = self._settings.process_pool_size
+            pool = ProcessPoolExecutor(
+                max_workers=size,
+                mp_context=ctx,
+                initializer=_init_pool_child,
+                initargs=(self._process_modules,),
             )
-        return self._process_pool
+            self._process_pool = pool
+            self._pool_ready = asyncio.ensure_future(self._warm_up(pool))
+            # Read its outcome even if every job waiting on it was cancelled meanwhile.
+            self._pool_ready.add_done_callback(lambda f: f.cancelled() or f.exception())
+        pool, ready = self._process_pool, self._pool_ready
+        assert ready is not None
+        await asyncio.shield(ready)
+        return pool
+
+    async def _warm_up(self, pool: ProcessPoolExecutor) -> None:
+        """Start all of `pool`'s children and return once each has answered.
+
+        A spawn-context pool starts a child per submitted task while it has no idle one,
+        so the first round of `process_pool_size` tasks starts them all. A child still
+        starting can't take a task, so rounds repeat until every child's pid has come
+        back. (A multiprocessing Barrier in the initializer would do the same in one
+        round, but each pool would allocate named semaphores, and with a reset every few
+        seconds under chaos the resource tracker warned they could leak.)
+        """
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        size = self._settings.process_pool_size
+        ready: set[int] = set()
+        while len(ready) < size:
+            if loop.time() - started > _POOL_START_TIMEOUT_S:
+                raise BrokenProcessPool(
+                    f"{size - len(ready)} of {size} pool children not ready "
+                    f"after {_POOL_START_TIMEOUT_S:g}s"
+                )
+            round_ = (loop.run_in_executor(pool, _pool_child_ready) for _ in range(size))
+            ready.update(await asyncio.gather(*round_))
+        self._log.info("process pool ready: %d child(ren) in %.2fs", size, loop.time() - started)
 
     def _shutdown_pools(self, abandoned: bool) -> None:
         if self._thread_pool is not None:
@@ -678,5 +772,18 @@ class _Run:
     thread: concurrent.futures.Future[Any] | None = None
     # process: the pool the run is in now; it changes when a pool reset restarts it.
     pool: ProcessPoolExecutor | None = None
-    # Loop time the run (last) started; its timeout counts from here (ADR-039).
-    started: float = field(default_factory=lambda: asyncio.get_running_loop().time())
+    # Loop time the run (last) started; its timeout counts from here. None while a
+    # process-pool run waits for its pool to be ready: no clock yet (ADR-039).
+    started: float | None = field(default_factory=lambda: asyncio.get_running_loop().time())
+    clock_running: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def __post_init__(self) -> None:
+        self.clock_running.set()
+
+    def start_clock(self) -> None:
+        self.started = asyncio.get_running_loop().time()
+        self.clock_running.set()
+
+    def stop_clock(self) -> None:
+        self.started = None
+        self.clock_running.clear()

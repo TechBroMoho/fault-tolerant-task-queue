@@ -228,7 +228,7 @@ class Run:
             )
             # Measured, not estimated: every done key, hash, and log entry is still there
             # (no TTLs in chaos runs), so this is the whole run's footprint against the
-            # noeviction cap. The 1M run is what sizes it (ADR-039).
+            # noeviction cap. The 1M run is what sizes it (ADR-040).
             mem = await redis.info("memory")
             redis_memory = {k: mem[k] for k in ("used_memory", "used_memory_peak", "maxmemory")}
             report = self._report(
@@ -364,6 +364,11 @@ class Run:
         levels: Counter[str] = Counter()
         messages: Counter[str] = Counter()
         errors: list[str] = []
+        pool_start_s: list[float] = []
+        # Timeouts of runs that can't hang (the mix's hang jobs hang only on their first
+        # attempt or two): each one is a healthy run the timeout cut short. Evidence, not
+        # an invariant; on a starved machine it's the pool-reset cascade (ADR-039).
+        false_timeouts: Counter[str] = Counter()
         for i in range(1, workers + 1):
             name = topology.worker_name(i)
             res = await topology.run("docker", "logs", name, check=False)
@@ -389,12 +394,24 @@ class Run:
                 ):
                     if marker in msg:
                         messages[marker] += 1
+                if msg.startswith("process pool ready:"):
+                    pool_start_s.append(float(msg.rsplit(" in ", 1)[1].rstrip("s")))
+                if msg.startswith("HandlerTimeout") and not _may_hang(
+                    self.accepted.get(str(rec.get("job_id")), "?"), int(rec.get("attempt", 0))
+                ):
+                    false_timeouts[self.accepted.get(str(rec.get("job_id")), "?")] += 1
                 if rec.get("level") == "ERROR" and len(errors) < 20:
                     errors.append(line[:500])
         return {
             "by_level": dict(levels),
             "by_message": dict(messages),
             "pool_resets": messages["process pool reset"],
+            "pool_starts": {
+                "count": len(pool_start_s),
+                "max_s": max(pool_start_s, default=0.0),
+                "mean_s": round(sum(pool_start_s) / len(pool_start_s), 3) if pool_start_s else 0.0,
+            },
+            "timeouts_of_runs_that_cannot_hang": dict(false_timeouts),
             "error_samples": errors,
         }
 
@@ -503,6 +520,13 @@ class Run:
             v["max_delivery_excluding_crashy"],
             self.max_deliveries,
         )
+        wl = report["worker_logs"]
+        log.info(
+            "  pool resets %d | pool starts %s | timeouts of runs that can't hang %s",
+            wl["pool_resets"],
+            wl["pool_starts"],
+            wl["timeouts_of_runs_that_cannot_hang"],
+        )
         r = report["run"]
         mem = r["redis_memory_bytes"]
         log.info(
@@ -512,6 +536,14 @@ class Run:
             mem["maxmemory"] / 2**20,
         )
         log.info("  report: %s", self.a.out)
+
+
+def _may_hang(kind: str, attempt: int) -> bool:
+    """Whether a run of this mix kind at this attempt can hang (chaos/mix.py): `hang` and
+    `hang_process` on attempts < hang_attempts <= 2, `hang_thread` on attempt 0, and
+    `hang_forever` always."""
+    limit = {"hang": 2, "hang_process": 2, "hang_thread": 1}.get(kind, 0)
+    return kind == "hang_forever" or attempt < limit
 
 
 def _docker_info(fmt: str) -> str:

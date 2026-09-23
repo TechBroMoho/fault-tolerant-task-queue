@@ -1,4 +1,4 @@
-# Large chaos runs (SPEC §7 Phase 5 scale decision, ADR-039), started by hand with any N.
+# Large chaos runs (SPEC §7 Phase 5 scale decision, ADR-040), started by hand with any N.
 # Used to measure how long N=1,000,000 takes on a GitHub-hosted runner.
 
 name: chaos-scale
@@ -9,6 +9,9 @@ on:
       jobs:
         description: "Jobs to enqueue (N)"
         default: "1000000"
+      workers:
+        description: "Worker containers (default: one per vCPU, ADR-040)"
+        default: "nproc"
       drain_timeout:
         description: "Seconds to wait for the queue to drain after the fault phase"
         default: "3600"
@@ -23,6 +26,7 @@ jobs:
     env:
       CHAOS_JOBS: ${{ inputs.jobs }}
       DRAIN_TIMEOUT: ${{ inputs.drain_timeout }}
+      CHAOS_WORKERS: ${{ inputs.workers }}
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: astral-sh/setup-uv@v10.2.0
@@ -33,13 +37,14 @@ jobs:
       - run: make setup
       - name: Runner facts
         run: nproc; free -m; df -h /; docker version --format '{{.Server.Version}}'
-      - name: Chaos run (N=${{ env.CHAOS_JOBS }}, 8 workers, random seed)
+      - name: Chaos run (N=${{ env.CHAOS_JOBS }}, workers=${{ env.CHAOS_WORKERS }}, random seed)
         run: |
+          [ "$CHAOS_WORKERS" = nproc ] && CHAOS_WORKERS=$(nproc)
           start=$(date +%s)
-          uv run python -m chaos.run --jobs "$CHAOS_JOBS" --workers 8 \
+          uv run python -m chaos.run --jobs "$CHAOS_JOBS" --workers "$CHAOS_WORKERS" \
             --drain-timeout "$DRAIN_TIMEOUT" \
             --out results/ci/chaos_report.json --run-dir "$PWD/chaos/runs/ci"
-          echo "chaos N=$CHAOS_JOBS wall time: $(( $(date +%s) - start )) s" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "chaos N=$CHAOS_JOBS workers=$CHAOS_WORKERS wall time: $(( $(date +%s) - start )) s" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Upload the chaos report and worker logs
         if: always()
         uses: actions/upload-artifact@v7.0.1

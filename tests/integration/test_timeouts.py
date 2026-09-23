@@ -30,7 +30,7 @@ from ftq.metrics import read_counters
 from ftq.models import Job
 from ftq.registry import JobContext, Registry
 
-from . import blocking_handlers
+from . import blocking_handlers, slow_start_handlers
 from .helpers import (
     entries,
     fast,
@@ -376,6 +376,76 @@ async def test_a_restarted_bystander_gets_a_fresh_timeout(
     # Only the hung job timed out; the bystander ran twice, both times as attempt 0.
     assert json.loads(by_done["result"])["attempt"] == 0, c
     assert len(_runs(bystander_runs)) == 2
+    assert (c["timeouts"], c["retried"], c["processed"]) == (1, 1, 2)
+    await _assert_drained(r, keys, s.group)
+
+
+@pytest.mark.slow
+async def test_pool_start_up_does_not_count_toward_the_timeout(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    """The timeout measures the handler, not the pool: a new pool's children take
+    START_S (2 s) to be ready, and a handler that does nothing, under a 1 s timeout,
+    must still succeed on its first attempt (ADR-039)."""
+    s = fast(settings, process_pool_size=2)
+    job_id = await Client(r, s).enqueue("instant", {})
+    async with running_worker(r, s, slow_start_handlers.registry):
+        done = await _wait_state(r, keys, job_id, "SUCCEEDED", within=30)
+    c = await read_counters(r, keys)
+    assert json.loads(done["result"])["attempt"] == 0, c
+    assert (c["timeouts"], c["retried"], c["processed"]) == (0, 0, 1)
+
+
+@pytest.mark.slow
+async def test_no_clock_starts_until_every_child_of_the_pool_is_ready(
+    r: aioredis.Redis,
+    settings: Settings,
+    keys: Keys,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pool is ready when ALL its children are, not the first. Here one child is
+    ready after 2 s and the other after 4 s. Two 1.2 s jobs under a 2 s timeout: if
+    their clocks started when the first child was ready, the second job would queue
+    behind the first on that child, or wait for the other one, and time out."""
+    monkeypatch.setenv(slow_start_handlers.STAGGER_DIR_ENV, str(tmp_path))
+    s = fast(settings, process_pool_size=2)
+    client = Client(r, s)
+    job_ids = [
+        await client.enqueue(
+            "spin_2s_timeout", {"runs": str(tmp_path / f"runs-{i}"), "seconds": 1.2}
+        )
+        for i in range(2)
+    ]
+    async with running_worker(r, s, slow_start_handlers.registry):
+        for job_id in job_ids:
+            done = await _wait_state(r, keys, job_id, "SUCCEEDED", within=40)
+            assert json.loads(done["result"])["attempt"] == 0
+    c = await read_counters(r, keys)
+    assert (c["timeouts"], c["retried"], c["processed"]) == (0, 0, 2)
+
+
+@pytest.mark.slow
+async def test_after_a_pool_reset_no_clock_starts_until_the_new_pool_is_ready(
+    r: aioredis.Redis, settings: Settings, keys: Keys, tmp_path: Path
+) -> None:
+    """The cascade CI found (ADR-039), in miniature. A timeout resets the pool; the
+    bystander restarts in a new pool whose children take 2 s to be ready. If that
+    start-up were on its clock (3 s, for 2 s of work) it would time out, lose an
+    attempt, and reset the pool again. Only the hung job may time out."""
+    hung_runs, bystander_runs = tmp_path / "hung", tmp_path / "bystander"
+    s = fast(settings, process_pool_size=2)
+    client = Client(r, s)
+    bystander = await client.enqueue(
+        "spin_3s_timeout", {"runs": str(bystander_runs), "seconds": 2.0}
+    )
+    hung = await client.enqueue("hang_first_attempt", {"runs": str(hung_runs)})
+    async with running_worker(r, s, slow_start_handlers.registry):
+        by_done = await _wait_state(r, keys, bystander, "SUCCEEDED", within=40)
+        await _wait_state(r, keys, hung, "SUCCEEDED", within=40)
+    c = await read_counters(r, keys)
+    assert json.loads(by_done["result"])["attempt"] == 0, c
+    assert len(_runs(bystander_runs)) == 2  # restarted once, by the one reset
     assert (c["timeouts"], c["retried"], c["processed"]) == (1, 1, 2)
     await _assert_drained(r, keys, s.group)
 
