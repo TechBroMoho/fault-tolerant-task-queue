@@ -11,7 +11,7 @@ BENCH_ARGS ?=
 .DEFAULT_GOAL := help
 
 .PHONY: help setup fmt fmt-check lint typecheck test test-all check check-all up down chaos bench \
-        aws-plan aws-up aws-bench aws-down aws-verify-clean
+        aws-base aws-image aws-plan aws-up aws-smoke aws-bench aws-down aws-verify-clean
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -69,17 +69,51 @@ bench: ## Local benchmark: scaling, latency, backpressure + charts -> results/lo
 
 # ---------------------------------------------------------------- AWS (BILLABLE except plan/verify)
 
-aws-plan: ## terraform plan + cost estimate, $0 (Phase 7)
-	@echo "make aws-plan: not implemented yet (Phase 7)" >&2; exit 1
+# The account is on the Free plan: if the credits run out, it's closed (CLAUDE.md). Every
+# billable step prints an itemized estimate and needs a typed confirmation first.
+AWS_ENV := AWS_PROFILE=$(or $(AWS_PROFILE),ftq) AWS_REGION=us-west-2 AWS_PAGER=
+TF_BASE := deploy/terraform/base
+TF_STACK := deploy/terraform/stack
+IMAGE_TAG ?= $(shell git rev-parse --short HEAD)
+# Fleet size, e.g. TF_VARS="-var worker_hosts=6 -var workers=12 -var loadgen_hosts=1"
+TF_VARS ?=
 
-aws-up: ## BILLABLE: apply after typed confirmation (Phase 7)
-	@echo "make aws-up: not implemented yet (Phase 7)" >&2; exit 1
+aws-base: ## Budget alarm + ECR repo (idle cost $0); needs TF_VAR_alert_email
+	@test -n "$$TF_VAR_alert_email" || { echo "set TF_VAR_alert_email" >&2; exit 1; }
+	$(AWS_ENV) terraform -chdir=$(TF_BASE) init -input=false
+	$(AWS_ENV) terraform -chdir=$(TF_BASE) apply -input=false
+
+aws-image: ## Build linux/amd64 and push to ECR as the git short SHA (ECR storage: cents)
+	@git diff --quiet HEAD -- src bench docker pyproject.toml uv.lock || { echo "commit first: the tag must name the code" >&2; exit 1; }
+	$(AWS_ENV) sh -c 'repo=$$(terraform -chdir=$(TF_BASE) output -raw repository_url) && \
+	  aws ecr get-login-password | docker login --username AWS --password-stdin "$${repo%%/*}" && \
+	  docker buildx build --platform linux/amd64 -f docker/Dockerfile -t "$$repo:$(IMAGE_TAG)" --push .'
+
+aws-plan: ## terraform plan + itemized cost estimate, $0
+	$(AWS_ENV) terraform -chdir=$(TF_STACK) init -input=false
+	$(AWS_ENV) terraform -chdir=$(TF_STACK) plan -input=false -out=tfplan -var image_tag=$(IMAGE_TAG) $(TF_VARS)
+	$(AWS_ENV) terraform -chdir=$(TF_STACK) show -json tfplan > $(TF_STACK)/tfplan.json
+	$(AWS_ENV) $(UV) run python -m deploy.aws estimate $(TF_STACK)/tfplan.json
+
+aws-up: ## BILLABLE: apply the saved plan after a typed confirmation
+	@test -f $(TF_STACK)/tfplan || { echo "run make aws-plan first" >&2; exit 1; }
+	@$(AWS_ENV) $(UV) run python -m deploy.aws estimate $(TF_STACK)/tfplan.json
+	@printf 'This starts billable resources. Type "apply" to continue: '; read ans; test "$$ans" = apply
+	$(AWS_ENV) terraform -chdir=$(TF_STACK) apply -input=false tfplan
+	rm -f $(TF_STACK)/tfplan $(TF_STACK)/tfplan.json
+
+aws-smoke: ## BILLABLE (stack must be up): ftq bench as an ECS task, exactly-once checked
+	$(AWS_ENV) $(UV) run python -m deploy.aws smoke $(SMOKE_ARGS)
 
 aws-bench: ## BILLABLE: run the benchmark suite in AWS (Phase 8)
 	@echo "make aws-bench: not implemented yet (Phase 8)" >&2; exit 1
 
-aws-down: ## Tear down all AWS resources (Phase 7)
-	@echo "make aws-down: not implemented yet (Phase 7)" >&2; exit 1
+aws-down: ## Destroy the stack, delete ECR images, then verify-clean (safe to run any time)
+	$(AWS_ENV) terraform -chdir=$(TF_STACK) init -input=false >/dev/null
+	$(AWS_ENV) terraform -chdir=$(TF_STACK) destroy -input=false -auto-approve -var image_tag=$(IMAGE_TAG) $(TF_VARS)
+	$(AWS_ENV) sh -c 'ids=$$(aws ecr list-images --repository-name ftq --query imageIds --output json 2>/dev/null); \
+	  if [ -n "$$ids" ] && [ "$$ids" != "[]" ]; then aws ecr batch-delete-image --repository-name ftq --image-ids "$$ids" >/dev/null; fi'
+	$(MAKE) aws-verify-clean
 
-aws-verify-clean: ## Verify nothing billable is left running, $0 (Phase 7)
-	@echo "make aws-verify-clean: not implemented yet (Phase 7)" >&2; exit 1
+aws-verify-clean: ## Fail unless nothing billable is left in us-west-2, $0
+	$(AWS_ENV) $(UV) run python -m deploy.aws verify-clean

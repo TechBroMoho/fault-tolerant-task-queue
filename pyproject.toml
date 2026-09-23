@@ -42,7 +42,7 @@ target-version = "py312"
 src = ["src", "tests"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["ftq", "chaos", "bench"]
+known-first-party = ["ftq", "chaos", "bench", "deploy"]
 
 [tool.ruff.lint]
 select = [
@@ -60,7 +60,7 @@ select = [
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests", "chaos", "bench"]
+files = ["src", "tests", "chaos", "bench", "deploy"]
 
 # ---------------------------------------------------------------- pytest
 [tool.pytest.ini_options]

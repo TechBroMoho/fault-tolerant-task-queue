@@ -10,14 +10,58 @@
 - **Follow-up done:** CI #7's chaos failure (I4 `kills = 2 < 3`, a harness scheduling
   gap, fixed in ADR-043), and the 1M record: 7 of 7 passing 1M runs on the current
   queue code.
-- **Phase 7 pre-flight (read-only, $0) done 2026-09-23.** **Blocker:** the EC2 vCPU
-  quota is 5, so at most two 2-vCPU instances can run; the plan needs ~16.
-  Waiting on Mohammed to choose a sizing option (quota increase or not). Nothing billable
-  is created without an itemized estimate and an explicit "yes".
+- **Current phase:** Phase 7 (AWS). The infrastructure is written and planned. **Waiting
+  on Mohammed's approval** of the small-footprint apply ($0.1971/h).
+  - vCPU quota: asked for 16, **AWS granted 64**. The stack's own cap is 16.
+  - Budget alarm created (credits excluded).
+  - Nothing billable exists yet.
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
-- **AWS:** nothing created. Spend to date: $0.
+- **AWS:** budget `ftq-monthly-cost` only ($0; no actions). Spend to date: $0.
 
 ## Phase log
+
+### Phase 7: infrastructure written and planned; awaiting apply approval (2026-09-23)
+
+**Done ($0).**
+- **vCPU quota** (L-1216C47A): requested 16 at 07:20 PDT. Closed 07:26 with the quota
+  at **64**.
+  - Because the quota no longer limits spend, the stack enforces its own
+    `max_vcpus = 16`.
+- **Budget created (the only apply):** `deploy/terraform/base`.
+  - `ftq-monthly-cost`, $20/month, ACTUAL alerts at $5/$10/$20 to Mohammed's email (a
+    Terraform variable, not in the repo).
+  - Checked through the API: `IncludeCredit False`, `IncludeRefund False`.
+- **ECR repo** in the same root: planned, not applied.
+- **Stack** in `deploy/terraform/stack` (ADR-045): 23 resources. `make aws-plan`
+  exit 0.
+  - Estimate: 1 m7i-flex + 1 c7i-flex + 2 × 30 GB gp3 + 2 × IPv4 = **$0.1971/h**.
+  - The full 12-worker fleet plans at **$0.7556/h**.
+- **The plan-time guards all fire** against this account:
+  - 18 vCPUs > the 16 cap;
+  - 66 vCPUs > the 64 quota;
+  - t3.small is burstable;
+  - 3 workers on 1 host.
+- `deploy/aws.py`: estimate (unit-tested against the hand estimate), smoke, one-off
+  task, verify-clean.
+  - `make aws-verify-clean` on the empty account: CLEAN, 11 checks, all 0.
+- The amd64 image builds on this Mac under emulation: 55 MB. `ftq` and `bench.loadgen`
+  import.
+- **Loadgen sizing (ADR-046):**
+  - Phase 6 measured 24–54 µs of loadgen CPU per job locally.
+  - One 2-vCPU host is estimated to offer ~12K–28K jobs/s, against a Redis cap estimated
+    at 13–28K. That's probably enough for 10K+, and possibly the limit at the top.
+  - A 60 s probe in the Phase 7 session will measure it on AWS silicon. A 16-vCPU layout
+    with 2 loadgen hosts (L2) is the fallback.
+
+**Proposed Phase 7 session (needs a yes):**
+1. `make aws-base`: ECR repo ($0 idle).
+2. `make aws-image`: ~55 MB in ECR, about $0.006/month until deleted.
+3. `make aws-plan` → `make aws-up`: small footprint, $0.1971/h.
+4. `make aws-smoke`: `ftq bench --jobs 20000`, exactly-once checked.
+5. The loadgen probe (ADR-046).
+6. `make aws-down`, which runs verify-clean.
+
+Expected ≤ 1 h, hard stop at 2 h: **≈ $0.20–0.40**.
 
 ### Phase 7 pre-flight: read-only AWS checks (2026-09-23, $0)
 

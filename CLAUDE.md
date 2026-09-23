@@ -52,7 +52,14 @@ make bench [BENCH_ARGS=...]   # scaling + latency + backpressure + charts -> res
 uv run python -m bench.run {concurrency|scaling|latency|backpressure|iothreads|point} --help   # one suite (local Docker)
 uv run python -m bench.loadgen --help   # the load generator alone: needs only FTQ_REDIS_URL + running workers (Phase 8 reuses it)
 uv run python -m bench.plot             # charts + summary.md from the saved reports
-make aws-plan / aws-up / aws-bench / aws-down / aws-verify-clean   # BILLABLE except plan/verify [stubs until Phase 7]
+TF_VAR_alert_email=... make aws-base   # budget alarm + ECR repo (idle $0; applied once)
+make aws-image                    # build linux/amd64, push to ECR as the git short SHA
+make aws-plan [TF_VARS="-var worker_hosts=6 -var workers=12 -var loadgen_hosts=1"]  # plan + itemized estimate, $0
+make aws-up                       # BILLABLE: apply the saved plan after typing "apply"
+make aws-smoke                    # BILLABLE (stack up): ftq bench as an ECS task, exactly-once checked
+uv run python -m deploy.aws task -- CMD ...   # BILLABLE (stack up): any one-off task, e.g. the loadgen
+make aws-down                     # destroy stack + delete ECR images + verify-clean (safe any time)
+make aws-verify-clean             # $0: fail unless nothing billable is left in us-west-2
 ```
 
 ## Style

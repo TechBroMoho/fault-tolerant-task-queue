@@ -2054,3 +2054,144 @@ used.
   one call at a time. If a real handler needs fan-out, the bound must grow with it.
 - Redis's `maxclients` (default 10,000) is far above any Phase 8 fleet: 12 workers at
   concurrency 50 is at most 12 × 102 = 1,224 connections.
+
+---
+
+## ADR-045: The AWS stack: two Terraform roots, fixed-size hosts, host networking
+
+*Status: accepted (Phase 7: `deploy/terraform/{base,stack}`, `deploy/aws.py`, `make
+aws-*`). Nothing applied yet except the budget.*
+
+**Context.**
+- SPEC §7: ECS on EC2 in one AZ with no NAT, an ECR repo, Redis on its own host, a worker
+  service, a loadgen run-task, 1-day logs, a budget that excludes credits, and a teardown
+  that's verified.
+- Free plan: only 2-vCPU free-tier-eligible types are known to be allowed (pre-flight).
+  If the credits run out, the account is closed.
+- The vCPU quota was 5. We asked for 16, and **AWS granted 64** (CASE_CLOSED 07:26 PDT,
+  within about 6 minutes). So the quota no longer caps spend.
+
+**Decisions.**
+1. **Two roots.**
+   - `base`: the budget and the ECR repo. It stays up for good. Neither costs anything
+     idle: the budget has no actions, and the repo is empty after `aws-down`.
+   - `stack`: everything else, destroyed after every session.
+   - So `aws-down` can never delete the cost alarm, and the image outlives a session
+     only until `aws-down` deletes it.
+2. **Budget:** $20/month, with ACTUAL alerts at $5, $10, and $20.
+   `include_credit = false` and `include_refund = false`. Otherwise credits net the spend
+   to ~$0 and nothing fires. The email is a Terraform variable, not in the repo.
+3. **Guards at plan time (`terraform_data.guards`)**:
+   - fleet vCPUs ≤ `max_vcpus` (default 16, the size Mohammed approved);
+   - fleet vCPUs ≤ the live quota;
+   - free-tier-eligible types only;
+   - no burstable (t-family) types;
+   - at most 2 workers per host.
+
+   All but the quota guard were exercised against this account by planning a fleet
+   that breaks them. The quota guard was tested at 66 vCPUs against the 64 quota. It
+   fails the plan, so nothing launches.
+4. **Fixed-size ASGs and a fixed Redis instance, not ECS capacity providers with managed
+   scaling** (a deviation from SPEC §7's wording).
+   - A benchmark fleet must not grow or shrink mid-run.
+   - Managed termination protection is a known cause of stuck `destroy`s.
+   - Redis runs on an `aws_instance`, so its private IP is known at plan time and goes
+     straight into `FTQ_REDIS_URL`. There's no service discovery to pay for or debug.
+5. **Host networking for every task.**
+   - A `.large` has only 3 ENIs, so `awsvpc` would cap tasks per host.
+   - Bridge mode adds NAT on the hot path.
+   - Placement uses an instance attribute (`ftq.role` = redis / worker / loadgen) set
+     in user data. With `loadgen_hosts = 0` (the small footprint), the loadgen runs on
+     the Redis host.
+6. **Redis:** `public.ecr.aws/docker/library/redis:8.8.3`, the same pin as Compose,
+   from ECR Public, which avoids Docker Hub's anonymous pull limits.
+   - `noeviction`, `maxmemory 5gb` on the 8 GiB m7i-flex.
+   - **No AOF or RDB for throughput runs** (SPEC §7 says to say so); Redis durability is
+     outside the zero-loss claim anyway (SPEC §4).
+   - Host sysctls per Redis's warnings: `vm.overcommit_memory=1`, THP off.
+   - Only members of the cluster SG can reach Redis; there's no SSH.
+7. **Workers** reserve 1 vCPU each (2 per host) and run at `FTQ_CONCURRENCY=50` with
+   WARNING-level JSON logs. `stopTimeout` is 40 s, over the 30 s drain grace.
+   - The awslogs driver runs in `non-blocking` mode, so a slow log pipe can't stall
+     the event loop (heartbeats).
+8. **One-off tasks** (smoke, loadgen) run as `timeout -k 30 <task_max_seconds>` (default
+   1800 s). That's the hard wall-clock guard: a forgotten run stops itself.
+9. **Cost estimate from the plan itself.**
+   - `deploy/aws.py estimate` reads `terraform show -json`: standalone instances, plus
+     each ASG's desired capacity × its launch template's type.
+   - It prices them live from the Pricing API (free). Cost Explorer costs $0.01 per call
+     and is never used.
+   - `make aws-up` prints the estimate again and needs "apply" typed in.
+10. **`verify-clean` checks the whole region, not just tagged resources.** A resource that
+    missed its tag must not hide.
+    - It checks for instances, volumes, ENIs, EIPs, NAT gateways, load balancers, ASGs,
+      active ECS clusters, ECR images, `/ftq` log groups, and the stack's Terraform
+      state. It exits non-zero on any.
+    - It has so far only been run against the empty account (all 0). The failing
+      direction will be seen for real once the stack is up.
+
+**Consequences.**
+- Small footprint (Phase 7): Redis + loadgen on 1 m7i-flex, 2 workers on 1 c7i-flex,
+  4 vCPUs, **$0.1971/h**. Full fleet (Phase 8: 6 worker hosts, 12 workers, 1 loadgen
+  host): 16 vCPUs, **$0.7556/h**. Both figures are from `deploy/aws.py estimate` on real
+  plans, and they match the pre-flight's hand estimate.
+- Public IPv4 on every host ($0.005/h each) is the price of having no NAT gateway
+  ($0.045/h + data) and no VPC endpoints (~$0.01/h each, several needed).
+
+---
+
+## ADR-046: Can one 2-vCPU host offer enough load? Measure it first; the fallback layout
+
+*Status: proposed (Phase 7). Answers Mohammed's question 3. The deciding measurement runs
+in the Phase 7 session.*
+
+**What Phase 6 measured (local, Docker Desktop on Apple Silicon; `results/local/bench/summary.json`).**
+- Loadgen CPU per accepted job: **24–54 µs** in every saturated or high-rate point
+  (median 38 µs over 59 points). The only higher values are two low-rate latency points
+  (59 and 159 µs), where per-tick overhead dominates. The loadgen reports this itself:
+  each producer's `getrusage` CPU (`cpu_busy`), which works the same on ECS.
+- Each producer process keeps one `enqueue_many` in flight, so it's latency-bound: at most
+  ~9–16K jobs/s per process at 8 workers (ADR-042 §6). Above ~20K/s it needed 4
+  processes.
+
+**What that implies for one c7i-flex.large (an estimate, not a measurement).**
+- 2 vCPUs is one physical core's two hyperthreads, and a flex type has a 40 % baseline.
+  An Apple P-core does more per second than one hyperthread, so assume 1.5–2.5× the
+  local CPU per job: roughly **57–135 µs per job**.
+- At ~1.6 usable vCPU-seconds per second (leaving room for the sampler and the OS):
+  **~12K–28K jobs/s offered**.
+- The ceiling to beat is Redis's main thread, estimated at 13–28K jobs/s (ADR-042).
+- So one loadgen host is **probably enough for 10K+, but may be the limit at the top of
+  Redis's range.** Whether it is depends on a number we don't have yet.
+
+**Guard that already exists.** Saturation runs record the minimum queue depth in the
+window. If it hits 0, the workers ran dry: the point measured the loadgen, and it's
+reported as such, not as capacity (ADR-041). A loadgen-bound run can't pass as a Redis
+number.
+
+**Decision: measure it in the Phase 7 session, on AWS silicon, before sizing Phase 8.**
+- After the smoke test, run one 60 s saturation probe:
+  `python -m bench.loadgen --rate 0 --max-depth 20000 --processes 4`.
+- It runs on the m7i-flex, the same Sapphire Rapids generation as the c7i-flex, against
+  the 2 workers.
+- It gives producer µs per job and `cpu_busy` on AWS hardware. Co-located with Redis,
+  the figure is an upper bound.
+- Cost: a few minutes of the $0.1971/h session.
+
+**Fleet layouts within 16 vCPUs (for Phase 8, chosen after the probe).**
+
+| Layout | Redis | Loadgen | Workers | vCPUs | $/h | When |
+|---|---|---|---|---|---|---|
+| L1 | 1 m7i-flex | 1 c7i-flex, 4 processes | 6 hosts × 2 = **12** | 16 | 0.7556 | the probe says 1 host offers ≥ 1.3× Redis's measured cap |
+| L2 | 1 m7i-flex | **2** c7i-flex | 5 hosts: 12 as 3/3/2/2/2 (or 10 as 2 each) | 16 | 0.7556 | the probe says 1 loadgen host would be the limit |
+
+- L2 needs a $0 code change first: the loadgen runs from one coordinator today. The
+  second host needs a producer-only mode, and the exactly-once check must count both
+  hosts' accepted jobs. There's also a trade-off: 3 workers on a 2-vCPU host get less
+  CPU each.
+  - ADR-042 found Redis, not the workers, is the limit from 4 workers up, so the total
+    shouldn't suffer.
+  - RESULTS must state the packing either way.
+- A clean L2 with 6 worker hosts (12 workers at 2 per host) needs 18 vCPUs, about
+  **$0.849/h**. The quota (64) allows it, but it's over the approved 16, so it needs
+  Mohammed's yes.
