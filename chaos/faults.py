@@ -42,6 +42,8 @@ _WEIGHTS = {
     "latency": 1.0,
     "partition": 1.5,
 }
+# Every kind is planned at least this often (see `plan`); I4 needs 3 kills and 3 pauses.
+OPENING_ROUNDS = 4
 # After a fault is healed, leave its worker alone this long (a killed worker needs a
 # moment to restart) before it can be picked again.
 _SETTLE_S = 2.0
@@ -74,20 +76,23 @@ def plan(
     span: float,
     gap: tuple[float, float] = (1.0, 3.0),
 ) -> list[Fault]:
-    """Faults over `span` seconds, one every `gap` seconds on average.
+    """Faults over at least `span` seconds, one every `gap` seconds on average.
 
-    The first rounds go through every kind twice (in a shuffled order), so even a short
-    run has each kind at least twice; after that kinds are drawn by `_WEIGHTS`. A worker
-    has at most one fault at a time, and at most half the workers are faulted at once,
-    so the run keeps making progress.
+    The opening rounds go through every kind OPENING_ROUNDS times (in a shuffled order),
+    and the plan runs past `span` if that's what it takes to fit them. So every run has
+    at least that many kills, pauses, and network faults planned, comfortably above I4's
+    minimums even if one is skipped. After the opening, kinds are drawn by `_WEIGHTS`.
+    (Drawing every fault at random once left a 100K run with 2 pauses, and I4 failed.)
+    A worker has at most one fault at a time, and at most half the workers are faulted
+    at once, so the run keeps making progress.
     """
-    opening = [k for k in KINDS for _ in range(2)]
+    opening = [k for k in KINDS for _ in range(OPENING_ROUNDS)]
     rng.shuffle(opening)
     busy_until = [0.0] * (workers + 1)
     max_active = max(1, workers // 2)
     faults: list[Fault] = []
     t = 2.0  # let the workers start first
-    while t < span:
+    while t < span or opening:
         kind = opening[0] if opening else rng.choices(KINDS, [_WEIGHTS[k] for k in KINDS])[0]
         free = [w for w in range(1, workers + 1) if busy_until[w] <= t]
         active = workers - len(free)

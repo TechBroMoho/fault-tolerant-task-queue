@@ -151,6 +151,7 @@ class Run:
         enqueue_s = a.jobs / a.rate
         span = enqueue_s + a.fault_tail
         plan = faults.plan(rng, a.workers, LEASE, span)
+        span = max(span, max(f.at + f.duration for f in plan))
         log.info(
             "seed %d | %d jobs | %d workers | %s",
             self.seed,

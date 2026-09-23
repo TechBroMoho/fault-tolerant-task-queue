@@ -173,7 +173,11 @@ async def verify(
         e = entries[0]
         if e["dlq_reason"] != k.dlq_reason:
             i3.fail(f"{job_id} ({kind}): reason {e['dlq_reason']}, expected {k.dlq_reason}")
-        elif kind == "crashy" and e["dlq_deliveries"] != str(max_deliveries + 1):
+        elif kind == "crashy" and int(e["dlq_deliveries"]) <= max_deliveries:
+            # Too early: it still had deliveries left. (Later than max_deliveries + 1 is
+            # fine: a fault can interrupt the DLQ move itself, e.g. the reclaim's reply is
+            # lost, and the next reclaim finds it one delivery later. It never runs then;
+            # the crash-count check below proves that.)
             i3.fail(f"{job_id} (crashy): dead-lettered at delivery {e['dlq_deliveries']}")
         elif kind in ("poison", "hang_forever") and e["dlq_attempts"] != str(max_attempts):
             i3.fail(f"{job_id} ({kind}): dead after {e['dlq_attempts']} attempts")
@@ -181,9 +185,25 @@ async def verify(
             i3.fail(f"{job_id} (hang_forever): last error {e['dlq_error'][:80]!r}")
     for job_id in dlq_by_job.keys() - accepted.keys():
         i3.fail(f"DLQ entry for {job_id}, which was never accepted")
+    # A crashy job may run (and crash a worker) at most max_deliveries times. Running it
+    # past that would mean the max_deliveries check failed to stop it. Nothing else exits
+    # with the crashy exit code (70).
+    crashy_jobs = sum(1 for kind in accepted.values() if kind == "crashy")
+    if evidence is not None and evidence.get("crash_restarts", 0) > crashy_jobs * max_deliveries:
+        i3.fail(
+            f"{evidence['crash_restarts']} crashy crashes > {crashy_jobs} crashy jobs x "
+            f"max_deliveries {max_deliveries}: a crashy job ran past max_deliveries"
+        )
+    crashy_dlq_deliveries = sorted(
+        int(f["dlq_deliveries"])
+        for job_id, fs in dlq_by_job.items()
+        if accepted.get(job_id) == "crashy"
+        for f in fs
+    )
     i3.detail = {
         "dlq_entries": len(dlq),
         "reasons": dict(Counter(f["dlq_reason"] for _i, f in dlq)),
+        "crashy_dlq_deliveries": crashy_dlq_deliveries,
     }
 
     # ---- I5: drained. Nothing left in the stream, the PEL, or the delayed set.
@@ -220,11 +240,13 @@ async def verify(
     raw_histogram: Any = await redis.hgetall(keys.reclaims)
     histogram = {int(k): int(v) for k, v in raw_histogram.items()}
     # A crashy job's single entry is reclaimed exactly once at each delivery count from
-    # 2 to max_deliveries + 1 (each claim raises the count by one, and each run crashes).
+    # 2 up to the count it was dead-lettered at (each claim raises the count by one).
     # Subtracting that leaves how far every OTHER job's delivery count climbed: the
     # margin under max_deliveries that ADR-008's sizing is about.
-    crashy = sum(1 for kind in accepted.values() if kind == "crashy")
-    others = {n: c - (crashy if 2 <= n <= max_deliveries + 1 else 0) for n, c in histogram.items()}
+    others = dict(histogram)
+    for n_dead in crashy_dlq_deliveries:
+        for n in range(2, n_dead + 1):
+            others[n] = others.get(n, 0) - 1
     others = {n: c for n, c in others.items() if c}
     return {
         "passed": all(v["ok"] for v in invariants.values()),
