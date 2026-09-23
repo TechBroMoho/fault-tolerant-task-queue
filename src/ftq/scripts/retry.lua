@@ -11,6 +11,7 @@
 -- ARGV[3]  caller's consumer name (the worker id)
 -- ARGV[4]  next attempt number (the failed attempt + 1)
 -- ARGV[5]  delay in ms (full-jitter backoff, computed by the caller: backoff.py)
+-- ARGV[6]  '1' if the failed run timed out (ADR-030), else '0'
 --
 -- Returns 'OK' (retry scheduled), 'LEASE_LOST' (the caller isn't the owner: nothing
 -- changed), or 'TERMINAL' (the job already succeeded or died via another copy: this
@@ -69,4 +70,7 @@ redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
 redis.call('XDEL', KEYS[1], ARGV[2])
 
 redis.call('HINCRBY', KEYS[4], 'retried', 1)
+if ARGV[6] == '1' then
+  redis.call('HINCRBY', KEYS[4], 'timeouts', 1)                    -- counted with the retry
+end
 return 'OK'

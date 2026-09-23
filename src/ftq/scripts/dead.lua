@@ -19,6 +19,7 @@
 -- ARGV[5]  reason (one of the four above)
 -- ARGV[6]  last error message
 -- ARGV[7]  attempts made (handler runs started; 0 if the entry never parsed)
+-- ARGV[8]  '1' if the last run timed out (ADR-030), else '0'
 --
 -- Returns 'OK' (moved to the DLQ), 'LEASE_LOST' (not the owner: nothing changed), or
 -- 'TERMINAL' (another copy of this job already finished: this entry is dropped).
@@ -86,4 +87,7 @@ redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
 redis.call('XDEL', KEYS[1], ARGV[2])
 
 redis.call('HINCRBY', KEYS[4], 'dead', 1)
+if ARGV[8] == '1' then
+  redis.call('HINCRBY', KEYS[4], 'timeouts', 1)                    -- counted with the move
+end
 return 'OK'

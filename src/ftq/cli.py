@@ -1,7 +1,6 @@
-"""Command-line interface: `ftq worker`, `ftq enqueue`, `ftq dlq list|requeue`.
+"""Command-line interface: `ftq worker | enqueue | stats | bench | dlq list|requeue`.
 
 Configuration comes from `FTQ_*` env vars (config.py); flags override a few of them.
-`stats` and `bench` arrive in later phases.
 """
 
 import asyncio
@@ -9,6 +8,7 @@ import dataclasses
 import importlib
 import json
 import logging
+import os
 import signal
 from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
@@ -16,10 +16,12 @@ from typing import Annotated, Any
 import redis.asyncio as aioredis
 import typer
 
-from ftq import dlq
-from ftq.client import Client
+from ftq import dlq, logs
+from ftq.bench import format_report, run_bench
+from ftq.client import Client, QueueFull
 from ftq.config import Settings, make_redis
 from ftq.keys import Keys
+from ftq.metrics import snapshot
 from ftq.registry import Registry
 from ftq.worker import Worker
 
@@ -42,17 +44,8 @@ def _load_registry(spec: str) -> Registry:
     return registry
 
 
-def _configure_logging(level: str) -> None:
-    # INFO covers lifecycle events only; per-job lines are DEBUG, so the default level
-    # never logs every job (SPEC Phase 3). JSON logs arrive in Phase 3.
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-
-async def run_worker(settings: Settings, registry: Registry) -> None:
-    """Run one worker until SIGTERM/SIGINT, then drain gracefully."""
+async def run_worker(settings: Settings, registry: Registry) -> Worker:
+    """Run one worker until SIGTERM/SIGINT, then drain gracefully. Returns the worker."""
     redis = make_redis(settings)
     worker = Worker(redis, settings, registry)
     loop = asyncio.get_running_loop()
@@ -64,6 +57,7 @@ async def run_worker(settings: Settings, registry: Registry) -> None:
         await worker.run()
     finally:
         await redis.aclose()
+    return worker
 
 
 @app.command()
@@ -76,8 +70,21 @@ def worker(
 ) -> None:
     """Run a worker process until SIGTERM/SIGINT."""
     settings = _settings(queue=queue, concurrency=concurrency)
-    _configure_logging(settings.log_level)
-    asyncio.run(run_worker(settings, _load_registry(handlers)))
+    logs.configure(settings.log_level, settings.log_format)
+    finished = asyncio.run(run_worker(settings, _load_registry(handlers)))
+    stuck = finished.threads_still_running()
+    if stuck:
+        # Handler threads that timed out or were abandoned and are still running. A
+        # thread can't be killed, and the interpreter would wait for them at exit, maybe
+        # forever, so the grace period wouldn't bound shutdown. Everything the queue
+        # needs is already in Redis (their jobs were retried or are in the PEL), so exit
+        # without waiting (ADR-030). This is also what `docker stop`'s SIGKILL would do.
+        logging.getLogger("ftq.cli").warning(
+            "exiting with %d handler thread(s) still running; they are killed with the process",
+            stuck,
+        )
+        logging.shutdown()
+        os._exit(0)
 
 
 @app.command()
@@ -104,7 +111,46 @@ def enqueue(
         finally:
             await redis.aclose()
 
-    typer.echo(asyncio.run(_enqueue()))
+    try:
+        typer.echo(asyncio.run(_enqueue()))
+    except QueueFull as exc:
+        typer.echo(f"not enqueued: {exc}", err=True)
+        raise typer.Exit(2) from None
+
+
+@app.command()
+def stats(
+    queue: Annotated[str | None, typer.Option(help="Overrides FTQ_QUEUE.")] = None,
+) -> None:
+    """Print the queue's depth, in-flight, delayed, DLQ size, consumers, and counters (JSON)."""
+    settings = _settings(queue=queue)
+    typer.echo(json.dumps(_with_redis(settings, lambda r: snapshot(r, settings)), indent=2))
+
+
+@app.command()
+def bench(
+    jobs: Annotated[int, typer.Option(help="How many jobs to enqueue.")] = 10_000,
+    job_type: Annotated[str, typer.Option("--type", help="Handler type.")] = "send_email",
+    payload: Annotated[str, typer.Option(help="Payload of every job, JSON.")] = "{}",
+    batch: Annotated[int, typer.Option(help="Jobs per pipelined enqueue_many.")] = 500,
+    timeout: Annotated[float, typer.Option(help="Give up waiting after this many s.")] = 600.0,
+    queue: Annotated[str | None, typer.Option(help="Overrides FTQ_QUEUE.")] = None,
+) -> None:
+    """Enqueue N jobs, wait until workers commit them all, report rates + exactly-once check.
+
+    Uses block-mode backpressure, so a run larger than the high watermark throttles
+    instead of failing. Exits 1 if any job is missing or has more than one result.
+    """
+    parsed = json.loads(payload)
+    if not isinstance(parsed, dict):
+        raise typer.BadParameter("payload must be a JSON object")
+    settings = _settings(queue=queue, backpressure_mode="block")
+    report = _with_redis(
+        settings, lambda r: run_bench(r, settings, jobs, job_type, parsed, batch, timeout)
+    )
+    typer.echo(format_report(report))
+    if report["missing"] or report["duplicate_results"]:
+        raise typer.Exit(1)
 
 
 def _with_redis[T](settings: Settings, fn: Callable[[aioredis.Redis], Awaitable[T]]) -> T:

@@ -16,6 +16,9 @@ Two kinds of handler (ADR-028):
 
 `heartbeat=False` opts a handler out of lease extension. The chaos test's "slow" jobs use
 it so their leases are guaranteed to expire (ADR-007).
+
+`timeout=` overrides `Settings.job_timeout` for one handler type (ADR-030). A run that
+takes longer counts as a failed attempt, whatever kind of handler it is.
 """
 
 from collections.abc import Awaitable, Callable
@@ -45,6 +48,7 @@ Pool = Literal["thread", "process"]
 class AsyncSpec:
     fn: AsyncHandler
     heartbeat: bool
+    timeout: float | None = None  # None = Settings.job_timeout
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +56,7 @@ class SyncSpec:
     fn: SyncHandler
     pool: Pool
     heartbeat: bool
+    timeout: float | None = None  # None = Settings.job_timeout
 
 
 HandlerSpec = AsyncSpec | SyncSpec
@@ -62,20 +67,22 @@ class Registry:
         self._handlers: dict[str, HandlerSpec] = {}
 
     def register(
-        self, job_type: str, *, heartbeat: bool = True
+        self, job_type: str, *, heartbeat: bool = True, timeout: float | None = None
     ) -> Callable[[AsyncHandler], AsyncHandler]:
         """Decorator for an async handler: `@registry.register("send_email")`."""
+        _check_timeout(timeout)
 
         def decorator(fn: AsyncHandler) -> AsyncHandler:
-            self._add(job_type, AsyncSpec(fn, heartbeat))
+            self._add(job_type, AsyncSpec(fn, heartbeat, timeout))
             return fn
 
         return decorator
 
     def register_sync(
-        self, job_type: str, *, pool: Pool, heartbeat: bool = True
+        self, job_type: str, *, pool: Pool, heartbeat: bool = True, timeout: float | None = None
     ) -> Callable[[SyncHandler], SyncHandler]:
         """Decorator for a blocking handler run in a thread or process pool."""
+        _check_timeout(timeout)
 
         def decorator(fn: SyncHandler) -> SyncHandler:
             # A process pool pickles the function by its import path, so it must be a
@@ -84,7 +91,7 @@ class Registry:
                 raise ValueError(
                     f"process-pool handler {fn.__qualname__!r} must be a module-level function"
                 )
-            self._add(job_type, SyncSpec(fn, pool, heartbeat))
+            self._add(job_type, SyncSpec(fn, pool, heartbeat, timeout))
             return fn
 
         return decorator
@@ -99,3 +106,11 @@ class Registry:
 
     def types(self) -> list[str]:
         return sorted(self._handlers)
+
+    def specs(self) -> dict[str, HandlerSpec]:
+        return dict(self._handlers)
+
+
+def _check_timeout(timeout: float | None) -> None:
+    if timeout is not None and not timeout > 0:
+        raise ValueError(f"timeout must be positive, got {timeout!r}")

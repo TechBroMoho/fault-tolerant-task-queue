@@ -43,6 +43,12 @@ class Keys:
         return f"{self.prefix}:effects"
 
     @property
+    def full(self) -> str:
+        """Backpressure flag: exists while the queue is "full" (between crossing the high
+        watermark and falling below the low one). Hysteresis state, set by enqueue.lua."""
+        return f"{self.prefix}:full"
+
+    @property
     def stats(self) -> str:
         """Hash of counters (metrics.py)."""
         return f"{self.prefix}:stats"

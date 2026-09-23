@@ -75,8 +75,11 @@ class Transitions:
         )
         return Outcome(outcome)
 
-    async def retry(self, entry_id: str, job: Job, delay_s: float) -> Outcome:
-        """Schedule attempt `job.attempt + 1` to run after `delay_s`, if we own the entry."""
+    async def retry(
+        self, entry_id: str, job: Job, delay_s: float, *, timed_out: bool = False
+    ) -> Outcome:
+        """Schedule attempt `job.attempt + 1` to run after `delay_s`, if we own the entry.
+        `timed_out` also counts the failure in the `timeouts` counter (ADR-030)."""
         k = self._keys
         outcome: Any = await self._retry(
             keys=[k.stream, k.delayed, k.done(job.job_id), k.stats],
@@ -86,12 +89,20 @@ class Transitions:
                 self._worker_id,
                 str(job.attempt + 1),
                 str(int(delay_s * 1000)),
+                "1" if timed_out else "0",
             ],
         )
         return Outcome(outcome)
 
     async def dead(
-        self, entry_id: str, job_id: str, reason: DeadReason, error: str, attempts: int
+        self,
+        entry_id: str,
+        job_id: str,
+        reason: DeadReason,
+        error: str,
+        attempts: int,
+        *,
+        timed_out: bool = False,
     ) -> Outcome:
         """Move the entry's job to the DLQ with terminal state DEAD, if we own the entry."""
         k = self._keys
@@ -105,6 +116,7 @@ class Transitions:
                 reason.value,
                 error,
                 str(attempts),
+                "1" if timed_out else "0",
             ],
         )
         return Outcome(outcome)

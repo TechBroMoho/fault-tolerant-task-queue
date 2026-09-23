@@ -86,6 +86,14 @@ class Settings(BaseSettings):
             "Thread-pool handlers get `concurrency` threads."
         ),
     )
+    job_timeout: float = Field(
+        default=300.0,
+        gt=0,
+        description=(
+            "Seconds one handler run may take before it counts as a failed attempt "
+            "(ADR-030). A handler type can override it at registration."
+        ),
+    )
 
     # ------------------------------------------------------------ leases (ADR-023, ADR-025)
     visibility_timeout: float = Field(
@@ -150,9 +158,45 @@ class Settings(BaseSettings):
         default=60.0, gt=0, description="Seconds between consumer-cleanup passes."
     )
 
+    # ------------------------------------------------------------ backpressure (ADR-031)
+    backpressure_mode: Literal["reject", "block"] = Field(
+        default="reject",
+        description=(
+            "When the queue is full: 'reject' raises QueueFull at once; 'block' waits "
+            "(up to block_timeout) for the depth to fall below the low watermark."
+        ),
+    )
+    high_watermark: int = Field(
+        default=100_000,
+        ge=1,
+        description=(
+            "Queue depth (stream length + delayed retries) at which enqueue stops accepting jobs."
+        ),
+    )
+    low_watermark: int = Field(
+        default=80_000,
+        ge=0,
+        description="Once full, enqueue accepts jobs again only when depth falls below this.",
+    )
+    block_timeout: float = Field(
+        default=30.0,
+        ge=0,
+        description="In 'block' mode, seconds to wait for room before raising QueueFull.",
+    )
+    block_poll_interval: float = Field(
+        default=0.05,
+        gt=0,
+        description="In 'block' mode, seconds between admission retries while full.",
+    )
+
+    # ------------------------------------------------------------ logging
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(
         default="INFO",
         description="INFO logs lifecycle events only; per-job lines are DEBUG.",
+    )
+    log_format: Literal["json", "text"] = Field(
+        default="json",
+        description="'json': one object per line with job_id/attempt/worker_id fields.",
     )
 
     # ------------------------------------------------------------ retention
@@ -199,23 +243,46 @@ class Settings(BaseSettings):
         # on this: pruning only ever deletes consumers that own no entries (ADR-029).
         if self.consumer_prune_idle * 1000 <= self.block_ms:
             raise ValueError("consumer_prune_idle must exceed block_ms")
-        if self.done_ttl_seconds and self.done_ttl_seconds < _TTL_MARGIN * self.job_lifetime_bound:
+        # Hysteresis needs a gap: with low == high, the queue would flip between full and
+        # not full on every enqueue at the boundary (ADR-031).
+        if self.low_watermark >= self.high_watermark:
             raise ValueError(
-                f"done_ttl_seconds ({self.done_ttl_seconds}) must be 0 or at least "
-                f"{_TTL_MARGIN}x the redelivery bound of {self.job_lifetime_bound:.0f}s (ADR-010)"
+                f"low_watermark ({self.low_watermark}) must be below high_watermark "
+                f"({self.high_watermark})"
             )
+        self.check_ttl_covers(self.job_timeout)
         return self
+
+    def lifetime_bound(self, timeout: float) -> float:
+        """Upper bound (s) on how long copies of a job whose runs time out after
+        `timeout` can keep being delivered. One delivery ends at the latest when its run
+        times out (then it's retried), or, if the worker dies first, a lease later, when
+        it's reclaimed: at most `timeout + visibility_timeout`. Every attempt can be
+        delivered `max_deliveries` times and then waits up to `job_backoff_cap`.
+
+        The done/ledger TTL must outlast this, or a late copy would commit twice (ADR-010).
+        Before the per-job timeout (ADR-030), a heartbeating job had no bound at all.
+        Time spent waiting undelivered in a backlog is still NOT covered: size TTLs for it.
+        """
+        per_delivery = timeout + self.visibility_timeout
+        per_attempt = self.max_deliveries * per_delivery + self.job_backoff_cap
+        return self.max_attempts * per_attempt
 
     @property
     def job_lifetime_bound(self) -> float:
-        """Upper bound (s) on how long copies of a job can keep being redelivered without
-        anyone heartbeating: every attempt can be delivered `max_deliveries` times, each
-        after a full lease, and waits up to `job_backoff_cap` before the next attempt.
-        The done/ledger TTL must outlast this, or a late copy would commit twice (ADR-010).
-        Time spent waiting undelivered in a backlog is NOT covered: size TTLs for that.
-        """
-        per_attempt = self.max_deliveries * self.visibility_timeout + self.job_backoff_cap
-        return self.max_attempts * per_attempt
+        """`lifetime_bound` for the default `job_timeout`."""
+        return self.lifetime_bound(self.job_timeout)
+
+    def check_ttl_covers(self, timeout: float) -> None:
+        """Raise ValueError unless done_ttl_seconds is 0 or >= 10x lifetime_bound(timeout).
+        The worker also calls this for each handler type's own timeout."""
+        bound = self.lifetime_bound(timeout)
+        if self.done_ttl_seconds and self.done_ttl_seconds < _TTL_MARGIN * bound:
+            raise ValueError(
+                f"done_ttl_seconds ({self.done_ttl_seconds}) must be 0 or at least "
+                f"{_TTL_MARGIN}x the redelivery bound of {bound:.0f}s for a {timeout}s "
+                "job timeout (ADR-010)"
+            )
 
 
 def make_redis(settings: Settings) -> aioredis.Redis:
