@@ -363,6 +363,71 @@ async def test_reclaim_respects_count(r: aioredis.Redis, settings: Settings, key
     assert len(rest) == 3
 
 
+async def _expired_entries(
+    r: aioredis.Redis, s: Settings, keys: Keys, deliveries: list[int]
+) -> list[str]:
+    """One expired PEL entry per item, owned by "crashed", with that delivery count
+    (XCLAIM's IDLE and RETRYCOUNT options set both directly)."""
+    client = Client(r, s)
+    await r.xgroup_create(keys.stream, s.group, id="0", mkstream=True)
+    ids = []
+    for n in deliveries:
+        await client.enqueue("t")
+        entry = await deliver(r, keys.stream, s.group, "crashed")
+        await r.xclaim(
+            keys.stream, s.group, "crashed", 0, [entry], idle=60_000, retrycount=n, justid=True
+        )
+        ids.append(entry)
+    return ids
+
+
+async def test_reclaim_takes_at_most_the_suspects_the_caller_has_room_for(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    """ADR-035: two entries that become suspects when claimed (delivery 3 >= the default
+    threshold 3), and one that doesn't (delivery 2). With one suspect slot, the reaper
+    takes the non-suspect and ONE suspect. The other suspect is put back exactly as it
+    was: same delivery count, still expired, so another worker takes it at once."""
+    s = fast(settings)
+    first, second, plain = await _expired_entries(r, s, keys, [2, 2, 1])
+
+    claimed, _more = await Reaper(r, s, "a").reclaim(count=10, suspect_slots=1)
+
+    assert [(c.entry_id, c.deliveries) for c in claimed] == [(first, 3), (plain, 2)]
+    assert [c.is_suspect(s) for c in claimed] == [True, False]
+    [left] = [p for p in await pending(r, keys.stream, s.group) if p.entry_id == second]
+    assert left.deliveries == 2  # unchanged: the put-back undid the claim's increment
+    assert left.idle_ms >= 500  # still expired
+    # A second worker with a free suspect slot takes it on its next pass.
+    again, _more = await Reaper(r, s, "b").reclaim(count=10, suspect_slots=1)
+    assert [(c.entry_id, c.deliveries) for c in again] == [(second, 3)]
+    counters = await read_counters(r, keys)
+    assert counters["reclaimed"] == 3  # put-backs aren't reclaims
+    assert await hash_of(r, keys.reclaims) == {"3": "2", "2": "1"}
+
+
+async def test_reclaim_with_no_suspect_slot_still_takes_non_suspects(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    s = fast(settings)
+    suspect, plain = await _expired_entries(r, s, keys, [4, 1])
+    claimed, _more = await Reaper(r, s, "a").reclaim(count=10, suspect_slots=0)
+    assert [c.entry_id for c in claimed] == [plain]
+    [left] = [p for p in await pending(r, keys.stream, s.group) if p.entry_id == suspect]
+    assert left.deliveries == 4
+
+
+async def test_entries_past_max_deliveries_are_never_held_back_as_suspects(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    """An entry past max_deliveries goes to the DLQ without running, so it can't crash
+    anything: the reaper takes it even with no suspect slot, and the worker dead-letters it."""
+    s = fast(settings, max_deliveries=3)
+    [doomed] = await _expired_entries(r, s, keys, [3])
+    claimed, _more = await Reaper(r, s, "a").reclaim(count=10, suspect_slots=0)
+    assert [(c.entry_id, c.deliveries, c.is_suspect(s)) for c in claimed] == [(doomed, 4, False)]
+
+
 # ---------------------------------------------------------------- requeue
 
 

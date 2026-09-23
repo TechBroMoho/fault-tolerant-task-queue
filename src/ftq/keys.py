@@ -49,6 +49,12 @@ class Keys:
         return f"{self.prefix}:full"
 
     @property
+    def reclaims(self) -> str:
+        """Hash: delivery count an entry had when a reaper took it -> how many times that
+        happened (reclaim.lua). Shows how close jobs came to max_deliveries (ADR-008)."""
+        return f"{self.prefix}:reclaims"
+
+    @property
     def stats(self) -> str:
         """Hash of counters (metrics.py)."""
         return f"{self.prefix}:stats"

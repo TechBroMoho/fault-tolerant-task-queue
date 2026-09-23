@@ -101,6 +101,7 @@ def test_keys_share_one_hash_tag() -> None:
         k.effects,
         k.stats,
         k.full,
+        k.reclaims,
         k.done("j"),
         k.idem("i"),
         k.ledger("l"),

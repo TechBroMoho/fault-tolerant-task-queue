@@ -128,6 +128,15 @@ class Settings(BaseSettings):
             "unrun: the job keeps crashing its worker."
         ),
     )
+    suspect_deliveries: int = Field(
+        default=3,
+        ge=2,
+        description=(
+            "A reclaimed entry at this delivery count or more is suspected of crashing its "
+            "workers; each worker runs at most one suspect at a time, so jobs that ran "
+            "beside a crashing job don't follow it to the DLQ (ADR-035)."
+        ),
+    )
     job_backoff_base: float = Field(
         default=1.0,
         gt=0,

@@ -29,6 +29,11 @@ class Claimed:
     fields: dict[str, str]
     deliveries: int  # the entry's delivery count, including this claim
 
+    def is_suspect(self, settings: Settings) -> bool:
+        """Redelivered often enough to suspect it crashes workers, but not so often that
+        it goes to the DLQ unrun (ADR-035). A worker runs one suspect at a time."""
+        return settings.suspect_deliveries <= self.deliveries <= settings.max_deliveries
+
 
 def _pairs(flat: list[str]) -> dict[str, str]:
     """A Lua-returned {name, value, name, value, ...} list as a dict."""
@@ -47,16 +52,20 @@ class Reaper:
         # on every pass. "0-0" = start over.
         self._cursor = "0-0"
 
-    async def reclaim(self, count: int) -> tuple[list[Claimed], bool]:
-        """Claim up to `count` expired entries. Returns (claimed, more_to_scan)."""
+    async def reclaim(self, count: int, suspect_slots: int = 1) -> tuple[list[Claimed], bool]:
+        """Claim up to `count` expired entries, of which at most `suspect_slots` suspects
+        (ADR-035). Returns (claimed, more_to_scan)."""
         reply: Any = await self._reclaim(
-            keys=[self._keys.stream, self._keys.stats],
+            keys=[self._keys.stream, self._keys.stats, self._keys.reclaims],
             args=[
                 self._settings.group,
                 self._worker_id,
                 str(int(self._settings.visibility_timeout * 1000)),
                 self._cursor,
                 str(count),
+                str(suspect_slots),
+                str(self._settings.suspect_deliveries),
+                str(self._settings.max_deliveries),
             ],
         )
         cursor, claimed, deleted = reply

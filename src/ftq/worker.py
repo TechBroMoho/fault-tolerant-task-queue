@@ -122,6 +122,9 @@ class Worker:
         self._rng = rng or random.Random()  # retry jitter; tests pass a seeded one
         self._stop = asyncio.Event()
         self._in_flight: set[asyncio.Task[None]] = set()
+        # The in-flight jobs that are suspects: reclaimed so often they may be what keeps
+        # crashing workers. At most one at a time (ADR-035).
+        self._suspects: set[asyncio.Task[None]] = set()
         self._next_reap = 0.0  # loop time of the next reaper pass; 0 = at startup
         self._thread_pool: ThreadPoolExecutor | None = None
         self._process_pool: ProcessPoolExecutor | None = None
@@ -227,8 +230,11 @@ class Worker:
     async def _reap(self, free: int) -> int:
         """One reaper pass: claim up to `free` expired entries and start them."""
         loop = asyncio.get_running_loop()
+        # One suspect at a time: if a suspect is what crashes workers, only it and this
+        # worker's fresh jobs go down with it, never a second suspect (ADR-035).
+        suspect_slots = 0 if self._suspects else 1
         try:
-            claimed, more = await self._reaper.reclaim(free)
+            claimed, more = await self._reaper.reclaim(free, suspect_slots)
         except _REDIS_DOWN as exc:
             self._log.warning("reclaim failed (%s)", exc)
             self._next_reap = loop.time() + self._settings.reap_interval
@@ -239,7 +245,10 @@ class Worker:
             self._log.debug(
                 "reclaimed entry (delivery %d)", c.deliveries, extra={"entry_id": c.entry_id}
             )
-            self._spawn(c.entry_id, c.fields, c.deliveries)
+            task = self._spawn(c.entry_id, c.fields, c.deliveries)
+            if c.is_suspect(self._settings):
+                self._suspects.add(task)
+                task.add_done_callback(self._suspects.discard)
         return len(claimed)
 
     async def _fetch(self, count: int) -> list[tuple[str, dict[str, str]]]:
@@ -264,10 +273,11 @@ class Worker:
         entries: list[tuple[str, dict[str, str]]] = reply[0][1]
         return entries
 
-    def _spawn(self, entry_id: str, fields: dict[str, str], deliveries: int) -> None:
+    def _spawn(self, entry_id: str, fields: dict[str, str], deliveries: int) -> asyncio.Task[None]:
         task = asyncio.create_task(self._process(entry_id, fields, deliveries))
         self._in_flight.add(task)
         task.add_done_callback(self._in_flight.discard)
+        return task
 
     async def _drain(self) -> bool:
         """Give in-flight jobs `shutdown_grace` seconds to finish, then abandon the rest.
