@@ -34,7 +34,7 @@ A from-scratch, Celery-style distributed task queue on Redis Streams: at-least-o
 make setup        # uv sync --locked (no pre-commit hooks yet)
 make fmt          # ruff format + safe autofixes
 make check        # fmt-check + lint + typecheck + FAST tests (`-m "not slow"`, ~16 s)
-make check-all    # fmt-check + lint + typecheck + EVERY test (~55 s); what CI must run
+make check-all    # fmt-check + lint + typecheck + EVERY test (~75 s); what CI must run (Phase 5 confirmed)
 make test         # fast pytest set (needs Redis: `make up`; fails, never skips, without it)
 make test-all     # every test, including `slow` (subprocess / process-pool / >1 s tests)
 make up [WORKERS=N] / down   # redis (+ N worker containers from docker/Dockerfile) / down -v
@@ -45,7 +45,8 @@ uv run ftq bench --jobs N [--type T --payload JSON --batch B]  # enqueue, wait, 
 uv run ftq dlq list [--limit N]   # DLQ entries as JSON lines
 uv run ftq dlq requeue JOB_ID... | --all   # back on the stream, attempt 0, same job_id
 uv run python bench/pipelining.py # enqueue batching + worker drain measurement -> results/local/
-make chaos N=...  # chaos run + verifier → results/local/chaos_report.json   [stub until Phase 4]
+make chaos N=100000 [CHAOS_WORKERS=8] [SEED=s]  # chaos run + verifier -> results/local/chaos_report.json (~2 min; run in background)
+uv run python -m chaos.run --help                # same, all knobs (--rate, --out, --keep, --skip-build ...)
 make bench ...    # local load test + charts                               [stub until Phase 6]
 make aws-plan / aws-up / aws-bench / aws-down / aws-verify-clean   # BILLABLE except plan/verify [stubs until Phase 7]
 ```

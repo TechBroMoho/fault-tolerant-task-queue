@@ -2,15 +2,227 @@
 
 ## Status
 
-- **Current phase:** Phase 3 (multiple worker processes, backpressure with hysteresis,
-  pipelined `enqueue_many`, `ftq stats`, JSON logs, **per-job timeouts**, the worker Docker
-  image): **complete**, awaiting Mohammed's review.
-- **Next:** Phase 4 (chaos harness: per-worker Toxiproxy, kills/pauses/network faults,
-  verifier I1–I5, mutation tests, N=100,000 locally). Starts on Mohammed's go-ahead.
+- **Current phase:** Phase 4 (the chaos harness: per-worker Toxiproxy, kills, pauses and
+  network faults, a supervisor, verifier I1–I5, mutation tests, and 3 × N=100,000 local
+  runs): **complete**, awaiting Mohammed's review.
+- **Next:** Phase 5 (GitHub Actions CI; it calls `make check-all`, confirmed by Mohammed;
+  measure N=1M on a hosted runner to choose per-push vs nightly). Starts on Mohammed's
+  go-ahead.
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
 - **AWS:** nothing created. Spend to date: $0.
 
 ## Phase log
+
+### Phase 4: Chaos testing harness (2026-09-22)
+
+**Built**
+- **`chaos/` package, `make chaos N=… [CHAOS_WORKERS=8] [SEED=s]`** (ADR-036):
+  - A generated Compose project: Redis on port 6390, one Toxiproxy 2.12.0 with a proxy
+    per worker, and `worker-1..8`. The producer and the verifier connect to Redis
+    directly (resolves ADR-011).
+  - A seeded fault plan: kill + restart, pause for 1.5–3 leases, and Toxiproxy
+    `reset_peer`, downstream `timeout` (lost replies), `latency`, and partition, each on
+    one worker's proxy. Every kind is planned ≥ 4 times.
+  - An injector that records what actually happened, and a supervisor that restarts
+    crashed workers and counts restarts by exit code.
+  - The mix enqueued at 2,000 jobs/s; then heal, drain, graceful stop, verify, and a JSON
+    report. Worker logs and the accepted-job list go to `chaos/runs/`.
+- **Verifier I1–I5** (`chaos/verifier.py`), counted from the append-only effects and
+  results logs, the done hashes, and the DLQ. It is stricter than SPEC's wording in a few
+  places: no late successes, no stray results or effects, the DLQ holds only the expected
+  jobs, and crashy jobs never run past `max_deliveries` (checked from crash counts). I4
+  also requires timeouts, pool resets, and crash restarts. The report adds each
+  non-crashy job's highest delivery count (the ADR-008 margin).
+- **The job mix** (`chaos/mix.py`): normal, flaky (k ≤ 3), slow (no heartbeat), `cpu_task`,
+  and hang jobs of every kind. Per Mohammed's requirement these are the new built-in
+  `hang` / `hang_thread` / `hang_process` handlers with a 2 s timeout: under chaos their
+  timeouts cancel async runs, orphan threads, and **reset process pools** (~200 resets
+  per 100K run). Plus always-hanging, poison, and crashy jobs.
+- **Two system bugs fixed** (see "Things that went wrong"):
+  - **ADR-035:** a crashy job's companions followed it into the DLQ (a false DEAD). Now an
+    entry redelivered ≥ 3 times is a *suspect*, and each worker runs at most one at a
+    time.
+  - **ADR-038:** a worker that started while Redis was unreachable crashed (exit 1). It
+    now waits.
+- **`max_deliveries` / `max_attempts` sized** for chaos at 12 / 8, with a false-DEAD
+  estimate (ADR-008): ≈ 1.5 × 10⁻³ per 100K run, driven by slow jobs. The observed
+  highest delivery of any non-crashy job was 5–7 across all 7 runs.
+- **Worker count: 8** (ADR-036). Docker has 10 CPUs and 7.75 GiB; 8 saturated workers plus
+  Redis plus Toxiproxy fit in 10 CPUs. The runs measured 3.1–4.3 CPUs in use.
+- **Mutation tests** (`test_chaos_verifier.py`): ledger without NX → I2 fails; commit
+  without its done check → I2b fails; retry without its ownership check → **the verifier
+  can't see it** (ADR-037, below).
+- New tests: 25, taking the suite from 139 to 164.
+  - Crash isolation: 2 subprocess tests.
+  - Reclaim suspects: 3 script tests.
+  - Startup: 2 tests.
+  - Built-in hang handlers: 1 test.
+  - Verifier: 5 mutation tests and 9 rule tests.
+  - Planner: 3 unit tests.
+  - Two existing unit tests were extended (the built-in handler list, and the new key's
+    hash tag).
+- Phase 5's CI command is recorded: `make check-all` (ADR-034).
+
+**Acceptance evidence** (Docker 29.4.3, 10 CPUs / 7.75 GiB, Redis 8.8.3):
+
+```
+$ make check > log 2>&1; echo "make check exit=$?"
+make check exit=0
+  69 files already formatted / All checks passed! / Success: no issues found in 61 source files
+  ===================== 134 passed, 30 deselected in 15.00s ======================
+$ make check-all > log 2>&1; echo "make check-all exit=$?"
+make check-all exit=0
+  ======================== 164 passed in 72.17s (0:01:12) ========================
+```
+
+**N = 100,000, three runs, all PASSED** on code `464635e` (random seeds; raw reports
+`results/local/chaos_report.json`, `chaos_report_run2.json`, `chaos_report_run3.json`).
+The reports say `464635e-dirty`: the only uncommitted files were CLAUDE.md, README.md,
+and docs/DECISIONS.md. `git diff 464635e -- src chaos tests Makefile pyproject.toml
+uv.lock docker` was empty. Reports now list dirty paths themselves. Reproduce with the
+`run.reproduce` command in each report, e.g.
+`uv run python -m chaos.run --jobs 100000 --workers 8 --concurrency 16 --seed 115930751 --rate 2000 --fault-tail 20`.
+
+```
+seed        I1-I5  SUCCEEDED/DEAD  dup results  dup effects  kills pauses net  crash    reclaimed  dup commits  timeouts  pool    max delivery    time
+                                   (log)        (log)                           restarts            suppressed            resets  (non-crashy)
+115930751   PASS   99974 / 26      0            0            7     8      18   36       735        309          384       208     5 (limit 12)    88.6 s
+2145370571  PASS   99974 / 26      0            0            5     5      24   36       849        240          374       187     5               83.9 s
+425084029   PASS   99974 / 26      0            0            6     7      22   36       960        251          375       196     5               82.0 s
+```
+
+Each run: 100,000 accepted jobs.
+- I1: 99,974 SUCCEEDED and 26 DEAD (20 poison and 3 hang_forever after 8 attempts, 3
+  crashy at delivery 13), `late_successes` 0.
+- I2: 97,824 effects logged for the 97,824 jobs with effects, each key exactly once.
+  Effects suppressed: 327 / 261 / 265.
+- I2b: 99,974 results, one per SUCCEEDED job.
+- I3: the DLQ holds exactly those 26.
+- I5: stream, PEL, and delayed set all 0.
+- Worker logs: 0 ERROR lines. Orphaned threads that finished late: 42–45. Consumers
+  pruned under chaos: 23–34.
+- Run 1's summary as printed:
+
+```
+==== chaos run PASSED (seed 115930751, 100000 jobs, 8 workers) ====
+  I1_no_loss ok | I2_no_duplicate_effects ok | I2b_no_duplicate_results ok | I3_dlq_correct ok
+  I4_faults_happened ok | I5_drained ok
+  faults {'kills': 7, 'pauses': 8, 'network_windows': 18, ... 'skipped': 0} | crash restarts {'70': 36}
+  processed 99974 dead 26 reclaimed 735 duplicates_suppressed 309 effects_suppressed 327 timeouts 384 lease_lost 62
+  ... excluding crashy jobs: {2: 603, 3: 87, 4: 8, 5: 1} (max 5, max_deliveries 12)
+```
+
+**Every chaos run of this phase**, including the failures (none was dropped):
+
+```
+run                          code        N      result
+debug 1 (seed 1)             uncommitted 5K     harness error after the run (run_dir path bug); found the startup bug (ADR-038)
+debug 2 (seed 1)             uncommitted 5K     I1-I3,I5 ok; I4 FAIL kills 2 < 3 (32 s fault phase too short)
+debug 3 (seed 2)             uncommitted 30K    I1-I3,I5 ok; I4 FAIL pauses 2 < 3 (36 s)
+pre-commit (seed 236340187)  uncommitted 100K   PASSED
+seed 1280290511              b4f6779     100K   PASSED
+seed 1661764791              b4f6779     100K   FAILED: I3 crashy at delivery 14; I4 pauses 2 < 3
+                                                (raw: results/local/chaos_failures/2026-09-22_seed1661764791_I3_I4.json)
+seed 371414021               b4f6779     100K   PASSED
+3 acceptance runs (above)    464635e     100K   PASSED x3
+```
+
+The seed-1661764791 failure is written up below. The verifier's I3 expectation was wrong
+and the fault plan left I4 to chance; the system was right. Both were fixed with
+tests, I4's minimums were not lowered, and the three acceptance runs are the next ones
+after that fix.
+
+Mutation checks. Scripted, one bug at a time, each file restored and sha256-verified:
+
+```
+reclaim.lua: suspects never held back               -> CAUGHT (crash_isolation)
+worker: always offers a suspect slot                -> CAUGHT (crash_isolation[last])
+worker: reclaimed suspects not tracked              -> CAUGHT (crash_isolation[last])
+reclaim.lua: put-back keeps the bumped count        -> CAUGHT (at_most_the_suspects...)
+reclaim.lua: put-back marks the entry fresh         -> CAUGHT
+reclaim.lua: DLQ-bound entries count as suspects    -> CAUGHT (past_max_deliveries...)
+worker: startup doesn't wait for Redis              -> CAUGHT (test_startup, both)
+hang: async handler never hangs                     -> CAUGHT (built_in_hang_handlers)
+verifier: crashy must be at exactly max+1           -> CAUGHT (rules[14])
+verifier: crashy may be dead-lettered early         -> CAUGHT (rules[12])
+verifier: no crash-count bound                      -> CAUGHT (ran_past_max_deliveries)
+verifier: I1 ignores each kind's expected ending    -> CAUGHT (i1_requires...[DEAD])
+verifier: I1 ignores late successes                 -> CAUGHT
+verifier: I2 counts distinct keys, not log entries  -> CAUGHT (ledger_without_nx_fails_i2)
+verifier: I2b counts distinct ids, not log entries  -> CAUGHT (commit_without_the_done_check)
+verifier: I4 minimums never checked                 -> CAUGHT
+planner: opening not guaranteed (random only)       -> CAUGHT (test_chaos_plan)
+planner: opening rounds 2                           -> CAUGHT
+planner: two faults on one worker at once           -> CAUGHT
+retry.lua: ownership bypassed, vs Phase 2 tests     -> CAUGHT (3 failed)
+```
+
+The three SPEC §7 mutation checks are automated tests. Two of them catch their bug as
+SPEC says:
+- ledger without NX: I2 fails with "slow:… 2 effects";
+- commit without its done check: I2b fails with "(slow, SUCCEEDED): 2 results".
+
+The third, retry.lua without its ownership check, does **not** fail I1, I2, or I2b, and
+can't. The test builds the exact window: A's stale retry lands while B still owns and
+runs the entry. The mutant acts (`retried` = 1, against 0 in the control), but B's commit
+is first-wins, the needless rerun is suppressed, and the ledger stops its effect. See
+ADR-037.
+
+**Decisions worth Mohammed's review**
+- **ADR-037: the retry-ownership mutation check deviates from SPEC §7.** The verifier sees
+  outcomes, and the terminal-state check, the entry's `XDEL`, first-wins commit, and the
+  ledger each absorb a non-owner retry, so no outcome changes. The Phase 2 script and
+  stale-worker tests enforce the check itself (3 fail under the mutant). Options: accept
+  this, or add an append-only transition log so the verifier can count runs per
+  attempt (new hot-path instrumentation, not added unasked).
+- **ADR-035: suspect isolation in `reclaim.lua`.** Claim-and-put-back (`XCLAIM … IDLE
+  RETRYCOUNT JUSTID`), chosen over peek-then-claim.
+- **I3's crashy rule** is "past `max_deliveries`, and never run past it", not "exactly at
+  `max_deliveries + 1`" (ADR-036).
+- The flaky k comes from the seeded RNG at enqueue time, not a hash of the job_id: the
+  ids are created inside `enqueue_many` (ADR-036).
+- Chaos settings (lease 2 s, `max_deliveries` 12, `max_attempts` 8, 16 slots per worker)
+  are the chaos run's, not new library defaults.
+
+**Open issues**
+- **A flaky Phase 3 test, found by this phase's repeat runs:**
+  `test_waiting_for_a_pool_child_does_not_count_toward_the_timeout` failed 1 of 6 passes
+  of the new-test set.
+  - An instrumented copy (scratch only) ran 12 + 12 + 15 times with the probe added. Its
+    two failures each had `reclaimed` 2–3 and `lease_lost` 2–3, with runs
+    `[2, 2, 2]` / `[1, 2, 2]`. The jobs weren't timed out or reset: they were
+    **reclaimed**, because their 0.5 s test lease lapsed.
+  - Not the cause, as far as I can measure: the worker's event loop (worst stall 3 ms in
+    12 runs, one of which reclaimed) and Redis (`latency-monitor-threshold 50`: no events
+    in 15 runs; `aof_delayed_fsync` 0).
+  - Root cause **unknown**. The test itself is unchanged: a longer lease there would hide
+    this, and that's Mohammed's call. Production leases are 30 s.
+- **Occasional slow test-process wall time (unexplained; may matter for Phase 5 CI
+  runtime).** Measured:
+  - In a 6-pass loop of the new-test set, pytest reported 34–37 s per pass, but three
+    passes took **168 s, 169 s, and 125 s** of wall time (the other three: 38, 46, and 52
+    s). In a separate 15-run loop of one test, one iteration took ~44 s instead of ~4 s.
+  - Startup is fast: `uv run python` 0.03 s, importing ftq + redis + pytest 0.13 s.
+  - No orphaned processes were left after any of 6 passes. (Pool children orphaned
+    earlier came from a pytest process I killed mid-run.)
+  - An exit-timing probe was **inconclusive**. It hooked `atexit` and ran 5 iterations;
+    in all 5 the process exited within 0.1 s of the session ending (`atexit` reached
+    after 0.0 s, process wall 80.2–80.4 s = session 80.0–80.2 s). But the probe was
+    broken: its script had no `__main__` guard, so the spawned pool children re-ran
+    `pytest.main`, and every session failed (rc = 1) and took 80 s. So it neither shows
+    nor rules out the slowness, and all its files were deleted.
+  - Where the extra time goes is still unknown: before the session, at exit, or in
+    `uv`. None of these runs showed it in CI-shaped conditions.
+  - **Phase 5:** time `make check-all` on the hosted runner, and if wall time far exceeds
+    pytest's reported time, find the cause before setting job timeouts.
+- 1M-job runs haven't been tried. Redis memory at 1M is estimated from ADR-010, not
+  measured; the chaos Redis caps at 3 GB with noeviction. Phase 5 measures 1M.
+- The retry-ownership check has no verifier-level evidence, by construction (ADR-037).
+- A reaper holding a suspect claims and returns other suspects every pass: a few wasted
+  commands (ADR-035).
+- Carried: results/effects logs never trimmed (ADR-021); the private `_processes` map
+  (ADR-028); batch-100 pipelining noise (ADR-032); the hysteresis flag only moves on an
+  enqueue (ADR-031).
 
 ### Phase 3: Concurrency, backpressure, observability, per-job timeouts (2026-09-22)
 
@@ -652,3 +864,71 @@ pytest exit (redis up)=0
   session and SIGKILLs the whole process group after 90 s, counting that as caught. The
   stray pytest and pool-child processes from the first attempt were found with `pgrep` and
   killed.
+- **2026-09-22 (Phase 4): jobs next to a crashing job were dead-lettered with it (a real
+  bug, found by analysis and confirmed by a test).**
+  - While sizing `max_deliveries` (ADR-008), I asked what happens to the other jobs a
+    crashy job kills. Their entries expire at the same moment as the crashy one. A single
+    `XAUTOCLAIM` batch then claims them all together, they crash the next worker
+    together, and each crash adds a delivery to every one of them. They reach
+    `max_deliveries` in the same step as the crashy job and go to the DLQ with it.
+  - No `max_deliveries` value helps, because the companions' count always equals the
+    crashy job's.
+  - `test_crash_isolation.py` reproduced it before any fix: 4 innocent `send_email` jobs
+    fetched with one crashy job all ended DEAD, whether the crashy job came first or last
+    in the PEL.
+  - Fix (ADR-035): an entry at delivery ≥ 3 is a suspect, and a worker runs one suspect
+    at a time. Suspects it can't take are put back with their delivery count restored.
+    Six mutants of the fix are caught.
+  - Lesson: "size the limit against the faults" first needs a check that every source of
+    redelivery is independent. This one wasn't.
+- **2026-09-22 (Phase 4): a worker restarted inside a network partition crashed (found by
+  the first chaos run).**
+  - Debug run 1 recorded a restart with exit code 1, not the crashy 70. The worker's log
+    held a `ConnectionError` traceback from `XGROUP CREATE`, the first command a worker
+    sends.
+  - The supervisor had restarted worker 7 (after a crashy job killed it) during a 2.1 s
+    partition of that worker's proxy. The fetch loop waits out outages (ADR-022), but
+    startup didn't.
+  - Two tests reproduced it: a worker pointed at a port with nothing listening, with a
+    TCP forwarder to Redis started later. Fix (ADR-038): startup retries like the fetch
+    loop.
+  - This is the kind of bug only a restart-during-fault schedule finds.
+- **2026-09-22 (Phase 4): the verifier expected something the system rightly doesn't do,
+  and the fault plan left I4 to chance.**
+  - A 100K run (seed 1661764791, code b4f6779) failed I3: a crashy job was in the DLQ at
+    delivery 14, and I3 demanded exactly `max_deliveries + 1` = 13. Crash restarts were
+    exactly 36 = 3 × 12, so it never ran at 13. The worker logs showed several `reclaim
+    failed (Error while reading … Connection reset by peer)`: a reclaim that ran in Redis
+    and lost its reply. The entry sat claimed but unseen and was claimed again at 14.
+    That's correct behaviour. The DLQ move of an over-limit entry is a transition a fault
+    can interrupt too.
+  - I3 now checks what safety needs: never dead-lettered with deliveries left, and never
+    *run* past the limit. The second part is new: crash count ≤ crashy jobs × limit.
+  - The same run failed I4 (2 pauses, minimum 3): after the opening round every fault was
+    random, and this plan drew no more pauses. The plan now guarantees 4 of each kind.
+    The minimums weren't touched.
+  - All three acceptance runs are the next three after the fix, and the failed run's
+    report is committed (`results/local/chaos_failures/`).
+  - Lesson: an exact expected count under faults needs to say why no fault can change
+    it. This one couldn't.
+- **2026-09-22 (Phase 4): harness mistakes, each caught before it produced a result.**
+  1. Debug run 1 finished and then crashed while writing its report. `run_dir` was
+     relative, and `Path.relative_to` raised. The verifier result was lost (the worker
+     logs had been saved). Fixed with `.resolve()`.
+  2. A launch line chained `make chaos` after a `ruff check` that failed, so no run
+     started. The wait loop then polled a log file that didn't exist until the 10-minute
+     shell limit. Now every run is launched on its own line and its log is checked right
+     away.
+  3. The first stale-retry test let worker A's own reaper reclaim A's expired entry, so
+     "B's run" was really A's. The control failed, which exposed it. A now has one slot
+     (a busy worker doesn't reap) and no heartbeats, and B heartbeats.
+  4. The supervisor could count a deliberately killed worker as crashed if the kill was
+     healed between its two reads. It now checks the hold before and after reading
+     states.
+  5. That same stale-retry test asserted exact reclaim counts. Under load it failed 2 of
+     5 runs (`reclaimed` 2): the needless retry sometimes lands on A, and B then reclaims
+     it too. It now asserts the mutant's actual signature (`retried` = 1) and the
+     verifier's verdict, which don't depend on timing.
+  6. Reports marked the tree dirty for untracked files (e.g. an `AGENTS.md` that isn't
+     part of the project), and then for doc edits made during the runs. They now say
+     which tracked paths differ, and PROGRESS states the code diff was empty.

@@ -1,0 +1,534 @@
+{
+  "passed": true,
+  "run": {
+    "date_utc": "2026-09-23T04:35:51+00:00",
+    "git": "464635e-dirty",
+    "reproduce": "uv run python -m chaos.run --jobs 100000 --workers 8 --concurrency 16 --seed 2145370571 --rate 2000 --fault-tail 20",
+    "seed": 2145370571,
+    "jobs": 100000,
+    "accepted": 100000,
+    "workers": 8,
+    "mix": {
+      "normal": 94424,
+      "flaky": 3000,
+      "slow": 300,
+      "cpu": 2000,
+      "hang": 100,
+      "hang_thread": 50,
+      "hang_process": 100,
+      "hang_forever": 3,
+      "poison": 20,
+      "crashy": 3
+    },
+    "worker_env": {
+      "FTQ_QUEUE": "chaos",
+      "FTQ_BLOCK_MS": "500",
+      "FTQ_SOCKET_TIMEOUT": "2",
+      "FTQ_SOCKET_CONNECT_TIMEOUT": "1",
+      "FTQ_VISIBILITY_TIMEOUT": "2.0",
+      "FTQ_HEARTBEAT_INTERVAL": "0.5",
+      "FTQ_REAP_INTERVAL": "0.5",
+      "FTQ_MAX_ATTEMPTS": "8",
+      "FTQ_MAX_DELIVERIES": "12",
+      "FTQ_JOB_BACKOFF_BASE": "0.1",
+      "FTQ_JOB_BACKOFF_CAP": "2",
+      "FTQ_JOB_TIMEOUT": "10",
+      "FTQ_SHUTDOWN_GRACE": "10",
+      "FTQ_DONE_TTL_SECONDS": "0",
+      "FTQ_CONSUMER_PRUNE_IDLE": "10",
+      "FTQ_CONSUMER_PRUNE_INTERVAL": "5",
+      "FTQ_LOG_LEVEL": "INFO",
+      "FTQ_LOG_FORMAT": "json",
+      "FTQ_CONCURRENCY": "16",
+      "FTQ_REDIS_URL": "redis://toxiproxy:2000<i>/0"
+    },
+    "docker": {
+      "cpus": "10",
+      "mem_bytes": "8321712128"
+    },
+    "seconds": {
+      "fault_phase": 71.6,
+      "drain": 6.0,
+      "total": 83.9
+    },
+    "drained_before_timeout": true
+  },
+  "verifier": {
+    "passed": true,
+    "invariants": {
+      "I1_no_loss": {
+        "ok": true,
+        "jobs": 100000,
+        "states": {
+          "SUCCEEDED": 99974,
+          "DEAD": 26
+        },
+        "violations": []
+      },
+      "I2_no_duplicate_effects": {
+        "ok": true,
+        "effects_logged": 97824,
+        "distinct_keys": 97824,
+        "duplicated_keys": 0,
+        "violations": []
+      },
+      "I2b_no_duplicate_results": {
+        "ok": true,
+        "results_logged": 99974,
+        "duplicated_job_ids": 0,
+        "violations": []
+      },
+      "I3_dlq_correct": {
+        "ok": true,
+        "dlq_entries": 26,
+        "reasons": {
+          "max_attempts": 23,
+          "max_deliveries": 3
+        },
+        "crashy_dlq_deliveries": [
+          13,
+          13,
+          13
+        ],
+        "violations": []
+      },
+      "I4_faults_happened": {
+        "ok": true,
+        "observed": {
+          "kills": 5,
+          "pauses": 5,
+          "network_windows": 24,
+          "skipped": 1,
+          "pool_resets": 187,
+          "crash_restarts": 36,
+          "reclaimed": 849,
+          "duplicates_suppressed": 240,
+          "timeouts": 374
+        },
+        "minimums": {
+          "kills": 3,
+          "pauses": 3,
+          "network_windows": 6,
+          "reclaimed": 1,
+          "duplicates_suppressed": 1,
+          "timeouts": 1,
+          "pool_resets": 1,
+          "crash_restarts": 1
+        },
+        "violations": []
+      },
+      "I5_drained": {
+        "ok": true,
+        "stream": 0,
+        "pel": 0,
+        "delayed": 0,
+        "violations": []
+      }
+    },
+    "counters": {
+      "processed": 99974,
+      "duplicates_suppressed": 240,
+      "effects_applied": 97824,
+      "effects_suppressed": 261,
+      "retried": 6512,
+      "scheduled": 6512,
+      "dead": 26,
+      "late_successes": 0,
+      "requeued": 0,
+      "reclaimed": 849,
+      "heartbeats": 2555,
+      "lease_lost": 61,
+      "consumers_pruned": 39,
+      "timeouts": 374,
+      "rejected": 0,
+      "blocked": 0
+    },
+    "reclaims_by_delivery": {
+      "2": 694,
+      "3": 96,
+      "4": 30,
+      "5": 5,
+      "6": 3,
+      "7": 3,
+      "8": 3,
+      "9": 3,
+      "10": 3,
+      "11": 3,
+      "12": 3,
+      "13": 3
+    },
+    "reclaims_by_delivery_excluding_crashy": {
+      "2": 691,
+      "3": 93,
+      "4": 27,
+      "5": 2
+    },
+    "max_delivery_excluding_crashy": 5
+  },
+  "faults": {
+    "planned": 35,
+    "executed": {
+      "kills": 5,
+      "pauses": 5,
+      "network_windows": 24,
+      "by_kind.kill": 5,
+      "by_kind.pause": 5,
+      "by_kind.reset_peer": 4,
+      "by_kind.timeout": 7,
+      "by_kind.latency": 6,
+      "by_kind.partition": 7,
+      "skipped": 1
+    },
+    "crash_restarts_by_exit_code": {
+      "70": 36
+    },
+    "timeline": [
+      {
+        "at": 2.0,
+        "kind": "timeout",
+        "worker": 2,
+        "duration": 2.419,
+        "latency_ms": 0,
+        "started": 2.001,
+        "healed": 4.433
+      },
+      {
+        "at": 5.465,
+        "kind": "timeout",
+        "worker": 1,
+        "duration": 1.022,
+        "latency_ms": 0,
+        "started": 5.466,
+        "healed": 6.494
+      },
+      {
+        "at": 3.151,
+        "kind": "reset_peer",
+        "worker": 6,
+        "duration": 3.759,
+        "latency_ms": 0,
+        "started": 3.155,
+        "healed": 6.927
+      },
+      {
+        "at": 7.969,
+        "kind": "pause",
+        "worker": 7,
+        "duration": 3.24,
+        "latency_ms": 0,
+        "started": 7.97,
+        "healed": 11.295
+      },
+      {
+        "at": 9.993,
+        "kind": "partition",
+        "worker": 8,
+        "duration": 1.621,
+        "latency_ms": 0,
+        "started": 9.993,
+        "healed": 11.621
+      },
+      {
+        "at": 11.065,
+        "kind": "reset_peer",
+        "worker": 6,
+        "duration": 3.553,
+        "latency_ms": 0,
+        "started": 11.066,
+        "healed": 14.625
+      },
+      {
+        "at": 12.968,
+        "kind": "latency",
+        "worker": 4,
+        "duration": 4.071,
+        "latency_ms": 103,
+        "started": 12.969,
+        "healed": 17.05
+      },
+      {
+        "at": 17.469,
+        "kind": "latency",
+        "worker": 6,
+        "duration": 3.003,
+        "latency_ms": 86,
+        "started": 17.47,
+        "healed": 20.48
+      },
+      {
+        "at": 18.97,
+        "kind": "reset_peer",
+        "worker": 7,
+        "duration": 3.253,
+        "latency_ms": 0,
+        "started": 18.971,
+        "healed": 22.231
+      },
+      {
+        "at": 20.113,
+        "kind": "partition",
+        "worker": 1,
+        "duration": 3.96,
+        "latency_ms": 0,
+        "started": 20.113,
+        "healed": 24.109
+      },
+      {
+        "at": 22.575,
+        "kind": "pause",
+        "worker": 8,
+        "duration": 3.533,
+        "latency_ms": 0,
+        "started": 22.576,
+        "healed": 26.203
+      },
+      {
+        "at": 23.912,
+        "kind": "partition",
+        "worker": 6,
+        "duration": 3.625,
+        "latency_ms": 0,
+        "started": 23.912,
+        "healed": 27.548
+      },
+      {
+        "at": 24.938,
+        "kind": "kill",
+        "worker": 2,
+        "duration": 2.504,
+        "latency_ms": 0,
+        "started": 24.939,
+        "healed": 27.691
+      },
+      {
+        "at": 27.389,
+        "kind": "timeout",
+        "worker": 4,
+        "duration": 2.542,
+        "latency_ms": 0,
+        "started": 27.39,
+        "healed": 29.94
+      },
+      {
+        "at": 29.422,
+        "kind": "reset_peer",
+        "worker": 5,
+        "duration": 1.15,
+        "latency_ms": 0,
+        "started": 29.422,
+        "healed": 30.587
+      },
+      {
+        "at": 30.73,
+        "kind": "kill",
+        "worker": 8,
+        "duration": 0.681,
+        "latency_ms": 0,
+        "started": 30.731,
+        "healed": 31.612
+      },
+      {
+        "at": 33.541,
+        "kind": "pause",
+        "worker": 7,
+        "duration": 3.61,
+        "latency_ms": 0,
+        "started": 33.542,
+        "healed": 37.242
+      },
+      {
+        "at": 35.303,
+        "kind": "latency",
+        "worker": 5,
+        "duration": 2.691,
+        "latency_ms": 193,
+        "started": 35.304,
+        "healed": 38.005
+      },
+      {
+        "at": 37.849,
+        "kind": "latency",
+        "worker": 6,
+        "duration": 3.848,
+        "latency_ms": 246,
+        "started": 37.85,
+        "healed": 41.717
+      },
+      {
+        "at": 39.553,
+        "kind": "timeout",
+        "worker": 4,
+        "duration": 2.299,
+        "latency_ms": 0,
+        "started": 39.555,
+        "healed": 41.863
+      },
+      {
+        "at": 40.786,
+        "kind": "kill",
+        "worker": 8,
+        "duration": 1.286,
+        "latency_ms": 0,
+        "started": 40.787,
+        "healed": 42.303
+      },
+      {
+        "at": 43.496,
+        "kind": "kill",
+        "worker": 3,
+        "duration": 0.936,
+        "latency_ms": 0,
+        "started": 43.497,
+        "healed": 44.827
+      },
+      {
+        "at": 45.8,
+        "kind": "partition",
+        "worker": 2,
+        "duration": 1.954,
+        "latency_ms": 0,
+        "started": 45.801,
+        "healed": 47.765
+      },
+      {
+        "at": 46.816,
+        "kind": "timeout",
+        "worker": 3,
+        "duration": 3.977,
+        "latency_ms": 0,
+        "started": 46.816,
+        "healed": 50.802
+      },
+      {
+        "at": 49.249,
+        "kind": "kill",
+        "worker": 8,
+        "duration": 1.35,
+        "latency_ms": 0,
+        "started": 49.25,
+        "healed": 50.85
+      },
+      {
+        "at": 51.111,
+        "kind": "pause",
+        "worker": 6,
+        "duration": 3.223,
+        "latency_ms": 0,
+        "started": 51.112,
+        "healed": 54.477
+      },
+      {
+        "at": 54.088,
+        "kind": "partition",
+        "worker": 4,
+        "duration": 2.503,
+        "latency_ms": 0,
+        "started": 54.089,
+        "healed": 56.599
+      },
+      {
+        "at": 55.107,
+        "kind": "partition",
+        "worker": 8,
+        "duration": 3.224,
+        "latency_ms": 0,
+        "started": 55.108,
+        "healed": 58.341
+      },
+      {
+        "at": 57.513,
+        "kind": "timeout",
+        "worker": 3,
+        "duration": 1.572,
+        "latency_ms": 0,
+        "started": 57.514,
+        "healed": 59.107
+      },
+      {
+        "at": 59.23,
+        "kind": "partition",
+        "worker": 4,
+        "duration": 1.799,
+        "latency_ms": 0,
+        "started": 59.231,
+        "healed": 61.042
+      },
+      {
+        "at": 62.143,
+        "kind": "latency",
+        "worker": 5,
+        "duration": 4.419,
+        "latency_ms": 89,
+        "started": 62.144,
+        "healed": 66.57
+      },
+      {
+        "at": 63.224,
+        "kind": "timeout",
+        "worker": 7,
+        "duration": 3.627,
+        "latency_ms": 0,
+        "started": 63.225,
+        "healed": 66.863
+      },
+      {
+        "at": 65.622,
+        "kind": "latency",
+        "worker": 1,
+        "duration": 4.301,
+        "latency_ms": 182,
+        "started": 65.623,
+        "healed": 69.941
+      },
+      {
+        "at": 67.721,
+        "kind": "pause",
+        "worker": 4,
+        "duration": 3.737,
+        "latency_ms": 0,
+        "started": 67.722,
+        "healed": 71.551
+      }
+    ],
+    "skipped": [
+      {
+        "at": 14.704,
+        "kind": "pause",
+        "worker": 5,
+        "duration": 3.156,
+        "latency_ms": 0,
+        "reason": "docker pause ftq-chaos-worker-5 exited 1: Error response from daemon: container 017ca4f3ef91a652b23f096e45173df582dc634acb6c6c0077ceddd7434beb5e is not running"
+      }
+    ]
+  },
+  "worker_logs": {
+    "by_level": {
+      "INFO": 411,
+      "WARNING": 715
+    },
+    "by_message": {
+      ": started (": 49,
+      "exceeded its": 415,
+      "process pool reset": 187,
+      "job -> DLQ": 26,
+      "pruned": 29,
+      "orphaned thread run finished": 45,
+      "lost the lease": 24
+    },
+    "pool_resets": 187,
+    "error_samples": []
+  },
+  "cpu_percent_mean": {
+    "ftq-chaos-redis": 13.8,
+    "ftq-chaos-toxiproxy": 18.1,
+    "ftq-chaos-worker-1": 33.7,
+    "ftq-chaos-worker-2": 45.4,
+    "ftq-chaos-worker-3": 65.1,
+    "ftq-chaos-worker-4": 59.7,
+    "ftq-chaos-worker-5": 40.6,
+    "ftq-chaos-worker-6": 33.8,
+    "ftq-chaos-worker-7": 41.9,
+    "ftq-chaos-worker-8": 12.9
+  },
+  "run_dir": "chaos/runs/20260923T043425Z"
+}

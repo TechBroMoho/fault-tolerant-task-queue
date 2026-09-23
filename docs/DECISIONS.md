@@ -169,9 +169,9 @@ lease. It isn't a loss, but it's one more source of redelivery for ADR-008's siz
 
 ## ADR-007: Slow non-heartbeating jobs must stay between 1× and about 2× the lease
 
-*Status: partly implemented (Phase 2: the `slow` handler, registered with
-`heartbeat=False`; a test shows it is reclaimed mid-run and its effect still happens once).
-The duration distribution lands with the Phase 4 chaos mix.*
+*Status: accepted (Phase 2: the `slow` handler, registered with `heartbeat=False`; a test
+shows it is reclaimed mid-run and its effect still happens once. Phase 4: the chaos mix
+draws each slow job's duration from U(1.2, 1.8) × the lease, `chaos/mix.py`).*
 
 **Context.** The chaos mix includes slow jobs that don't heartbeat, so their lease is guaranteed
 to expire (SPEC §7, Phase 4). Every reclaim by `XAUTOCLAIM` increments the delivery count. A job
@@ -191,7 +191,8 @@ invariant I4) without risking false DEADs.
 
 ## ADR-008: Size `max_deliveries` for *all* sources of redelivery, including crashy jobs
 
-*Status: planned (Phase 4 sizing, with an estimated false-DEAD probability).*
+*Status: accepted (Phase 4: sized below for the chaos settings, with an estimate and the
+observed delivery counts. ADR-035 removed the crash-chain source first).*
 
 **Context.** A crashy job kills its whole worker process. Every *other* job that worker had
 prefetched also gets redelivered, and its delivery count goes up even though it did nothing
@@ -209,6 +210,54 @@ worker is bounded.
 
 **Consequences.** If the verifier ever reports a normal job as DEAD, first check this analysis
 against the fault counts before calling it a bug. Never "fix" it by weakening I1 or I4.
+
+*Phase 4: the sizing.* Doing this analysis turned up a source of redelivery that no
+`max_deliveries` value can absorb. A crashy job's companions were reclaimed in the same
+batch, crashed along with it every time, and reached its delivery count exactly. ADR-035
+fixes that first: companions end with at most delivery 3 from a crash chain. What's left
+is independent faults.
+
+Chaos settings (`chaos/run.py`, not the library defaults): lease `L` = 2 s,
+`max_deliveries` = **12**, `max_attempts` = **8**, `suspect_deliveries` = 3.
+
+- **Model.** An entry gains a delivery each time the worker running it loses it before
+  committing: killed, paused past the lease, partitioned or black-holed long enough, or
+  crashed by a crashy job beside it. Call the rate of such loss events per worker `λ`. A
+  run lasting `d` seconds is hit with probability `p ≈ 1 − e^(−λd)`. After a hit, a
+  healthy worker reclaims the entry, so successive hits are roughly independent, and
+  `P(an entry reaches delivery n) ≈ p^(n − n0)`. `n0` is the deliveries the job gets
+  anyway: 1 for most jobs, 2 for slow jobs (ADR-007).
+- **λ for a 100K run** (~70 s of faults, 8 workers): the plan has ~34 faults, ~28 of which
+  lose in-flight work (latency doesn't). Crash restarts = crashy jobs × `max_deliveries` =
+  3 × 12 = 36. `λ ≈ (28 + 36) / (70 × 8) ≈ 0.11 /s`. The mix scales every kind with N and
+  the producer's rate is fixed, so λ stays about the same at 1M.
+- **Slow jobs** are the risk: `d ≤ 1.8 L = 3.6 s`, so `p ≈ 0.33`. A false DEAD needs
+  delivery 13: `p^11 ≈ 5 × 10⁻⁶` per slow job. Over 300 slow jobs that's **≈ 1.5 × 10⁻³
+  per 100K run** (≈ 1.5 × 10⁻² at 1M with 3,000 slow jobs).
+- **Everything else** runs for ~0.05 s (≤ 0.3 s under a latency toxic): `p ≤ 0.03`, and
+  `p^11 < 10⁻¹⁶`. Retries don't add up: each attempt is a fresh entry whose count starts
+  at 1 (ADR-026).
+- **max_attempts = 8.** Flaky jobs need at most 4 runs (k ≤ 3), and hang jobs at most 3. The
+  extra attempts absorb failures that faults cause. For example, a ledger call that fails
+  during a partition makes the handler raise. That takes a network fault on the job's own
+  worker during its short run, and four of those for one job is negligible.
+- **Cost.** A higher `max_deliveries` means more crashes per crashy job (each one kills
+  `max_deliveries` workers). 12 keeps that at 36 crashes per 100K run.
+
+**Observed.** How far the delivery count of every non-crashy job climbed, in each 100K run
+(the report's `reclaims_by_delivery_excluding_crashy`):
+
+| Run (seed) | Code | Highest delivery reached | Reclaims at 2 / 3 / 4 / 5+ |
+|---|---|---|---|
+| 115930751 | 464635e | 5 | 603 / 87 / 8 / 1 |
+| 2145370571 | 464635e | 5 | 691 / 93 / 27 / 2 |
+| 425084029 | 464635e | 5 | 802 / 96 / 24 / 2 |
+| 4 earlier runs | b4f6779 and before | 5, 6, 6, 7 | |
+
+Nothing came within 5 deliveries of the limit, so 12 holds with a wide margin. The one
+count past 12 in any run was a crashy job's lost reclaim (ADR-036, I3). The library
+defaults (10 and 5) are unchanged. Production has no deliberate crash loops, and its
+lease is 30 s.
 
 ---
 
@@ -277,7 +326,7 @@ starts (`Settings.check_ttl_covers`), and the worker refuses to start if it isn'
 
 ## ADR-011: Per-worker Toxiproxy topology is deferred to Phase 4
 
-*Status: planned (Phase 4).*
+*Status: accepted (Phase 4: `chaos/topology.py` generates the project; ADR-036).*
 
 **Context.** The chaos design needs one proxy per worker (`worker_i → proxy_i → redis`), so a
 network fault can hit a single worker. `docker compose --scale worker=N` replicas can't each be
@@ -617,6 +666,9 @@ other worker must notice and take them over without violating the in-flight cap.
   spare capacity reap instead.
 - `XAUTOCLAIM`'s third reply element (pending ids whose stream entry is gone) is logged at
   ERROR. Our exits always ack before deleting, so it should never happen.
+- *Phase 4:* a claimed entry that has been redelivered before (delivery ≥ 3) is a
+  *suspect*. A worker runs at most one suspect at a time, and puts back any others it
+  claimed (ADR-035).
 
 **Consequences.**
 - Recovery latency after a crash is at most `visibility_timeout + reap_interval +
@@ -1154,3 +1206,258 @@ exactly-once logic stay in the fast set, except the subprocess-based multi-worke
 **Consequences.** A green `make check` alone is not the phase gate; the gate is
 `check-all`. The slow set is where the real-process evidence lives (SIGTERM, crash loops,
 process pools, multi-process exactly-once).
+
+*Phase 4: confirmed by Mohammed. Phase 5 CI will call `make check-all`.* The new Phase 4
+tests over ~1 s are `slow` too: crash isolation (real crashing processes), startup
+against an unreachable Redis, the built-in hang handlers, and the verifier's mutation
+checks (two in-process workers, ~1.7 s each). The fast set is 134 tests in ~15 s; the
+full suite is 164 tests in ~72 s.
+
+---
+
+## ADR-035: Suspect redeliveries: each worker runs at most one at a time
+
+*Status: accepted (Phase 4: `reclaim.lua`, `Reaper.reclaim(count, suspect_slots)`,
+`Worker._reap`, `Settings.suspect_deliveries`; `test_crash_isolation.py`).*
+
+**Context.** A crashy job kills its worker, and every other job that worker was running
+dies with it. Those entries all expire at the same moment, so the next reaper's
+`XAUTOCLAIM` claimed them together (up to its free slots). They landed on one worker,
+the crashy job killed that worker too, and so on. Each crash added a delivery to every
+one of them, so the innocent companions reached `max_deliveries` in the same step as the
+crashy job and were dead-lettered with it. That's a false DEAD (chaos I1). A larger
+`max_deliveries` doesn't help, because the companions' count always equals the crashy
+job's. This came out of the ADR-008 analysis before the first chaos run.
+`test_crash_isolation.py` confirmed it on the old code: 4 innocent `send_email` jobs
+fetched together with one crashy job all ended **DEAD**, in both orderings (crashy first
+or last in the PEL).
+
+**Options.**
+1. **Raise `max_deliveries`.** Doesn't work: the companions die at any value.
+2. **Every reclaimed entry is a suspect; one at a time per worker.** This breaks the
+   lockstep, but ordinary crash recovery becomes one entry per worker per pass, and a
+   reclaimed non-heartbeating slow job holds that single slot for seconds.
+3. **Peek, then claim** (`XPENDING … IDLE`, then `XCLAIM` only what fits). The semantics
+   are clean. But `XPENDING IDLE` scans the PEL until it finds enough idle entries (the
+   whole PEL when few are idle), whereas `XAUTOCLAIM` caps each call at COUNT × 10
+   entries. It would also replace the scan behaviour the reaper's cursor is built around.
+4. **An entry is a suspect from its 3rd delivery on; one suspect per worker; claim with
+   XAUTOCLAIM and put back any suspect there's no room for.** Chosen.
+
+**Decision.** (4). An entry whose delivery count after this claim is at least
+`suspect_deliveries` (default 3) and at most `max_deliveries` is a suspect. (Past
+`max_deliveries` it goes to the DLQ without running, so it can't crash anything, and it
+is always taken.) The worker passes `suspect_slots` = 1 if it runs no suspect, else 0.
+`reclaim.lua` keeps the suspects it has room for and puts each other one back exactly as
+it was: `XCLAIM … IDLE <lease> RETRYCOUNT <count − 1> JUSTID`. That restores the delivery
+count, and the entry stays expired, so the next worker with a free suspect slot takes
+it. The script is atomic, so nobody can observe the claim-and-return. (Checked on Redis
+8.8.3 first: those options set the idle time and the count exactly, and `JUSTID` adds no
+increment.)
+
+First reclaims (delivery 2) still go out in batches, so ordinary crash recovery and
+slow-job reclaims are unchanged. The first shared crash puts the companions at delivery
+2. If they crash together again, they're at 3: suspects, split across workers, never
+again next to the crashy job. So a crash chain costs a companion at most one extra
+delivery beyond the batch reclaim.
+
+**Consequences.**
+- At most W suspects run at once across W workers. A suspect waits for a free suspect
+  slot, and its delivery count doesn't grow while it waits.
+- A busy worker's reaper still claims and returns suspects it can't take: a few extra
+  commands per pass, invisible from outside.
+- After a put-back the entry is owned by the reaper that returned it. The previous owner
+  was already stale, so its transitions get `LEASE_LOST` either way, and its commit is
+  still first-wins.
+- `reclaim.lua` also counts each claim by its delivery count (`ftq:{q}:reclaims`). The
+  chaos report subtracts the crashy jobs' exact contribution to show how close every
+  other job came to `max_deliveries` (ADR-008).
+- Tests: the subprocess test above, now passing (companions SUCCEEDED, each email sent
+  once, the crashy job DEAD at delivery 4 after 3 crashes), and three script tests (one
+  suspect per slot and the other put back unchanged and still expired; no slot still
+  takes non-suspects; DLQ-bound entries are never held back). Six mutants of this logic
+  are caught (PROGRESS.md, Phase 4).
+
+---
+
+## ADR-036: The chaos harness
+
+*Status: accepted (Phase 4: `chaos/`, `make chaos`).*
+
+**Topology** (resolves ADR-011). `chaos/topology.py` writes a Compose project as JSON
+(Compose reads JSON as YAML): `redis:8.8.3` (noeviction, AOF everysec, 3 GB cap, host
+port 6390), `ghcr.io/shopify/toxiproxy:2.12.0` (the latest release, seeded with the run's
+seed), and `worker-1..W`, each with `FTQ_REDIS_URL=redis://toxiproxy:2000<i>`. The
+orchestrator creates the proxies through the API before it starts the workers. The
+producer and the verifier connect to Redis directly (SPEC §7), so an enqueue reply can't
+be lost and "accepted" is unambiguous.
+
+**Faults** (`chaos/faults.py`). The plan is generated from the seed before the run.
+- Kinds: kill (SIGKILL, down 0.5–3 s, then `docker start`); pause (1.5–3 leases, the GC
+  "zombie"); Toxiproxy `reset_peer`, `timeout` and `latency` (50–250 ms ± 50) on that
+  worker's proxy; and partition (proxy disabled, 1–4 s).
+- `timeout` is set on the downstream side only: commands reach Redis and run, but their
+  replies are dropped. That is the "lost reply" case every script must survive (ADR-006).
+- The first 24 faults cover each kind 4 times, in shuffled order, and a short run's
+  plan is stretched to fit them. After that kinds are weighted: kill 2, pause 2,
+  reset_peer / timeout / partition 1.5, latency 1. One fault starts every U(1, 3) s.
+  (The first version covered each kind twice, then drew at random. A 100K run then drew
+  no more pauses, got only 2, and failed I4. The fix was to the plan, not to I4.) A worker has at most one fault at a time, plus a 2 s settle
+  after it heals, and at most half the workers are faulted at once.
+- The injector records what actually happened. A planned fault that can't happen (you
+  can't kill a worker a crashy job has just killed) is recorded as skipped, and I4 counts
+  only executed faults.
+
+**Supervisor.** Workers have no restart policy; the orchestrator restarts any worker that
+exited, as ECS would, and counts restarts by exit code (70 = crashy). A deliberately
+killed worker is left down until the injector restarts it. The hold is checked both
+before and after reading container states, because the first debug run caught the
+supervisor double-counting a restart.
+
+**Job mix** (`chaos/mix.py`, per 100K jobs):
+- 94.4 % `send_email` with 0–20 ms latency;
+- 3 % flaky (fails k ∈ 1..3 times, k from the seeded RNG at enqueue time, a deviation
+  from "a hash of the job_id", which is only created inside enqueue);
+- 0.3 % slow (1.2–1.8 leases, no heartbeat);
+- 2 % `cpu_task`, the process-pool bystanders;
+- hang jobs: 0.1 % async `hang`, 0.05 % `hang_thread`, and 0.1 % `hang_process`. Each
+  hangs on its first 1–2 attempts past `HANG_TIMEOUT` = 2 s, so under chaos a timeout
+  cancels an async run, orphans a thread, or resets a process pool with bystanders
+  restarted (Mohammed's Phase 4 requirement);
+- 3 `hang_forever` (always hangs, so DEAD after 8 timeouts), 20 poison, and 3 crashy.
+
+Each kind has a fixed expected ending that the verifier checks.
+
+**Producer.** It enqueues in batches of 100 at `--rate` (2,000 jobs/s), in block mode. A
+job is accepted once its `enqueue_many` returned its id. The fault phase lasts the
+enqueue time plus a 20 s tail, so faults hit jobs from the first to the last.
+
+**End of the run.**
+1. Heal everything: reset Toxiproxy, unpause every worker.
+2. Wait until the stream, PEL, and delayed set are all empty on three polls a second
+   apart (drain timeout 600 s).
+3. Stop the supervisor, then SIGTERM the workers (a graceful drain). Any redundant copy
+   still running finishes or is abandoned to the PEL, where I5 would see it.
+4. Save each worker's logs, verify, write the report, and tear down.
+
+**Verifier** (`chaos/verifier.py`), with a few rules beyond SPEC's wording:
+- I1 also fails on any `late_successes`: a job that was DEAD even briefly.
+- I2 and I2b fail on effects or results that belong to no accepted job.
+- I3 requires the DLQ to hold nothing but the expected dead jobs, each with the right
+  reason and counts: poison and hang_forever after `max_attempts` (hang_forever's error
+  a `HandlerTimeout`), and crashy only once past `max_deliveries`.
+  - At first I3 demanded crashy at *exactly* `max_deliveries + 1`. A 100K run found one
+    at 14 with a limit of 12, and that was correct behaviour. A reclaim that runs in Redis
+    but whose reply is lost (the worker logged "reclaim failed … Connection reset by
+    peer"), or a worker killed or paused between claiming the entry and moving it, leaves
+    the entry to be claimed again one delivery later. The DLQ move is itself a
+    transition a fault can interrupt.
+  - So the rule is now what safety needs: never dead-lettered with deliveries left, and
+    never *run* past `max_deliveries`. The second part is a new check: total crashy exits
+    (code 70) ≤ crashy jobs × `max_deliveries`. Both rules are tested on hand-built Redis
+    state, and mutants of each are caught.
+- I4 minimums: kills ≥ 3, pauses ≥ 3, network windows ≥ 6, reclaims ≥ 1, suppressed
+  duplicates ≥ 1, timeouts ≥ 1, pool resets ≥ 1 (counted from the workers' INFO lines),
+  and crash restarts ≥ 1. The first two debug runs failed I4 (kills 2, then pauses 2),
+  because their fault phases (32 s and 36 s) were too short. The 100K run's is ~70 s. The
+  minimums were not lowered.
+
+**Worker count: 8.** Docker Desktop has 10 CPUs and 7.75 GiB (`docker info`). A saturated
+worker is one busy Python process, about 1 CPU, so 8 workers plus Redis plus Toxiproxy
+fit in 10 CPUs even at saturation. That matters: a starved worker would miss heartbeats
+and lose leases for reasons that aren't scheduled faults. Measured at 2,000 jobs/s
+(`docker stats`, mean of samples, in each report): the whole stack used 3.1–4.3 CPUs,
+the busiest worker 0.65–1.0, Redis 0.1–0.2, and Toxiproxy 0.15–0.3. 12 workers would oversubscribe the machine at saturation
+for no gain in fault coverage.
+
+**Chaos worker settings.**
+- Lease 2 s, heartbeat 0.5 s, reap every 0.5 s.
+- `block_ms` 500, socket timeout 2 s, connect timeout 1 s.
+- `max_attempts` 8, `max_deliveries` 12 (ADR-008).
+- Backoff 0.1–2 s, job timeout 10 s.
+- Consumer pruning after 10 s idle, which exercises ADR-029 under chaos.
+- No TTLs (ADR-010), log level INFO.
+
+**Reproducibility.** `--seed` (printed first and recorded in the report) reproduces the
+job mix and the fault plan. The interleaving depends on timing, so counts like reclaims
+differ between runs with the same seed. The report records the git revision (with
+`-dirty(<paths>)` if tracked files differ from HEAD), Docker's CPUs and memory, the exact reproduce
+command, every executed and skipped fault, restarts by exit code, log-line counts
+(including ERROR samples), and per-container CPU. Worker logs and the accepted-job list
+go to `chaos/runs/<time>/` (gitignored).
+
+---
+
+## ADR-037: Verifier mutation checks, and why the retry-ownership mutant can't fail them
+
+*Status: accepted (Phase 4: `tests/integration/test_chaos_verifier.py`). The retry-ownership
+point is **for Mohammed's review**: it deviates from SPEC §7's wording.*
+
+**Context.** SPEC §7 wants mutation checks proving the verifier catches bugs:
+- ledger without NX → I2 fails;
+- commit without its done check → I2b fails;
+- retry.lua without its ownership check, under the stale-worker scenario → I1 (or
+  I2/I2b) fails.
+
+**Decision.** Each check plants its bug by rewriting the script source before the
+workers load it, and the rewrite must match exactly once. It then runs a scenario with
+real duplicate deliveries and calls the real verifier:
+- Two in-process workers, a 0.5 s lease, 20 normal jobs, 3 slow jobs (1 s, no heartbeat),
+  and 1 poison job. A control run passes every invariant and shows the duplicates
+  happened (reclaimed ≥ 3, duplicates_suppressed ≥ 3, effects_suppressed ≥ 3).
+- **Ledger without NX: I2 fails** ("slow:… 2 effects"); I2b still passes.
+- **Commit without its done check: I2b fails** ("(slow, SUCCEEDED): 2 results"); I2
+  still passes.
+- **retry.lua without its ownership check: the verifier *cannot* fail.** The test
+  builds the exact window. A (one slot, no heartbeat) stalls past its lease. B
+  (heartbeating) reclaims the job, and A's failure arrives while B still owns and runs
+  the entry. The control shows A refused (`retried` 0, `lease_lost` 1). Under the
+  mutant, A's retry really is scheduled (`retried` 1) and B's entry deleted, yet I1, I2,
+  I2b, I3, and I5 all pass. The test asserts exactly that, so it breaks if the facts
+  change.
+
+**Why the retry mutant is invisible to outcomes.** A non-owner's retry runs at one of
+three moments:
+1. **After the owner committed.** retry.lua's terminal-state check returns `TERMINAL`.
+2. **After the owner's own retry or DLQ move.** The entry is gone (every transition
+   `XDEL`s), so the script stops at `ENTRY_MISSING` before writing anything.
+3. **While the owner still runs it** (the tested window). The retry is scheduled, but
+   the owner's commit is first-wins. The extra run is then a suppressed duplicate, or
+   `TERMINAL` if it fails, and its effect is stopped by the ledger.
+
+So the ownership check's own guarantee, "a stale worker changes nothing", has no outcome
+the verifier can see. Its only trace is a wasted run. The check is still worth having:
+it keeps a stale worker from making work and from stealing a lease back. Other tests
+enforce it:
+- the Phase 2 script and stale-worker tests (3 fail under this mutant, re-run in Phase 4);
+- the new control test above.
+
+**What Mohammed should decide.** Accept this as the SPEC §7 mutation check for retry
+ownership (the verifier by design sees outcomes, and the defence in depth makes this bug
+outcome-free). Or ask for more: an append-only log of every transition, which would
+let the verifier count runs per attempt. That would be a new piece of instrumentation in
+the hot path, so this ADR doesn't add it unasked.
+
+---
+
+## ADR-038: A worker waits for Redis at startup
+
+*Status: accepted (Phase 4: `Worker._connect`; `tests/integration/test_startup.py`).*
+
+**Context.** The first chaos debug run: a crashy job killed worker 7 during a 2.1 s
+partition of that worker's proxy. The supervisor restarted it inside the partition, and
+the new process died in its first command (`XGROUP CREATE`) with exit code 1. The
+supervisor restarted it again. ADR-022 already makes the fetch loop wait out an outage,
+but startup didn't.
+
+**Decision.** `Worker.run()` first retries `ensure_group` on connection errors and
+timeouts, pausing 1 s between tries (like a failed fetch), until it succeeds or a stop is
+requested. A stop before Redis was ever reachable returns cleanly. The "started" line is
+logged only once connected.
+
+**Consequences.** A worker that boots during an outage waits instead of crash-looping.
+Under an orchestrator (ECS, the chaos supervisor) that's one long-lived process instead
+of a restart storm. Tested both ways: a worker pointed at a port with no listener keeps
+waiting, and completes a job once a TCP forwarder to Redis starts on that port; and a
+stop request before any connection returns without an error. Both tests fail on the old
+code.

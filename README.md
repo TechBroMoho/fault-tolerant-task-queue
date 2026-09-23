@@ -5,10 +5,10 @@ effectively-once side effects via idempotency keys, leases with heartbeats, retr
 a dead-letter queue, backpressure, and a chaos-testing harness that kills workers and cuts
 connections mid-job, then verifies no job was lost or duplicated.
 
-> **Status:** early development (Phase 3: multiple workers, backpressure, per-job timeouts,
-> stats, JSON logs). See [PROGRESS.md](PROGRESS.md).
-> No performance or correctness numbers are claimed yet. Every number that appears here later
-> will link to a raw result file and the command that reproduces it.
+> **Status:** early development (Phase 4: the chaos harness and its verifier). See
+> [PROGRESS.md](PROGRESS.md). No performance numbers are claimed yet; the local chaos
+> results are in PROGRESS.md with their raw reports in `results/local/`. Every number that
+> appears here later will link to a raw result file and the command that reproduces it.
 
 ## Development
 
@@ -18,8 +18,16 @@ Requires [uv](https://docs.astral.sh/uv/) and Docker.
 make setup      # install Python 3.12 deps from uv.lock
 make up         # start Redis (Docker Compose); `make up WORKERS=4` adds 4 worker containers
 make check      # format check + lint + mypy --strict + fast tests (~16 s)
-make check-all  # the same with every test, including the `slow` ones (~55 s; what CI runs)
+make check-all  # the same with every test, including the `slow` ones (~75 s; what CI runs)
+make chaos N=100000   # chaos run + verifier (8 workers, faults, I1-I5) -> results/local/chaos_report.json
 ```
+
+`make chaos` starts its own Compose project (`ftq-chaos`: Redis on port 6390, one Toxiproxy
+with a proxy per worker, and `CHAOS_WORKERS` worker containers built from the working tree).
+It enqueues N jobs at 2,000 jobs/s while it kills, pauses, and partitions workers on a seeded
+schedule, then drains, stops the workers, checks invariants I1 to I5, and tears everything
+down. `SEED=s` reproduces a run's job mix and fault plan. A 100K run takes about 2 minutes.
+Details: `chaos/run.py` and DECISIONS.md ADR-036.
 
 Try it by hand:
 
@@ -35,8 +43,9 @@ uv run ftq bench --jobs 50000                               # enqueue N, wait, c
 ```
 
 Built-in handlers: `send_email` (I/O, effect via the ledger), `cpu_task` (CPU-bound, runs in a
-process pool), and the deliberate failures `flaky`, `poison`, `crashy` (kills its worker), and
-`slow` (no heartbeats). Handlers are `async def` functions on the event loop, or plain functions
+process pool), and the deliberate failures `flaky`, `poison`, `crashy` (kills its worker),
+`slow` (no heartbeats), and `hang` / `hang_thread` / `hang_process` (hang past a short 2 s
+timeout on their first attempts). Handlers are `async def` functions on the event loop, or plain functions
 registered with `register_sync(..., pool="thread" | "process")` for blocking or CPU-bound work
 (ADR-028). Every run has a timeout (`FTQ_JOB_TIMEOUT`, or `timeout=` per handler type); a run
 that exceeds it is a failed attempt (ADR-030).
@@ -72,6 +81,7 @@ Every knob is an `FTQ_*` environment variable (`src/ftq/config.py`):
 | `FTQ_REAP_INTERVAL` | `5.0` | Seconds between reaper passes (XAUTOCLAIM of expired leases). |
 | `FTQ_MAX_ATTEMPTS` | `5` | Handler runs (first try + retries) before a failing job goes to the DLQ. |
 | `FTQ_MAX_DELIVERIES` | `10` | Deliveries of one stream entry (XPENDING count) before it goes to the DLQ unrun: the job keeps crashing its worker. |
+| `FTQ_SUSPECT_DELIVERIES` | `3` | A reclaimed entry at this delivery count or more is suspected of crashing its workers; each worker runs at most one suspect at a time, so jobs that ran beside a crashing job don't follow it to the DLQ (ADR-035). |
 | `FTQ_JOB_BACKOFF_BASE` | `1.0` | Retry delay base (s): delay = random(0, min(cap, base * 2^attempt)). |
 | `FTQ_JOB_BACKOFF_CAP` | `300.0` | Cap (s) on a single retry delay. |
 | `FTQ_SCHEDULER_INTERVAL` | `0.5` | Seconds between moves of due retries from the delayed set to the stream. |
