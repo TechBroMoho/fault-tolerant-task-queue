@@ -129,6 +129,9 @@ class FakeBackend:
         self.report = report
         self.workers = 0
 
+    def wait_for_redis(self) -> None:
+        self.calls.append(("wait_for_redis",))
+
     def set_workers(self, n: int) -> None:
         self.calls.append(("set_workers", n))
         self.workers = n
@@ -172,6 +175,7 @@ def test_each_point_resets_redis_with_no_workers_then_scales_and_saves(tmp_path:
     outcomes = run_session(fake, points, tmp_path, deadline_s=1e9)
     steps = [c[0] if c[0] != "set_workers" else f"set_workers({c[1]})" for c in fake.calls]
     assert steps == [
+        "wait_for_redis",
         "set_workers(0)", "flush", "set_workers(1)", "snapshot", "run_pair",
         "set_workers(0)", "flush", "set_workers(4)", "snapshot", "run_pair",
     ]  # fmt: skip
@@ -238,6 +242,9 @@ def test_backpressure_points_offer_1_5x_the_saved_headline_median(tmp_path: Path
 # ---------------------------------------------------------------- ECS calls (fake aws)
 
 
+ACCT = "123456789012"
+
+
 class FakeAws:
     """Answers the AWS CLI calls AwsBackend makes; records them."""
 
@@ -245,6 +252,13 @@ class FakeAws:
         self.calls: list[list[str]] = []
         self.desired = 0
         self.started: list[tuple[str, list[str]]] = []
+        # The Redis task, one state per poll (the last one repeats): (running count,
+        # task lastStatus, healthStatus). Default: up and healthy from the start.
+        self.redis_states: list[tuple[int, str, str]] = [(1, "RUNNING", "HEALTHY")]
+        self.redis_polls = 0
+
+    def _redis(self) -> tuple[int, str, str]:
+        return self.redis_states[min(self.redis_polls, len(self.redis_states)) - 1]
 
     def __call__(self, cmd: list[str]) -> str:
         self.calls.append(cmd)
@@ -259,11 +273,44 @@ class FakeAws:
         if op == "update-service":
             self.desired = int(arg("--desired-count"))
             return "{}"
+        if op == "describe-services" and arg("--services") == "redis":
+            self.redis_polls += 1  # each describe-services poll advances the state
+            n = self._redis()[0]
+            return json.dumps(
+                {
+                    "services": [
+                        {
+                            "serviceName": "redis",
+                            "desiredCount": 1,
+                            "runningCount": n,
+                            "pendingCount": 1 - n,
+                        }
+                    ]
+                }
+            )
+        if op == "list-tasks" and arg("--service-name") == "redis":
+            return json.dumps({"taskArns": ["arn:task/redis"] if self._redis()[0] else []})
+        if op == "describe-tasks" and arg("--tasks") == "arn:task/redis":
+            _, status, health = self._redis()
+            return json.dumps({"tasks": [{"lastStatus": status, "healthStatus": health,
+                                          "containers": [{}]}]})  # fmt: skip
         if op == "describe-services":
             n = self.desired
+            td = f"arn:aws:ecs:r:{ACCT}:task-definition/ftq-worker:7"
             svc = {"serviceName": "worker", "desiredCount": n, "runningCount": n,
-                   "pendingCount": 0, "deployments": [{}]}  # fmt: skip
+                   "pendingCount": 0, "deployments": [{}], "taskDefinition": td}  # fmt: skip
             return json.dumps({"services": [svc]})
+        if op == "list-tasks":
+            return json.dumps({"taskArns": []})
+        if op == "describe-task-definition":
+            assert "--cluster" not in args  # the call takes no cluster
+            return json.dumps({"taskDefinition": {
+                "taskDefinitionArn": arg("--task-definition"),
+                "containerDefinitions": [{"image": "123456789012.dkr.ecr.r/ftq:3d43177",
+                    "environment": [{"name": "FTQ_CONCURRENCY", "value": "50"},
+                                    {"name": "FTQ_REDIS_URL", "value": "redis://10.0.0.1:6379/0"},
+                                    {"name": "FTQ_LOG_LEVEL", "value": "WARNING"}]}],
+            }})  # fmt: skip
         if op == "list-container-instances":
             return json.dumps({"containerInstanceArns": ["arn:ci/B", "arn:ci/A", "arn:ci/C"]})
         if op == "start-task":
@@ -304,6 +351,58 @@ def test_setting_workers_waits_for_the_service_to_settle() -> None:
     update = next(c for c in fake.calls if "update-service" in c)
     assert update[update.index("--desired-count") + 1] == "12"
     assert "describe-services" in fake.calls[-1]
+
+
+def test_the_driver_waits_for_a_running_healthy_redis_task() -> None:
+    """Phase 8 part 3: the driver ran 13 s after apply and FLUSHALL was refused, because
+    the Redis task wasn't running yet. It must wait through every earlier state."""
+    fake = FakeAws()
+    fake.redis_states = [
+        (0, "", ""),                       # service created, no task yet
+        (0, "", ""),
+        (1, "PENDING", "UNKNOWN"),         # counted, but the container is still starting
+        (1, "RUNNING", "UNKNOWN"),         # running; the health check hasn't passed yet
+        (1, "RUNNING", "HEALTHY"),
+    ]  # fmt: skip
+    backend = AwsBackend({"cluster": "ftq", "loadgen_task_definition": "td"}, fake, poll_s=0)
+    backend.wait_for_redis(within=5)
+    assert fake.redis_polls == 5  # it returned only on the last state, never before
+
+
+def test_a_redis_task_that_never_gets_healthy_stops_the_session() -> None:
+    fake = FakeAws()
+    fake.redis_states = [(1, "RUNNING", "UNHEALTHY")]
+    backend = AwsBackend({"cluster": "ftq", "loadgen_task_definition": "td"}, fake, poll_s=0)
+    with pytest.raises(RuntimeError, match="Redis task"):
+        backend.wait_for_redis(within=0.05)
+    assert not any("start-task" in c for c in fake.calls)  # no flush was attempted
+
+
+def test_redis_is_waited_for_once_and_only_when_a_point_runs(tmp_path: Path) -> None:
+    (tmp_path / "scaling").mkdir()
+    (tmp_path / "scaling" / "w01.json").write_text("{}")
+    fake = FakeBackend(_report())
+    points = session_points(SessionSpec(worker_counts=(1,), suites=("scaling",)))
+    run_session(fake, points, tmp_path, deadline_s=1e9)
+    assert fake.calls == []  # every point saved: nothing to wait for
+    points = session_points(SessionSpec(worker_counts=(1, 2, 4), suites=("scaling",)))
+    run_session(fake, points, tmp_path, deadline_s=1e9)
+    assert [c[0] for c in fake.calls].count("wait_for_redis") == 1
+    assert fake.calls[0] == ("wait_for_redis",)  # before the first set_workers or flush
+
+
+def test_the_snapshot_records_the_workers_in_flight_cap_and_image() -> None:
+    """SPEC §9: the throughput claim states the in-flight cap. Phase 8's reports didn't
+    carry it; the snapshot now does, read from the running task definition."""
+    fake = FakeAws()
+    backend = AwsBackend({"cluster": "ftq", "loadgen_task_definition": "td"}, fake, poll_s=0)
+    fake.desired = 12
+    snap = backend.snapshot()
+    assert snap["worker_container"] == {
+        "task_definition": "ftq-worker:7",
+        "image_tag": "3d43177",
+        "env": {"FTQ_CONCURRENCY": "50", "FTQ_LOG_LEVEL": "WARNING"},  # no Redis address
+    }
 
 
 def test_a_failed_flush_stops_the_session() -> None:

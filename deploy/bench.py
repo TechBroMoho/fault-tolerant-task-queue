@@ -4,7 +4,8 @@
     python -m deploy.bench run                   # BILLABLE: the stack must be up
     python -m deploy.bench run --backend local   # the same driver against local Docker
 
-Each point, in order (ADR-048):
+Once, before the first point that runs: wait until the Redis task is running and healthy.
+Then each point, in order (ADR-048):
 1. scale the worker service to 0, and FLUSHALL (every point starts from an empty Redis,
    so memory, the results log, and the consumer group never carry over);
 2. scale the workers to N and wait until N are running;
@@ -222,6 +223,7 @@ class PairResult:
 class Backend(Protocol):
     name: str
 
+    def wait_for_redis(self) -> None: ...
     def set_workers(self, n: int) -> None: ...
     def flush(self) -> None: ...
     def snapshot(self) -> dict[str, Any]: ...
@@ -259,6 +261,7 @@ READ_ONLY_CALLS = frozenset({
     ("ecs", "describe-services"),
     ("ecs", "describe-tasks"),
     ("ecs", "describe-container-instances"),
+    ("ecs", "describe-task-definition"),
     ("ecs", "list-tasks"),
     ("ecs", "list-container-instances"),
     ("logs", "get-log-events"),
@@ -315,6 +318,23 @@ class AwsBackend:
 
     def scrub(self, text: str) -> str:
         return scrub(text, self.account)
+
+    def wait_for_redis(self, within: float = 300) -> None:
+        """Wait until the Redis task is RUNNING and its health check (`redis-cli ping`
+        in the container) says HEALTHY. Phase 8 part 3: the driver started 13 s after
+        apply, before the Redis task was running, and its FLUSHALL was refused."""
+
+        def healthy() -> bool:
+            svc = self._ecs("describe-services", "--services", "redis")["services"][0]
+            if svc["runningCount"] != 1:
+                return False
+            arns = self._ecs("list-tasks", "--service-name", "redis")["taskArns"]
+            if len(arns) != 1:
+                return False
+            task = self._task(arns[0])
+            return bool(task["lastStatus"] == "RUNNING" and task.get("healthStatus") == "HEALTHY")
+
+        _wait("the Redis task to be running and healthy", healthy, within, self._poll)
 
     def set_workers(self, n: int) -> None:
         self._ecs("update-service", "--service", "worker", "--desired-count", str(n))
@@ -396,6 +416,7 @@ class AwsBackend:
                 {k: s[k] for k in ("serviceName", "desiredCount", "runningCount", "pendingCount")}
                 for s in services
             ],
+            "worker_container": self._worker_container(services),
             "worker_tasks": [
                 {
                     "task": t["taskArn"].rsplit("/", 1)[-1],
@@ -404,6 +425,21 @@ class AwsBackend:
                 }
                 for t in tasks
             ],
+        }
+
+    def _worker_container(self, services: list[dict[str, Any]]) -> dict[str, Any]:
+        """The running workers' image and FTQ_* settings, from their task definition.
+        SPEC §9 wants the in-flight cap stated next to the throughput; Phase 8's reports
+        didn't carry it (it came from the Terraform default), so the snapshot does now."""
+        worker = next(s for s in services if s["serviceName"] == "worker")
+        td = json.loads(self._aws("ecs", "describe-task-definition", "--task-definition",
+                                  worker["taskDefinition"]))["taskDefinition"]  # fmt: skip
+        c = td["containerDefinitions"][0]
+        env = {e["name"]: e["value"] for e in c.get("environment", [])}
+        return {
+            "task_definition": td["taskDefinitionArn"].rsplit("/", 1)[-1],
+            "image_tag": c["image"].rsplit(":", 1)[-1],
+            "env": {k: v for k, v in sorted(env.items()) if k != "FTQ_REDIS_URL"},
         }
 
     def run_pair(self, coordinator: list[str], producer: list[str], within: float) -> PairResult:
@@ -484,6 +520,10 @@ class LocalBackend:
 
     def scrub(self, text: str) -> str:
         return text
+
+    def wait_for_redis(self) -> None:
+        # Compose's --wait blocks until the service's healthcheck (redis-cli ping) passes.
+        self._run([*self._compose, "up", "-d", "--wait", "redis"])
 
     def _workers(self) -> list[str]:
         out = self._run([*self._compose, "ps", "-q", "worker"])
@@ -568,6 +608,7 @@ def run_session(
     starting points once the next one wouldn't finish before `deadline_s`."""
     started = clock()
     outcomes: dict[str, str] = {}
+    redis_ready = False
     for p in points:
         key = f"{p.suite}/{p.label}"
         out = out_dir / p.suite / f"{p.label}.json"
@@ -581,6 +622,9 @@ def run_session(
         rate = backpressure_rate(_headline_rates(out_dir), p.overload) if p.overload else None
         run_id = f"{p.suite}-{p.label}-{uuid.uuid4().hex[:8]}"
         log.info("%s: %d workers%s", key, p.workers, f", {rate:.0f}/s offered" if rate else "")
+        if not redis_ready:  # once, before the first point that runs (Phase 8 part 3)
+            backend.wait_for_redis()
+            redis_ready = True
         backend.set_workers(0)
         backend.flush()
         backend.set_workers(p.workers)
