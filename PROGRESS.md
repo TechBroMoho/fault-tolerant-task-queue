@@ -2,23 +2,66 @@
 
 ## Status
 
-- **Current phase:** Phase 8, session part 2 done (2026-09-23). **9 of 10 points saved;
-  backpressure/w12_block has no result.** Phase 8 acceptance is NOT met yet:
-  - w12_block is missing (the driver crashed in its FLUSHALL poll; see the log below);
-  - (done since: the driver retries read-only polls, and the AWS scaling chart is drawn.)
-  - Torn down and verified CLEAN at 20:32:39 UTC. Only the budget and the empty ECR repo
-    remain ($0 idle).
+- **Current phase:** Phase 8, **all 10 points saved** (2026-09-23). Results, the
+  12-worker describe-services evidence, and the AWS scaling chart are committed;
+  teardown verified CLEAN at 21:00:14 UTC. Awaiting Mohammed's review (phase gate).
+  - The points came from three sessions: points 1–3 (w01, w02, w04) from part 1,
+    w08 through w12_reject from part 2, and w12_block from a separate part 3.
+    `results/aws/README.md` has the details.
 - **Headline (12 workers, 3 × 300 s):** median **19,240 jobs/s** (19,106 to 19,367),
   exactly-once True in all three. Redis's main thread is 96% busy: it's the ceiling,
   from 8 workers up (w08 19,194/s, w12 19,426/s).
-- **Next:** a short session for backpressure/w12_block only, if Mohammed approves.
+- **Backpressure at 1.5 × the headline (28,859/s offered):** reject refused 1,424,186
+  jobs; block made producers wait 73,325 times. Depth ≤ 199,670 in both; exactly-once
+  True in both.
 - **TODO:** re-check the spend after ~24 h. The budget's ActualSpend was still $0.00 at
   20:32 UTC (last refreshed 14:22 UTC, before any of today's sessions).
 - **Repo:** https://github.com/TechBroMoho/fault-tolerant-task-queue (public, default branch `main`, created 2026-09-22).
-- **AWS spend to date ≈ $1.45** (list prices, estimates): Phase 7 $0.06, Phase 8 part 1
-  $0.26, part 2 $1.13.
+- **AWS spend to date ≈ $1.56** (list prices, estimates): Phase 7 $0.06, Phase 8 part 1
+  $0.26, part 2 $1.13, part 3 $0.11.
 
 ## Phase log
+
+### Phase 8 session, part 3: backpressure/w12_block only (2026-09-23)
+
+Approved by Mohammed: ~$0.21 expected, hard stop ≈ $0.42. **A separate session from
+parts 1 and 2**; code 3d43177 (the driver's read-only retry; `src/` and
+`bench/loadgen.py` unchanged since 7510107, only `bench/plot.py` differs).
+
+- **Timeline (UTC):**
+  - Pushed 3d43177; image `ftq:3d43177`. Applied 20:52:00 → 20:52:39, 24 resources.
+  - Guard: `aws-down` at apply + 30 min; it exited unused.
+  - 20:52:52 driver started. **It failed its FLUSHALL at 20:53:05: Redis refused the
+    connection**, because I started the driver 13 s after apply, before the Redis task
+    was running. Nothing ran against the workers and nothing was measured; the driver's
+    log is kept locally, not committed.
+  - Waited for the redis service's runningCount = 1 (20:53:20) plus 15 s, and restarted
+    the driver at 20:53:35.
+  - w12_block 20:53:36 → 20:58:36. Every wait was a blocking command; no idle gaps.
+  - `make aws-down` 20:58:46 → 21:00:07: 24 destroyed. verify-clean CLEAN at 21:00:14.
+  - Up ~8 min: **≈ $0.11** (list prices).
+- **Result** (`results/aws/backpressure/w12_block.*`, with its `services.json`: worker
+  12 running, written as soon as it was taken):
+  - Offered target 28,859/s (1.5 × the headline median 19,240); producers blocked
+    73,325 times (557 s in total, over 8 producer processes), so accepted 17,338/s.
+  - Completed 17,235/s, depth 150,021 to 198,167 in the window, 0 rejected.
+  - Exactly-once True over 2,685,015 accepted jobs; hosts 2/2; e2e p50/p99
+    10,111/12,982 ms (queueing); Redis main thread 99% busy.
+- **Full Phase 8 table** (every point: exactly-once True, 2/2 hosts):
+
+  ```
+  suite        point       workers  completed/s  e2e p50/p99 ms  redis main  session
+  scaling      w01          1        3,564        6,106/6,679     0.26        part 1
+  scaling      w02          2        7,314        2,942/3,224     0.47        part 1, RECOVERED
+  scaling      w04          4       13,375        1,575/1,821     0.75        part 1
+  scaling      w08          8       19,194        1,051/1,406     0.93        part 2
+  scaling      w12         12       19,426        1,023/1,379     0.96        part 2
+  headline     w12_r1      12       19,240        1,026/1,424     0.96        part 2
+  headline     w12_r2      12       19,106        1,032/1,443     0.96        part 2
+  headline     w12_r3      12       19,367        1,020/1,411     0.96        part 2
+  backpressure w12_reject  12       17,784        9,749/13,616    0.99        part 2, RECOVERED
+  backpressure w12_block   12       17,235        10,111/12,982   0.99        part 3 (separate session)
+  ```
 
 ### Phase 8 follow-up: driver retry and the AWS chart (2026-09-23, $0)
 
@@ -1652,9 +1695,15 @@ pytest exit (redis up)=0
 | 2026-09-23 | Phase 7 stack: 1 m7i-flex.large (~19 min), 1 c7i-flex.large (~17 min), 2 × 30 GB gp3, 2 public IPv4, 23 resources; ECR image 55 MB (~20 min). All destroyed, verify-clean 14:56:50 UTC | ~20 min | ≈ $0.06 (list prices; re-check Cost Explorer after ~24 h) |
 | 2026-09-23 | Phase 8 part 1: L2' stack (1 m7i-flex.large, 8 c7i-flex.large, 9 × 30 GB gp3, 9 public IPv4, 24 resources), 15:43:13 → ~16:01; image ftq:d853d21. verify-clean 16:01:32 UTC | ~18 min | ≈ $0.26 (list prices) |
 | 2026-09-23 | Phase 8 part 2: same stack, 19:12:31 → 20:32:26; image ftq:7510107 (deleted by aws-down). verify-clean 20:32:39 UTC | ~80 min | ≈ $1.13 (list prices; approved cap ≈ $1.27) |
+| 2026-09-23 | Phase 8 part 3 (w12_block only): same stack, 20:52:00 → 21:00:07; image ftq:3d43177 (deleted by aws-down). verify-clean 21:00:14 UTC | ~8 min | ≈ $0.11 (list prices; approved cap ≈ $0.42) |
 
 ## Things that went wrong
 
+- **2026-09-23 (Phase 8 part 3): the driver started before Redis was up.** I launched
+  it 13 s after `terraform apply` returned; apply doesn't wait for ECS tasks, and the
+  FLUSHALL got "connection refused". Cost: ~40 s of stack time, nothing measured.
+  Parts 1 and 2 had got away with the same race. Lesson: wait for the redis service's
+  runningCount = 1 before starting the driver (the driver itself could check this).
 - **2026-09-23 (Phase 8 part 2): the driver crashed twice on one intermittent AWS CLI
   error, and a crash loses the point's snapshot.** `aws ecs describe-tasks` exited 255
   twice in this session (the same call by hand: exit 0). The driver has no retry for a
