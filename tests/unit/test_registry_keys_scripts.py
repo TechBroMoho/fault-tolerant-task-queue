@@ -7,6 +7,7 @@ import redis.asyncio as aioredis
 
 from ftq.config import Settings
 from ftq.handlers import registry as builtin
+from ftq.handlers.faults import HANG_TIMEOUT
 from ftq.keys import Keys
 from ftq.lua import script_source
 from ftq.models import Job
@@ -82,13 +83,30 @@ def test_worker_rejects_a_type_timeout_its_ttl_cannot_cover() -> None:
 
 
 def test_builtin_handlers() -> None:
-    assert builtin.types() == ["cpu_task", "crashy", "flaky", "poison", "send_email", "slow"]
+    assert builtin.types() == [
+        "cpu_task",
+        "crashy",
+        "flaky",
+        "hang",
+        "hang_process",
+        "hang_thread",
+        "poison",
+        "send_email",
+        "slow",
+    ]
     # cpu_task must not run on the event loop, or it starves heartbeats (ADR-028).
     cpu = builtin.get("cpu_task")
     assert isinstance(cpu, SyncSpec) and (cpu.pool, cpu.heartbeat) == ("process", True)
     # slow jobs must NOT heartbeat: their leases are meant to expire (ADR-007).
     slow = builtin.get("slow")
     assert slow is not None and slow.heartbeat is False
+    # One hang handler per way a timed-out run is stopped (ADR-030, ADR-036), each with
+    # the short HANG_TIMEOUT instead of the 300 s default.
+    hang = builtin.get("hang")
+    assert isinstance(hang, AsyncSpec) and hang.timeout == HANG_TIMEOUT
+    for job_type, pool in (("hang_thread", "thread"), ("hang_process", "process")):
+        spec = builtin.get(job_type)
+        assert isinstance(spec, SyncSpec) and (spec.pool, spec.timeout) == (pool, HANG_TIMEOUT)
 
 
 def test_keys_share_one_hash_tag() -> None:

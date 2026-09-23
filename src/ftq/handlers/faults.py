@@ -6,9 +6,15 @@ the chaos verifier can count effects per job (invariant I2).
 
 import asyncio
 import os
+import time
 from typing import Any
 
+from ftq.models import Job
 from ftq.registry import JobContext
+
+# The timeout the hang handlers are registered with (handlers/__init__.py): short, so a
+# chaos run sees many timeouts without spending minutes on each (ADR-030, ADR-036).
+HANG_TIMEOUT = 2.0
 
 
 class InjectedFailure(Exception):
@@ -52,3 +58,44 @@ async def slow(ctx: JobContext) -> dict[str, Any]:
     await asyncio.sleep(float(ctx.job.payload.get("seconds", 1.0)))
     applied = await ctx.ledger.apply(f"slow:{ctx.job.job_id}")
     return {"applied_now": applied}
+
+
+def _hangs(job: Job) -> bool:
+    """True on the attempts that should hang: attempt < `hang_attempts` (payload, default
+    1). Deterministic like `flaky`: a job knows how many timeouts it will take, and one
+    with hang_attempts >= max_attempts always hangs and must end in the DLQ."""
+    return job.attempt < int(job.payload.get("hang_attempts", 1))
+
+
+def _hang_seconds(job: Job) -> float:
+    """How long a hung run lasts if nobody stops it (payload `hang_seconds`, default 30):
+    far past HANG_TIMEOUT."""
+    return float(job.payload.get("hang_seconds", 30.0))
+
+
+async def hang(ctx: JobContext) -> dict[str, Any]:
+    """Async: hangs (a long await) on the first `hang_attempts` attempts, then applies its
+    effect. A timeout cancels the hung run at its await (ADR-030)."""
+    if _hangs(ctx.job):
+        await asyncio.sleep(_hang_seconds(ctx.job))
+    applied = await ctx.ledger.apply(f"hang:{ctx.job.job_id}")
+    return {"attempt": ctx.job.attempt, "applied_now": applied}
+
+
+def hang_thread(job: Job) -> dict[str, Any]:
+    """Thread pool: blocks its thread on the first `hang_attempts` attempts. A thread can't
+    be stopped, so a timed-out run becomes an orphan that holds its slot until the sleep
+    ends, and whatever it returns is discarded (ADR-030). No effect: sync handlers have
+    no ledger (ADR-028)."""
+    if _hangs(job):
+        time.sleep(_hang_seconds(job))
+    return {"attempt": job.attempt}
+
+
+def hang_process(job: Job) -> dict[str, Any]:
+    """Process pool: blocks its pool child on the first `hang_attempts` attempts. A
+    timeout resets the pool (every child SIGKILLed), and the other jobs that were
+    running in it restart at the same attempt (ADR-030). No effect, like hang_thread."""
+    if _hangs(job):
+        time.sleep(_hang_seconds(job))
+    return {"attempt": job.attempt}

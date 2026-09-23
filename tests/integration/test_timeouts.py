@@ -374,3 +374,29 @@ async def test_waiting_for_a_pool_child_does_not_count_toward_the_timeout(
     c = await read_counters(r, keys)
     assert (c["timeouts"], c["retried"], c["processed"]) == (0, 0, 3)
     assert all(len(_runs(tmp_path / f"runs-{i}")) == 1 for i in range(3))  # none restarted
+
+
+@pytest.mark.slow
+async def test_built_in_hang_handlers_time_out_then_succeed(
+    r: aioredis.Redis, settings: Settings, keys: Keys
+) -> None:
+    """The chaos mix's hang jobs (ADR-036), one of each kind, each hanging on its first
+    attempt only: every one times out once (async cancelled, thread orphaned, pool
+    reset), is retried, and succeeds on attempt 1. Only the async one has an effect."""
+    from ftq.handlers import registry as built_in
+
+    s = fast(settings)
+    client = Client(r, s)
+    ids = {
+        "hang": await client.enqueue("hang", {"hang_attempts": 1}),
+        "hang_thread": await client.enqueue("hang_thread", {"hang_attempts": 1, "hang_seconds": 3}),
+        "hang_process": await client.enqueue("hang_process", {"hang_attempts": 1}),
+    }
+    async with running_worker(r, s, built_in):
+        for job_id in ids.values():
+            done = await _wait_state(r, keys, job_id, "SUCCEEDED", within=20)
+            assert json.loads(done["result"])["attempt"] == 1
+    counters = await read_counters(r, keys)
+    assert (counters["timeouts"], counters["retried"], counters["processed"]) == (3, 3, 3)
+    assert [f["key"] for _id, f in await entries(r, keys.effects)] == [f"hang:{ids['hang']}"]
+    await _assert_drained(r, keys, s.group)
