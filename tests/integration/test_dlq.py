@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 
 import pytest
@@ -20,6 +21,11 @@ from .helpers import REPO_ROOT, add_entry, entries, fast, hash_of, running_worke
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
+# Rich (via Typer) styles CLI errors when it thinks it's in a terminal, and it forces that
+# under GitHub Actions (GITHUB_ACTIONS=true), where it styles "-" and "-all" as separate
+# spans. The assertions are about the text a user reads, so compare it without the escapes.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
 
 async def _ftq(settings: Settings, *args: str) -> tuple[int, str, str]:
     """Run the real CLI (`python -m ftq ...`) against the test queue."""
@@ -35,7 +41,7 @@ async def _ftq(settings: Settings, *args: str) -> tuple[int, str, str]:
     )
     out, err = await asyncio.wait_for(proc.communicate(), timeout=15)
     assert proc.returncode is not None
-    return proc.returncode, out.decode(), err.decode()
+    return proc.returncode, _ANSI.sub("", out.decode()), _ANSI.sub("", err.decode())
 
 
 async def test_dlq_list_and_requeue_via_cli_without_repeating_effects(

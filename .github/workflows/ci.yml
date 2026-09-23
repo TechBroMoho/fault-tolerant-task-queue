@@ -30,7 +30,7 @@ jobs:
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "0.11.16"
-          python-version: "3.12"
+          python-version: "3.12.13"  # the local + Docker image patch release
           enable-cache: true
       - run: make setup
       # The Compose Redis, not a `services:` container: a service container can't take
@@ -68,7 +68,7 @@ jobs:
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "0.11.16"
-          python-version: "3.12"
+          python-version: "3.12.13"  # the local + Docker image patch release
           enable-cache: true
       - run: make setup
       - name: Chaos run (N=${{ env.CHAOS_JOBS }}, 8 workers, random seed)
