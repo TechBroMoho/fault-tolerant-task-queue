@@ -48,7 +48,7 @@ jobs:
       - name: Runner facts
         if: always()
         run: |
-          nproc; free -m; docker version --format '{{.Server.Version}}'
+          nproc; { lscpu | grep -E 'Model name|MHz' || true; }; free -m; docker version --format '{{.Server.Version}}'
           docker compose exec -T redis redis-cli info server | grep redis_version
 
   docker:
@@ -73,6 +73,9 @@ jobs:
           python-version: "3.12.13"  # the local + Docker image patch release
           enable-cache: true
       - run: make setup
+      - name: Runner facts
+        run: |
+          nproc; { lscpu | grep -E 'Model name|MHz' || true; }; free -m
       # One worker per vCPU (ADR-040): the local runs' 8 workers on 10 CPUs had headroom;
       # 8 on this 4-vCPU runner starved every process, which is not the setup the
       # timeouts and leases were sized for.

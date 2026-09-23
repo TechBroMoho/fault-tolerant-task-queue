@@ -41,7 +41,10 @@ jobs:
           enable-cache: true
       - run: make setup
       - name: Runner facts
-        run: nproc; free -m; df -h /; docker version --format '{{.Server.Version}}'
+        # The CPU model: hosted runners differ (1M runs took 24 or 35 min on the same code).
+        run: |
+          nproc; { lscpu | grep -E 'Model name|MHz' || true; }; free -m; df -h /
+          docker version --format '{{.Server.Version}}'
       - name: Chaos run (N=${{ env.CHAOS_JOBS }}, workers=${{ env.CHAOS_WORKERS }}, random seed)
         run: |
           [ "$CHAOS_WORKERS" = nproc ] && CHAOS_WORKERS=$(nproc)
