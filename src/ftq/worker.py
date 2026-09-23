@@ -162,9 +162,29 @@ class Worker:
             if "BUSYGROUP" not in str(exc):  # BUSYGROUP = already exists, which is fine
                 raise
 
+    async def _connect(self) -> bool:
+        """Create the group, waiting out a Redis outage; False if stopped first.
+
+        A worker can start while Redis is unreachable: a restarted container coming up
+        inside a network partition, say. Crashing then would only make its supervisor
+        restart it into the same outage, again and again. So startup waits like the fetch
+        loop does (ADR-022). Found by the chaos run (PROGRESS.md, Phase 4).
+        """
+        while not self._stop.is_set():
+            try:
+                await self.ensure_group()
+                return True
+            except _REDIS_DOWN as exc:
+                self._log.warning("Redis unreachable at startup (%s); retrying", exc)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._stop.wait(), _FETCH_ERROR_PAUSE_S)
+        return False
+
     async def run(self) -> None:
         """Process jobs until `request_stop()`, then drain within `shutdown_grace`."""
-        await self.ensure_group()
+        if not await self._connect():
+            self._log.info("stopped before Redis was reachable")
+            return
         self._log.info(
             "worker %s: started (queue=%s, concurrency=%d, lease=%.1fs, timeout=%.1fs, "
             "handlers=%s)",
