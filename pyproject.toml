@@ -22,6 +22,7 @@ ftq = "ftq.cli:app"
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28,<0.29",
     "mypy>=2.3,<3",
     "pytest>=9.1,<10",
     "pytest-asyncio>=1.4,<2",
@@ -39,6 +40,9 @@ line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["ftq", "chaos"]
+
 [tool.ruff.lint]
 select = [
     "E", "W",   # pycodestyle
@@ -55,7 +59,7 @@ select = [
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "chaos"]
 
 # ---------------------------------------------------------------- pytest
 [tool.pytest.ini_options]

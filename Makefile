@@ -4,6 +4,8 @@
 UV ?= uv
 COMPOSE ?= docker compose
 WORKERS ?= 0
+N ?= 10000
+CHAOS_WORKERS ?= 8
 
 .DEFAULT_GOAL := help
 
@@ -56,8 +58,8 @@ down: ## Stop the local stack (workers too) and delete its data volume (dev data
 # ---------------------------------------------------------------- later phases (stubs)
 # Stubs exit non-zero so nothing can mistake "not built yet" for "passed".
 
-chaos: ## Chaos run + verifier (Phase 4)
-	@echo "make chaos: not implemented yet (Phase 4)" >&2; exit 1
+chaos: ## Chaos run + verifier: make chaos N=100000 [CHAOS_WORKERS=8] [SEED=s] -> results/local/chaos_report.json
+	$(UV) run python -m chaos.run --jobs $(N) --workers $(CHAOS_WORKERS) $(if $(SEED),--seed $(SEED),)
 
 bench: ## Local load test + charts (Phase 6)
 	@echo "make bench: not implemented yet (Phase 6)" >&2; exit 1
