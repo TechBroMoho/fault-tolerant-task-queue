@@ -426,9 +426,10 @@ pytest exit (redis up)=0
   printed tail's exit code. We re-ran it as `make check > log; echo $?` for the recorded evidence.
   The Phase 0 lesson still applies.
 
-- **2026-09-22 (Phase 2): four test-harness races, no system bugs.** Every first-run failure
-  in Phase 2 was the *test's* fault, and each fix made the test more precise rather than
-  looser:
+- **2026-09-22 (Phase 2): four test-harness races.** Every first-run failure in Phase 2 was
+  the *test's* fault, and each fix made the test more precise rather than looser. (The
+  suite passing didn't mean there were no system bugs: the post-gate review found two,
+  below.)
   (1) a PEL poll ran before the in-process worker had created the consumer group (`NOGROUP`):
   `running_worker` now creates the group before it yields;
   (2) a poll unpacked `[p] = pending(...)` before the worker had fetched the job: it now
@@ -455,3 +456,27 @@ pytest exit (redis up)=0
   field, because `inactive` is -1 for a consumer that never had a successful read. Both
   were rewritten until the planted bug made them fail: the job now writes a marker from
   inside the child before the signal, and each consumer gets one successful read first.
+- **2026-09-22 (Phase 2 review): `ftq dlq requeue --all` looped forever on a live system.**
+  `requeue_all` paged forward through the DLQ until it found no more entries. With workers
+  running, a requeued poison job fails again within milliseconds and is appended to the
+  END of the DLQ, so the sweep kept finding "new" entries and requeueing the same jobs
+  forever. Every Phase 2 test ran `--all` with no worker running, so none could see it.
+  Found by asking what `--all` does under concurrent writes. Reproduced first by
+  `test_requeue_all_is_bounded_while_workers_keep_killing_jobs` (20 poison jobs, a live
+  worker, page size 1), which timed out at 10 s. Fix: snapshot the DLQ's last id before
+  sweeping and stop there (ADR-027). A mutation check confirms that removing the bound
+  fails the test again. Lesson: a "process everything in this stream" loop over a stream
+  that the system itself appends to needs an explicit end point.
+- **2026-09-22 (Phase 2 review): the heartbeat margin allowed a lease to expire after one
+  missed beat.** The config accepted `heartbeat_interval ≤ visibility_timeout / 2`, and
+  ADR-025 claimed one lost beat "never" expires a healthy lease. But beats land every
+  `interval + one Redis round trip`, not every `interval`. After one lost beat the entry's
+  idle time reaches `2 × (interval + RTT)` before the next beat lands, which at exactly
+  `lease / 2` is already past the lease, and the reaper can take a healthy job. No test
+  caught it: every test used 5× margins, so the boundary was never exercised, and the unit
+  test asserted the wrong boundary as valid. Found by redoing the arithmetic in review.
+  Fix: require `heartbeat_interval ≤ visibility_timeout / 3`, leaving a full interval
+  spare for one lost or slow beat. The unit test now rejects `lease / 2`. The defaults
+  (10 s / 30 s) already met the new rule, so no default changed. Lesson: a safety bound
+  written as "N beats per lease" has to count the time a beat takes, not just the
+  interval.
